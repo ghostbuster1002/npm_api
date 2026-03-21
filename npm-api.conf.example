@@ -1,0 +1,32 @@
+# Nginx Proxy Manager API Configuration
+# ======================================
+#
+# This file can be placed in any of these locations (searched in order):
+#   1. ./npm-api.conf                  (current directory)
+#   2. ~/.config/npm-api/npm-api.conf  (user config - recommended)
+#   3. /etc/npm-api/npm-api.conf       (system-wide)
+#   4. <binary_dir>/npm-api.conf       (next to the binary)
+#
+# Alternatively, use environment variables (they override file config):
+#   NPM_API_HOST     - NPM server IP/hostname
+#   NPM_API_PORT     - NPM server port
+#   NPM_API_USER     - API username/email
+#   NPM_API_PASS     - API password
+#   NPM_API_DATA_DIR - Data directory for backups/tokens
+#
+# Example with environment variables:
+#   export NPM_API_USER="admin@example.com"
+#   export NPM_API_PASS="mypassword"
+#   npm-api host list
+
+# NPM Server Settings
+NGINX_IP="127.0.0.1"
+NGINX_PORT="81"
+
+# API Credentials (REQUIRED - change these!)
+API_USER="admin@example.com"
+API_PASS="changeme"
+
+# Optional: Custom data directory for backups and tokens
+# Default: ~/.npm-api/data or <script_dir>/data
+# DATA_DIR="/path/to/backup/dir"

@@ -1,0 +1,62 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Distribution / packaging
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Config files with credentials (never commit these!)
+npm-api.conf
+*.conf
+!npm-api.conf.example
+
+# Token and data files
+data/
+token/
+*.txt
+!requirements.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs
+*.log
