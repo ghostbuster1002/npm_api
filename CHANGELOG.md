@@ -58,6 +58,19 @@ relevant section below.
 - Certificate assignments are validated: setting `certificate_id` through
   `host bulk-update` or `host ssl-enable` checks that the certificate exists,
   reports its expiry, and warns about host domains it does not cover.
+- `backup --output/-o <dir>` writes the backup to a chosen directory instead of
+  the configured data directory.
+- `backup --include-keys` downloads certificate private keys. Without it the
+  backup holds configuration and certificate metadata only, and now says so
+  explicitly. With it, the command states that the output contains unencrypted
+  key material and where it landed.
+- Certificates that NPM's API does not export are named individually, along
+  with the `docker cp` command that fetches each from the container filesystem.
+  The path is chosen from the certificate's `provider`:
+  `/etc/letsencrypt/live/npm-<id>` for `letsencrypt`, `/data/custom_ssl/npm-<id>`
+  otherwise, and both are offered when NPM reports no provider at all. These do
+  not fail the backup, since a certificate NPM will never export would break
+  every scheduled run.
 
 ### Changed
 
@@ -77,6 +90,19 @@ relevant section below.
 - **BREAKING — `host split`, `host ssl-enable` and `host bulk-update` exit
   non-zero when any host fails.** They previously always exited 0, making
   partial failures invisible to scripts.
+- **BREAKING — `backup` no longer downloads certificate private keys by
+  default.** Pass `--include-keys` to restore the old behaviour. Note that the
+  old behaviour largely did not work; see Fixed.
+- **BREAKING — `backup` exits non-zero when a section fails**, naming the
+  sections that could not be written. It previously printed a warning and
+  exited 0, so a cron job recorded a partial backup as a success.
+- **BREAKING — the minimum supported Python is now 3.10**, up from an
+  advertised 3.8. Both 3.8 and 3.9 are past end of life.
+- `NPMClient.full_backup()` returns a `BackupResult` (`path`, `failures`,
+  `key_failures`, `complete`) rather than a path string, and
+  `NPMClient.download_certificate()` returns the list of files it wrote and
+  raises `CertificateDownloadError` rather than returning a bare boolean.
+  Both matter only if you import the module rather than using the CLI.
 - `--pattern` on `host bulk-update` (and the new `host split` / `host
   ssl-enable`) accepts a glob as well as a plain substring, so `*.internal.lan` and
   `internal.lan` both work.
@@ -107,6 +133,27 @@ relevant section below.
   a string instead.
 - `update_host` did not include `trust_forwarded_proto` (added by NPM 2.15), so
   it was absent from update payloads.
+- **Certificate backups failed silently.** `download_certificate` wrapped both
+  of its download routes in `except Exception: pass` and returned `False`,
+  which `full_backup` ignored — so `backup` reported "Backed up N certificates"
+  over directories containing nothing but `certificate_meta.json`. Failures are
+  now raised, named per certificate, and the success line no longer claims more
+  than metadata was written.
+- `download_certificate` wrote an empty `.key` file when NPM answered 200 with
+  no key material, which reads as a successful backup of an unusable key. That
+  response is now reported as a failure.
+- The zip-slip guard compared resolved paths with `str.startswith`, which
+  accepts a sibling directory sharing the prefix (`/backup` vs
+  `/backup-evil`). It now uses `Path.is_relative_to`. Python's
+  `ZipFile.extract` sanitises member paths on its own, so this was a weak
+  second line of defence rather than a live escape.
+- Private keys and API tokens were written and then `chmod`ed to 600, leaving
+  them world-readable in between under a default umask. They are now created
+  with mode 600 via `os.open`. Keys extracted from the legacy ZIP route were
+  never chmodded at all and kept whatever mode the archive carried.
+- `full_backup` crashed on its own `full_config_latest.json` symlink if the
+  backup it pointed at had been pruned: `Path.exists()` follows the link, so a
+  dangling one read as absent and `symlink_to` then raised `FileExistsError`.
 
 ### Removed
 

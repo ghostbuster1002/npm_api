@@ -27,7 +27,19 @@ The `.gitignore` excludes all `.conf` files to prevent accidental commits.
 
 ## Token Storage
 
-API tokens are stored in the data directory with `chmod 600` permissions (owner read/write only). Tokens are automatically refreshed when they expire.
+API tokens are stored in the data directory, created at mode 600 (owner read/write only). Tokens are automatically refreshed when they expire.
+
+## Certificate Private Keys
+
+`npm-api backup` does **not** capture certificate private keys unless you pass `--include-keys`. A default backup therefore holds configuration and certificate metadata only — enough to rebuild proxy hosts, not enough to serve TLS.
+
+When you do pass `--include-keys`:
+
+- Keys are written **unencrypted**, at mode 600. Encrypt the backup yourself if it leaves the machine (`age`, `gpg`, or an encrypted filesystem).
+- Keep the destination off shared storage and out of version control. `.gitignore` excludes `certificates/`, `backups/` and common key extensions, but that only protects a clone of this repo.
+- NPM's API exports Let's Encrypt certificates it issued, but not certificates uploaded to it, so a backup taken with `--include-keys` may still be missing key material. The command names each certificate it could not retrieve and prints the `docker cp` needed to fetch it from the container filesystem. Check that output rather than assuming the backup is complete.
+
+`npm-api cert download` always writes key material — that is its purpose — and prints the same warning.
 
 ## Network Security
 
@@ -48,10 +60,15 @@ If you discover a security vulnerability, please:
 ## Security Features
 
 - ✅ No hardcoded credentials (defaults are rejected)
-- ✅ Token files stored with restrictive permissions (600)
-- ✅ Private key files stored with restrictive permissions (600)
+- ✅ Token and private key files created at mode 600, with the mode applied at creation rather than afterwards
+- ✅ Private keys are opt-in for backups, never written by default
 - ✅ Path traversal protection on file operations
 - ✅ Zip slip attack prevention
+
+Not claimed:
+
+- ❌ Backups and downloaded keys are **not** encrypted at rest
+- ❌ HTTP, not HTTPS, to the NPM API by default (see Network Security above)
 - ✅ No command injection vectors (no shell execution)
 - ✅ No eval() or exec() usage
 - ✅ Config files excluded from git via .gitignore

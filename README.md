@@ -2,7 +2,7 @@
 
 [![Build and Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
 A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.com/) via its API.
 
@@ -105,6 +105,7 @@ npm-api host bulk-add-domain newdomain.com --interactive
 npm-api --help              Show all commands
 npm-api info                Dashboard and configuration info
 npm-api backup              Full backup of all configurations
+                            (add --include-keys to capture private keys)
 
 npm-api host --help         Proxy host management
 npm-api cert --help         SSL certificate management
@@ -287,6 +288,32 @@ npm-api cert list --json | jq '.[] | {id, domain_names, expires_on}'
 `cert show <id> --json` emits a single object; `cert show <domain> --json`
 emits an array of every matching certificate.
 
+## Backups
+
+```bash
+npm-api backup                                  # configuration only
+npm-api backup -o /mnt/nas/npm-2026-08-23       # choose the destination
+npm-api backup --include-keys                   # also capture private keys
+```
+
+By default a backup captures hosts, certificates *metadata*, access lists,
+users and settings — enough to rebuild every proxy host, **not** enough to
+serve TLS. The command says so explicitly when it finishes.
+
+Pass `--include-keys` to download certificate private keys as well. They are
+written unencrypted at mode 600, and the command tells you the backup now
+contains key material. Encrypt it yourself if it leaves the machine.
+
+Two limits worth knowing:
+
+- NPM's API exports Let's Encrypt certificates it issued, but **not**
+  certificates uploaded to it (`provider: other`) — those return HTTP 404 and
+  400 from both download routes. The backup names each one and prints the
+  `docker cp` that fetches it from the container filesystem instead. These do
+  not fail the backup, since an uploaded certificate fails every single run.
+- If a section fails, `backup` reports which one and **exits non-zero**, so a
+  cron job will not record a partial backup as a success.
+
 ## Gotcha: Deleted Certificates Leave Dangling IDs
 
 If you delete a certificate from the NPM UI, every host still referencing it
@@ -316,6 +343,9 @@ list is unusable the tool says coverage was not verified rather than guessing.
 - Use **environment variables** in CI/CD and Docker
 - Config files are automatically excluded via `.gitignore`
 - Secure config files with `chmod 600`
+- Certificate private keys are **opt-in**: `backup` writes none unless you pass
+  `--include-keys`. Keys and tokens are created at mode 600 but are not
+  encrypted at rest — see [SECURITY.md](SECURITY.md)
 
 ## Changelog
 

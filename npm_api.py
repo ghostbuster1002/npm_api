@@ -296,6 +296,80 @@ class ProxyHostDefaults:
 
 
 # =============================================================================
+# Secret file helpers
+# =============================================================================
+
+class CertificateDownloadError(RuntimeError):
+    """Raised when a certificate's files could not be retrieved from NPM."""
+
+
+@dataclass
+class CertKeyFailure:
+    """A certificate whose key material NPM's API would not hand over.
+
+    Carries enough to tell the user how to fetch it by hand: NPM keeps issued
+    certificates under /etc/letsencrypt and uploaded ones under /data, and the
+    directory is named for the certificate ID either way.
+    """
+    cert_id: int
+    name: str
+    provider: Optional[str]
+    reason: str
+
+    @property
+    def container_paths(self) -> List[str]:
+        """Where to look on the container, most likely location first.
+
+        An absent provider yields both candidates rather than a guess: NPM has
+        no obligation to send the field, and printing one confident wrong path
+        is worse than printing two and letting the user see which exists.
+        """
+        issued = f"/etc/letsencrypt/live/npm-{self.cert_id}"
+        uploaded = f"/data/custom_ssl/npm-{self.cert_id}"
+        if self.provider == "letsencrypt":
+            return [issued]
+        if self.provider:
+            return [uploaded]
+        return [uploaded, issued]
+
+    def __str__(self) -> str:
+        return f"certificate {self.cert_id} ({self.name}): {self.reason}"
+
+
+@dataclass
+class BackupResult:
+    """Outcome of a full backup, including anything that did not get written.
+
+    Carried back to the caller rather than only printed, so that a scheduled
+    run can fail loudly instead of exiting 0 over a half-written backup.
+    """
+    path: str
+    failures: List[str] = field(default_factory=list)
+    key_failures: List[CertKeyFailure] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.failures
+
+
+def write_secret(path: Path, content: str) -> Path:
+    """Write a file that only its owner can read, private from the first byte.
+
+    write_text() followed by chmod(0o600) leaves the file world-readable for
+    the moment in between, which matters when the content is a private key or
+    an API token. Passing the mode to os.open() applies it at creation. An
+    existing file keeps its old mode through O_CREAT, so remove it first.
+    """
+    path = Path(path)
+    if path.exists() or path.is_symlink():
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(content)
+    return path
+
+
+# =============================================================================
 # Host & certificate helpers
 # =============================================================================
 
@@ -491,15 +565,9 @@ class NPMClient:
             self.token = data["token"]
             expiry = data["expires"]
             
-            # Save token and expiry with secure permissions
-            token_path = Path(self.config.token_file)
-            expiry_path = Path(self.config.expiry_file)
-            
-            token_path.write_text(self.token)
-            token_path.chmod(0o600)  # Owner read/write only
-            
-            expiry_path.write_text(expiry)
-            expiry_path.chmod(0o600)  # Owner read/write only
+            # Save token and expiry, owner-readable only from creation
+            write_secret(Path(self.config.token_file), self.token)
+            write_secret(Path(self.config.expiry_file), expiry)
             
             console.print("[green]✅ Token generated successfully![/green]")
             console.print(f"[yellow]📅 Expires: {expiry}[/yellow]")
@@ -728,63 +796,92 @@ class NPMClient:
         response = self.delete(f"/nginx/certificates/{cert_id}")
         return response.status_code == 200
     
-    def download_certificate(self, cert_id: int, output_dir: str, cert_name: str) -> bool:
-        """Download certificate files"""
+    def download_certificate(self, cert_id: int, output_dir: str, cert_name: str) -> List[Path]:
+        """Write a certificate's files to output_dir and return what was written.
+
+        Raises CertificateDownloadError, listing what each route reported, when
+        no key material could be retrieved. Returning a bare False here used to
+        let full_backup claim success over a directory holding only metadata.
+        """
         # Sanitize cert_name to prevent path traversal (defense in depth)
         cert_name = re.sub(r'[^a-zA-Z0-9._-]', '_', cert_name)
-        
+
         output_path = Path(output_dir).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Try new API first
+
+        attempts: List[str] = []
+
+        # Preferred route: NPM returns the PEM bodies as JSON
         try:
             response = self.get(f"/nginx/certificates/{cert_id}/certificates",
-                               headers={"Accept": "application/json"})
-            if response.status_code == 200:
+                                headers={"Accept": "application/json"})
+            if response.status_code != 200:
+                attempts.append(f"JSON route: HTTP {response.status_code}")
+            else:
                 data = response.json()
-                
-                cert_path = output_path / f"{cert_name}.crt"
-                key_path = output_path / f"{cert_name}.key"
-                
-                cert_path.write_text(data.get("certificate", ""))
-                key_path.write_text(data.get("private", ""))
-                key_path.chmod(0o600)
-                
-                if "intermediate" in data:
-                    chain_path = output_path / f"{cert_name}.chain.crt"
-                    chain_path.write_text(data["intermediate"])
-                
-                # Get metadata
-                meta = self.get_certificate(cert_id)
-                meta_path = output_path / f"{cert_name}_metadata.json"
-                meta_path.write_text(json.dumps(meta, indent=2))
-                
-                return True
-        except Exception:
-            pass
-        
-        # Fallback to legacy ZIP download
+                certificate = data.get("certificate") or ""
+                private = data.get("private") or ""
+                if not certificate or not private:
+                    # NPM answers 200 with empty bodies for certificates whose
+                    # key it does not hold; writing those would back up nothing
+                    attempts.append("JSON route: response carried no key material")
+                else:
+                    written = [
+                        Path(write_secret(output_path / f"{cert_name}.key", private)),
+                    ]
+                    cert_path = output_path / f"{cert_name}.crt"
+                    cert_path.write_text(certificate)
+                    written.append(cert_path)
+
+                    if data.get("intermediate"):
+                        chain_path = output_path / f"{cert_name}.chain.crt"
+                        chain_path.write_text(data["intermediate"])
+                        written.append(chain_path)
+
+                    meta_path = output_path / f"{cert_name}_metadata.json"
+                    meta_path.write_text(json.dumps(self.get_certificate(cert_id), indent=2))
+                    written.append(meta_path)
+
+                    return written
+        except (requests.RequestException, ValueError, OSError) as exc:
+            attempts.append(f"JSON route: {exc}")
+
+        # Fallback: the legacy endpoint hands back a ZIP
+        zip_path = output_path / f"{cert_name}.download.zip"
         try:
             response = self.get(f"/nginx/certificates/{cert_id}/download")
-            if response.status_code == 200:
-                zip_path = output_path / "temp_cert.zip"
+            if response.status_code != 200:
+                attempts.append(f"ZIP route: HTTP {response.status_code}")
+            else:
                 zip_path.write_bytes(response.content)
-                
-                # Safe extraction - prevent zip slip attacks
-                with zipfile.ZipFile(zip_path, 'r') as zf:
+                written = []
+                with zipfile.ZipFile(zip_path, "r") as zf:
                     for member in zf.namelist():
-                        # Ensure no path traversal in zip contents
-                        member_path = output_path / member
-                        if not str(member_path.resolve()).startswith(str(output_path)):
-                            continue  # Skip potentially malicious paths
+                        member_path = (output_path / member).resolve()
+                        # startswith() would accept a sibling directory whose
+                        # name merely shares the prefix, e.g. /backup-evil
+                        if not member_path.is_relative_to(output_path):
+                            attempts.append(f"ZIP route: skipped unsafe path {member!r}")
+                            continue
                         zf.extract(member, output_path)
-                
+                        if member_path.is_file():
+                            # The archive carries the key alongside the cert
+                            # and its stored mode is whatever NPM chose
+                            if member_path.suffix in (".key", ".pem"):
+                                member_path.chmod(0o600)
+                            written.append(member_path)
+                if written:
+                    return written
+                attempts.append("ZIP route: archive was empty")
+        except (requests.RequestException, zipfile.BadZipFile, OSError) as exc:
+            attempts.append(f"ZIP route: {exc}")
+        finally:
+            if zip_path.exists():
                 zip_path.unlink()
-                return True
-        except Exception:
-            pass
-        
-        return False
+
+        raise CertificateDownloadError(
+            f"certificate {cert_id}: " + "; ".join(attempts or ["no route succeeded"])
+        )
     
     # =========================================================================
     # User Methods
@@ -935,17 +1032,56 @@ class NPMClient:
     # Backup Methods
     # =========================================================================
     
-    def full_backup(self) -> str:
-        """Perform a full backup of all configurations"""
+    @staticmethod
+    def _print_key_failures(failures: List["CertKeyFailure"], ssl_dir: Path) -> None:
+        """Explain how to fetch key material the API refused to return.
+
+        npm-api speaks to NPM over HTTP and has no access to the container, so
+        it can only tell the caller what to run — hence a copy-paste command
+        rather than an attempted fallback.
+        """
+        console.print(
+            f"\n[yellow]⚠️  NPM's API returned no key material for "
+            f"{len(failures)} certificate(s):[/yellow]"
+        )
+        for failure in failures:
+            console.print(f"[yellow]   • {failure.cert_id} ({failure.name}) — "
+                          f"{failure.reason}[/yellow]")
+
+        console.print(
+            "\n[cyan]   NPM's API exports Let's Encrypt certificates it issued, but not "
+            "\n   certificates uploaded to it. To capture these, copy them off the "
+            "\n   container filesystem on the NPM host (substitute your container "
+            "\n   name from `docker ps`):[/cyan]"
+        )
+        for failure in failures:
+            for path in failure.container_paths:
+                # soft_wrap keeps the command on one line; a wrapped command is
+                # not copy-pasteable, which is the whole point of printing it
+                console.print(f"[cyan]     docker cp <container>:{path} "
+                              f"{ssl_dir}/[/cyan]", soft_wrap=True)
+            if len(failure.container_paths) > 1:
+                console.print(f"[dim]       (certificate {failure.cert_id} reports no "
+                              f"provider; try both, only one will exist)[/dim]")
+
+    def full_backup(self, output_dir: Optional[str] = None,
+                    include_keys: bool = False) -> BackupResult:
+        """Perform a full backup of all configurations.
+
+        Certificate private keys are only fetched when include_keys is set, so
+        the default output is safe to sync or commit. Note that a backup taken
+        without them cannot restore TLS on its own.
+        """
         timestamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
-        backup_path = Path(self.config.backup_dir)
+        backup_path = Path(output_dir).expanduser() if output_dir else Path(self.config.backup_dir)
         
         # Create directories
         for subdir in [".user", ".settings", ".access_lists", ".Proxy_Hosts", ".ssl"]:
             (backup_path / subdir).mkdir(parents=True, exist_ok=True)
-        
+
         full_config = {}
-        
+        result = BackupResult(path=str(backup_path))
+
         # Backup users
         try:
             users = self.list_users()
@@ -955,6 +1091,7 @@ class NPMClient:
             )
             console.print(f"[green]✅ Backed up {len(users)} users[/green]")
         except Exception as e:
+            result.failures.append(f"users: {e}")
             console.print(f"[yellow]⚠️ Failed to backup users: {e}[/yellow]")
         
         # Backup settings
@@ -967,6 +1104,7 @@ class NPMClient:
             )
             console.print("[green]✅ Backed up settings[/green]")
         except Exception as e:
+            result.failures.append(f"settings: {e}")
             console.print(f"[yellow]⚠️ Failed to backup settings: {e}[/yellow]")
         
         # Backup access lists
@@ -982,6 +1120,7 @@ class NPMClient:
             )
             console.print(f"[green]✅ Backed up {len(access_lists)} access lists[/green]")
         except Exception as e:
+            result.failures.append(f"access lists: {e}")
             console.print(f"[yellow]⚠️ Failed to backup access lists: {e}[/yellow]")
         
         # Backup proxy hosts
@@ -1007,42 +1146,83 @@ class NPMClient:
             
             console.print(f"[green]✅ Backed up {len(hosts)} proxy hosts[/green]")
         except Exception as e:
+            result.failures.append(f"proxy hosts: {e}")
             console.print(f"[yellow]⚠️ Failed to backup proxy hosts: {e}[/yellow]")
         
         # Backup certificates
         try:
             certs = self.list_certificates()
             full_config["certificates"] = certs
-            
+
+            keys_saved: List[str] = []
+
             for cert in certs:
                 cert_id = cert["id"]
                 cert_name = cert.get("nice_name") or cert.get("domain_names", ["cert"])[0]
                 cert_name_safe = re.sub(r'[^a-zA-Z0-9.]', '_', cert_name)
                 cert_dir = backup_path / ".ssl" / cert_name_safe
                 cert_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 (cert_dir / "certificate_meta.json").write_text(
                     json.dumps(cert, indent=2)
                 )
-                
-                # Try to download cert files
-                self.download_certificate(cert_id, str(cert_dir), "cert")
-            
-            console.print(f"[green]✅ Backed up {len(certs)} certificates[/green]")
+
+                if not include_keys:
+                    continue
+
+                try:
+                    self.download_certificate(cert_id, str(cert_dir), "cert")
+                    keys_saved.append(f"{cert_id} ({cert_name})")
+                except CertificateDownloadError as exc:
+                    # Reported but not counted as a backup failure. NPM only
+                    # exports certificates it issued through Let's Encrypt;
+                    # uploaded ones fail here every single run, so treating
+                    # that as fatal would break scheduled backups outright.
+                    # The remedy is printed below instead.
+                    result.key_failures.append(CertKeyFailure(
+                        cert_id=cert_id,
+                        name=cert_name,
+                        provider=cert.get("provider"),
+                        reason=str(exc).split(": ", 1)[-1],
+                    ))
+
+            console.print(f"[green]✅ Backed up metadata for {len(certs)} certificates[/green]")
+
+            if not include_keys:
+                console.print(
+                    "[yellow]⚠️  Certificate private keys were NOT backed up. "
+                    "This backup cannot restore TLS on its own — rerun with "
+                    "--include-keys to capture key material.[/yellow]"
+                )
+            else:
+                if keys_saved:
+                    console.print(
+                        f"[green]🔑 Saved key material for {len(keys_saved)} "
+                        f"certificate(s) under {backup_path / '.ssl'}[/green]"
+                    )
+                    console.print(
+                        "[red]🔐 This backup now contains unencrypted private keys. "
+                        "Keep it off shared storage and out of version control.[/red]"
+                    )
+                if result.key_failures:
+                    self._print_key_failures(result.key_failures, backup_path / ".ssl")
         except Exception as e:
+            result.failures.append(f"certificates: {e}")
             console.print(f"[yellow]⚠️ Failed to backup certificates: {e}[/yellow]")
         
         # Save full config
         full_config_path = backup_path / f"full_config_{timestamp}.json"
         full_config_path.write_text(json.dumps(full_config, indent=2))
         
-        # Create latest symlink
+        # Create latest symlink. exists() follows the link, so a symlink left
+        # pointing at a pruned backup reads as absent and symlink_to() then
+        # fails with FileExistsError; is_symlink() catches that case.
         latest_path = backup_path / "full_config_latest.json"
-        if latest_path.exists():
+        if latest_path.is_symlink() or latest_path.exists():
             latest_path.unlink()
         latest_path.symlink_to(full_config_path.name)
-        
-        return str(backup_path)
+
+        return result
 
 
 # =============================================================================
@@ -1224,18 +1404,44 @@ def check_token():
 
 
 @app.command()
-def backup():
-    """Backup all configurations"""
+def backup(
+    output_dir: str = typer.Option(None, "-o", "--output",
+                                   help="Directory to write the backup into "
+                                        "(default: the configured data directory)"),
+    include_keys: bool = typer.Option(False, "--include-keys",
+                                      help="Also download certificate private keys. "
+                                           "Written unencrypted at mode 600")
+):
+    """Backup all configurations.
+
+    Without --include-keys the backup holds configuration and certificate
+    metadata only, which is enough to rebuild hosts but not to serve TLS.
+    """
     client = get_client()
-    
+
     console.print("\n[yellow]📦 Starting full backup...[/yellow]")
-    
+    if include_keys:
+        console.print("[yellow]🔑 Including certificate private keys[/yellow]")
+
     try:
-        backup_path = client.full_backup()
-        console.print(f"\n[green]✅ Backup completed![/green]")
-        console.print(f"[cyan]📂 Backup location: {backup_path}[/cyan]")
+        result = client.full_backup(output_dir=output_dir, include_keys=include_keys)
     except Exception as e:
         console.print(f"[red]❌ Backup failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    if result.complete:
+        console.print(f"\n[green]✅ Backup completed![/green]")
+    else:
+        # Exit non-zero so a scheduled run does not record a partial
+        # backup as a success
+        console.print(f"\n[red]❌ Backup incomplete — {len(result.failures)} "
+                      f"section(s) could not be written:[/red]")
+        for failure in result.failures:
+            console.print(f"[red]   • {failure}[/red]")
+
+    console.print(f"[cyan]📂 Backup location: {result.path}[/cyan]")
+
+    if not result.complete:
         raise typer.Exit(1)
 
 
@@ -2200,13 +2406,18 @@ def cert_download(
     
     console.print(f"\n[cyan]🔒 Downloading certificate ID: {cert_id}[/cyan]")
     console.print(f"   Output: {output_dir}")
-    
-    if client.download_certificate(cert_id, output_dir, cert_name):
-        console.print(f"[green]✅ Certificate downloaded successfully![/green]")
-        console.print(f"   Files saved to: {output_dir}")
-    else:
-        console.print(f"[red]❌ Failed to download certificate[/red]")
+
+    try:
+        written = client.download_certificate(cert_id, output_dir, cert_name)
+    except CertificateDownloadError as e:
+        console.print(f"[red]❌ Failed to download certificate: {e}[/red]")
         raise typer.Exit(1)
+
+    console.print(f"[green]✅ Certificate downloaded successfully![/green]")
+    for path in written:
+        console.print(f"   {path}")
+    console.print("[red]🔐 The private key is unencrypted at mode 600. "
+                  "Keep it off shared storage and out of version control.[/red]")
 
 
 # =============================================================================
