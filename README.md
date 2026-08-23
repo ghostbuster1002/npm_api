@@ -283,13 +283,15 @@ be two labels, so a suffix like `.co.uk` keeps one label too many.
 
 ## JSON Output
 
-`host list`, `host show`, `cert list` and `cert show` accept `--json`. Output is
-unstyled and written to stdout, so it pipes straight into `jq`:
+`info`, `host list`, `host show`, `host search`, `cert list`, `cert show`,
+`user list`, `acl list` and `acl show` accept `--json`. Output is unstyled and
+written to stdout, so it pipes straight into `jq`:
 
 ```bash
 npm-api host list --json | jq '.[] | select(.certificate_id == 27) | .id'
 npm-api host show 42 --json | jq -r '.domain_names[]'
-npm-api cert list --json | jq '.[] | {id, domain_names, expires_on}'
+npm-api cert list --json | jq '.[] | {id, nice_name, provider, expires_on}'
+npm-api info --json | jq '.stats.proxy_hosts'
 ```
 
 `cert show <id> --json` emits a single object; `cert show <domain> --json`

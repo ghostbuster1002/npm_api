@@ -95,6 +95,19 @@ relevant section below.
   previously defaulted to every host carrying the old domain, so a short
   argument like `com` would have rewritten the whole estate. Pass
   `--pattern <old_domain>` for the old behaviour.
+- **BREAKING — `user create` no longer takes the password as a positional
+  argument.** It is prompted for, with confirmation, or passed via
+  `--password`. A positional password lands in shell history and is readable
+  in `ps` output by every other user on the machine while the command runs.
+- `bulk-update certificate_id 0` and `access_list_id 0` now clear the link
+  instead of trying to look up a certificate with ID 0 and failing. `0`,
+  `none` and `null` all mean the same thing, matching what `--cert 0` already
+  did for `host split` and `host clone`.
+- API errors report the message NPM sent rather than requests' generic repr,
+  so a rejected write says `HTTP 400: Domain already in use` instead of
+  `400 Client Error: Bad Request for url: ...`.
+- `--json` now covers `info`, `host search`, `user list`, `acl list` and
+  `acl show`, alongside the host and certificate commands that already had it.
 - `host bulk-remove-domain` and `host bulk-replace-domain` gained `--pattern`.
   `bulk-remove-domain` already named the option in its error message without
   accepting it. All six bulk commands now take the same
@@ -140,8 +153,13 @@ relevant section below.
   matches integers strictly. A malformed numeric value such as `--5` can no
   longer reach `int()` and blow up with an uncaught `ValueError`; it is sent as
   a string instead.
-- `update_host` did not include `trust_forwarded_proto` (added by NPM 2.15), so
-  it was absent from update payloads.
+- `update_host` and `create_host` built their payloads from hardcoded
+  allowlists, so any field a newer NPM adds was silently reset on every write.
+  `update_host` now shares the copy-by-exclusion path used for clones, and
+  `create_host` sends `trust_forwarded_proto`. NPM's expanded `certificate`,
+  `owner` and `access_list` objects are excluded, so a host fetched with
+  expansions can be written back without sending an object where an ID belongs.
+- `host show` omitted `trust_forwarded_proto`.
 - **Certificate backups failed silently.** `download_certificate` wrapped both
   of its download routes in `except Exception: pass` and returned `False`,
   which `full_backup` ignored — so `backup` reported "Backed up N certificates"
@@ -182,3 +200,5 @@ relevant section below.
 
 - `NPMClient.enable_host_ssl` — dead after the `ssl-enable` rewrite, and it
   force-set `ssl_forced` and `http2_support` as a side effect.
+- `NPMClient.check_connection` — never called from anywhere, and `requests`
+  already surfaces connection failures with a clearer message.

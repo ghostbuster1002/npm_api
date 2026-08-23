@@ -293,6 +293,7 @@ class ProxyHostDefaults:
     hsts_subdomains: bool = False
     advanced_config: str = ""
     custom_locations: List[Dict] = field(default_factory=list)
+    trust_forwarded_proto: bool = False
 
 
 # =============================================================================
@@ -352,6 +353,31 @@ class BackupResult:
         return not self.failures
 
 
+def format_http_error(exc: Exception) -> str:
+    """Render the message NPM actually sent, not requests' generic repr.
+
+    An HTTPError stringifies as "400 Client Error: Bad Request for url: ...",
+    which buries the reason. NPM replies with {"error": {"message": ...}}.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+
+    try:
+        body = response.json()
+    except ValueError:
+        detail = (response.text or "").strip()
+        return f"HTTP {response.status_code}: {detail[:200]}" if detail \
+            else f"HTTP {response.status_code}"
+
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict) and error.get("message"):
+        return f"HTTP {response.status_code}: {error['message']}"
+    if isinstance(error, str) and error:
+        return f"HTTP {response.status_code}: {error}"
+    return f"HTTP {response.status_code}: {json.dumps(body)[:200]}"
+
+
 def write_secret(path: Path, content: str) -> Path:
     """Write a file that only its owner can read, private from the first byte.
 
@@ -373,14 +399,25 @@ def write_secret(path: Path, content: str) -> Path:
 # Host & certificate helpers
 # =============================================================================
 
-# Assigned by NPM; never sent back when creating or updating a host
-HOST_READONLY_FIELDS = {"id", "created_on", "modified_on", "owner_user_id"}
+# Assigned by NPM; never sent back when creating or updating a host. The
+# trailing three are objects NPM expands alongside their *_id counterparts when
+# a query asks for them; echoing them back would send a nested object where the
+# API expects an integer.
+HOST_READONLY_FIELDS = {
+    "id", "created_on", "modified_on", "owner_user_id",
+    "certificate", "owner", "access_list",
+}
 
 # Runtime status NPM writes into meta, not part of a host's configuration
 HOST_META_RUNTIME_KEYS = {"nginx_online", "nginx_err"}
 
 # Host fields whose values are lists rather than scalars
 HOST_LIST_FIELDS = {"domain_names", "locations"}
+
+# Link fields where 0 is NPM's way of saying "nothing linked". Treated as null
+# so that `bulk-update certificate_id 0` clears the certificate, matching what
+# `--cert 0` already means to split and clone.
+HOST_UNSET_ON_ZERO_FIELDS = {"certificate_id", "access_list_id"}
 
 
 def host_config_payload(host: Dict, overrides: Optional[Dict] = None) -> Dict:
@@ -461,7 +498,10 @@ def coerce_field_value(field_name: str, value: str) -> Any:
 
     # Matched strictly: "--5" survives lstrip("-").isdigit() but int() rejects it
     if re.fullmatch(r"-?\d+", value.strip()):
-        return int(value.strip())
+        number = int(value.strip())
+        if number == 0 and field_name in HOST_UNSET_ON_ZERO_FIELDS:
+            return None
+        return number
 
     return value
 
@@ -489,14 +529,6 @@ class NPMClient:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
-    
-    def check_connection(self) -> bool:
-        """Check if NPM is accessible"""
-        try:
-            response = requests.head(self.config.base_url, timeout=5)
-            return response.status_code < 500
-        except requests.RequestException:
-            return False
     
     def load_token(self) -> bool:
         """Load token from file if valid"""
@@ -658,6 +690,7 @@ class NPMClient:
             "hsts_subdomains": defaults.hsts_subdomains,
             "advanced_config": defaults.advanced_config,
             "locations": defaults.custom_locations,
+            "trust_forwarded_proto": defaults.trust_forwarded_proto,
             "access_list_id": None,
             "certificate_id": None,
             "meta": {"dns_challenge": None},
@@ -677,23 +710,16 @@ class NPMClient:
         return response.json()
 
     def update_host(self, host_id: int, updates: Dict) -> Dict:
-        """Update a proxy host"""
-        # Get current config
+        """Update a proxy host, carrying over every field the caller did not name.
+
+        NPM's PUT replaces the whole object, so the current config is read back
+        first. Built by exclusion rather than from an allowlist: an allowlist
+        written against one NPM release silently resets fields a later release
+        adds, which is exactly how trust_forwarded_proto went missing.
+        """
         current = self.get_host(host_id)
-        
-        # Fields that can be updated
-        updatable_fields = [
-            "domain_names", "forward_host", "forward_port", "forward_scheme",
-            "caching_enabled", "block_exploits", "allow_websocket_upgrade",
-            "http2_support", "ssl_forced", "hsts_enabled", "hsts_subdomains",
-            "advanced_config", "locations", "access_list_id", "certificate_id",
-            "enabled", "meta", "trust_forwarded_proto"
-        ]
-        
-        # Build update payload
-        data = {k: current.get(k) for k in updatable_fields if k in current}
-        data.update(updates)
-        
+        data = host_config_payload(current, updates)
+
         response = self.put(f"/nginx/proxy-hosts/{host_id}", json=data)
         response.raise_for_status()
         return response.json()
@@ -1344,11 +1370,28 @@ def print_json(payload: Any):
 # =============================================================================
 
 @app.command()
-def info():
+def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on stdout")):
     """Display script variables and dashboard information"""
     client = get_client()
     config = client.config
-    
+
+    if as_json:
+        if not client.ensure_token():
+            console.print("[red]❌ Failed to authenticate[/red]")
+            raise typer.Exit(1)
+        # The API user is included but no token or password: this output is
+        # meant to be pipeable and pasteable into an issue
+        print_json({
+            "version": VERSION,
+            "config_source": config.get_config_info(),
+            "base_url": config.base_url,
+            "nginx_ip": config.nginx_ip,
+            "api_user": config.api_user,
+            "data_dir": config.data_dir_id,
+            "stats": client.get_dashboard_stats(),
+        })
+        return
+
     console.print(f"\n[yellow]Script Info: [green]{VERSION}[/green][/yellow]")
     console.print(f"[green]Config from[/green] : {config.get_config_info()}")
     console.print(f"[green]BASE URL[/green]   : {config.base_url}")
@@ -1537,6 +1580,8 @@ def host_show(
     console.print(f"  [cyan]Block Exploits:[/cyan] {'[green]Yes[/green]' if host.get('block_exploits') else '[red]No[/red]'}")
     console.print(f"  [cyan]Caching:[/cyan] {'[green]Yes[/green]' if host.get('caching_enabled') else '[red]No[/red]'}")
     console.print(f"  [cyan]Websocket:[/cyan] {'[green]Yes[/green]' if host.get('allow_websocket_upgrade') else '[red]No[/red]'}")
+    console.print(f"  [cyan]Trust Forwarded Proto:[/cyan] "
+                  f"{'[green]Yes[/green]' if host.get('trust_forwarded_proto') else '[red]No[/red]'}")
     console.print(f"  [cyan]HSTS:[/cyan] {'[green]Yes[/green]' if host.get('hsts_enabled') else '[red]No[/red]'}"
                   f"{' [dim](+subdomains)[/dim]' if host.get('hsts_subdomains') else ''}")
     console.print(f"  [cyan]Access List ID:[/cyan] {host.get('access_list_id') or 'None'}")
@@ -1554,16 +1599,23 @@ def host_show(
 
 
 @host_app.command("search")
-def host_search(search: str = typer.Argument(..., help="Domain name to search")):
+def host_search(
+    search: str = typer.Argument(..., help="Domain name to search"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on stdout")
+):
     """Search proxy hosts by domain name"""
     client = get_client()
-    
+
     hosts = client.search_hosts(search)
-    
+
+    if as_json:
+        print_json(hosts)
+        return
+
     if not hosts:
         console.print(f"[yellow]No hosts found matching '{search}'[/yellow]")
         return
-    
+
     for host in hosts:
         console.print(f"  [yellow]{host.get('id'):4}[/yellow] [green]{', '.join(host.get('domain_names', []))}[/green]")
 
@@ -1608,7 +1660,7 @@ def host_create(
         console.print(f"[green]✅ Proxy host created successfully![/green]")
         console.print(f"[cyan]   ID: {proxy_id}[/cyan]")
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to create host: {e}[/red]")
+        console.print(f"[red]❌ Failed to create host: {format_http_error(e)}[/red]")
         raise typer.Exit(1)
 
 
@@ -1695,7 +1747,7 @@ def host_update(
         console.print(f"[green]✅ Host {host_id} updated successfully![/green]")
         console.print(f"   {field_name} = {result.get(field_name)}")
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to update host: {e}[/red]")
+        console.print(f"[red]❌ Failed to update host: {format_http_error(e)}[/red]")
         raise typer.Exit(1)
 
 
@@ -1823,7 +1875,7 @@ def apply_domain_changes(client: NPMClient, changes: List[Dict],
                 console.print(f"  [green]✅ Host {host_id}: {describe(change)}[/green]")
                 success_count += 1
             except requests.HTTPError as e:
-                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
+                console.print(f"  [red]❌ Host {host_id}: Failed - {format_http_error(e)}[/red]")
                 error_count += 1
 
     print_bulk_summary(success_count, error_count)
@@ -2386,7 +2438,7 @@ def cert_generate(
         console.print(f"[red]❌ {e}[/red]")
         raise typer.Exit(1)
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to generate certificate: {e}[/red]")
+        console.print(f"[red]❌ Failed to generate certificate: {format_http_error(e)}[/red]")
         if hasattr(e, 'response') and e.response is not None:
             try:
                 error_data = e.response.json()
@@ -2483,12 +2535,16 @@ def cert_download(
 # =============================================================================
 
 @user_app.command("list")
-def user_list():
+def user_list(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on stdout")):
     """List all users"""
     client = get_client()
-    
+
     users = client.list_users()
-    
+
+    if as_json:
+        print_json(users)
+        return
+
     if not users:
         console.print("[yellow]No users found[/yellow]")
         return
@@ -2517,9 +2573,17 @@ def user_list():
 def user_create(
     username: str = typer.Argument(..., help="Username"),
     email: str = typer.Argument(..., help="Email address"),
-    password: str = typer.Argument(..., help="Password")
+    password: str = typer.Option(None, "--password", prompt=True, hide_input=True,
+                                 confirmation_prompt=True,
+                                 help="Password (prompted for if omitted, so it stays "
+                                      "out of shell history and `ps` output)")
 ):
-    """Create a new user"""
+    """Create a new user.
+
+    The password is prompted for rather than taken as an argument: a positional
+    password lands in shell history and is visible in the process list to every
+    other user on the machine for as long as the command runs.
+    """
     client = get_client()
     
     # Check if user already exists
@@ -2538,7 +2602,7 @@ def user_create(
         console.print(f"   Name: {username}")
         console.print(f"   Email: {email}")
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to create user: {e}[/red]")
+        console.print(f"[red]❌ Failed to create user: {format_http_error(e)}[/red]")
         raise typer.Exit(1)
 
 
@@ -2913,19 +2977,23 @@ def host_bulk_update(
                 console.print(f"  [green]✅ Host {host_id}: {field}={typed_value}[/green]")
                 success_count += 1
             except requests.HTTPError as e:
-                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
+                console.print(f"  [red]❌ Host {host_id}: Failed - {format_http_error(e)}[/red]")
                 error_count += 1
 
     print_bulk_summary(success_count, error_count)
 
 
 @acl_app.command("list")
-def acl_list():
+def acl_list(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on stdout")):
     """List all access lists"""
     client = get_client()
-    
+
     access_lists = client.list_access_lists()
-    
+
+    if as_json:
+        print_json(access_lists)
+        return
+
     if not access_lists:
         console.print("[yellow]No access lists found[/yellow]")
         return
@@ -2952,16 +3020,23 @@ def acl_list():
 
 
 @acl_app.command("show")
-def acl_show(list_id: int = typer.Argument(..., help="Access List ID")):
+def acl_show(
+    list_id: int = typer.Argument(..., help="Access List ID"),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on stdout")
+):
     """Show access list details"""
     client = get_client()
-    
+
     try:
         al = client.get_access_list(list_id)
     except requests.HTTPError:
         console.print(f"[red]❌ Access list ID {list_id} not found[/red]")
         raise typer.Exit(1)
-    
+
+    if as_json:
+        print_json(al)
+        return
+
     console.print(f"\n[cyan]🔑 Access List Details:[/cyan]")
     console.print(f"   ID: {al.get('id')}")
     console.print(f"   Name: {al.get('name')}")
@@ -3018,7 +3093,7 @@ def acl_create(
         console.print(f"   ID: {result.get('id')}")
         console.print(f"   Name: {name}")
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to create access list: {e}[/red]")
+        console.print(f"[red]❌ Failed to create access list: {format_http_error(e)}[/red]")
         raise typer.Exit(1)
 
 
@@ -3094,7 +3169,7 @@ def acl_update(
         result = client.update_access_list(list_id, updates)
         console.print(f"[green]✅ Access list {list_id} updated successfully![/green]")
     except requests.HTTPError as e:
-        console.print(f"[red]❌ Failed to update access list: {e}[/red]")
+        console.print(f"[red]❌ Failed to update access list: {format_http_error(e)}[/red]")
         raise typer.Exit(1)
 
 
