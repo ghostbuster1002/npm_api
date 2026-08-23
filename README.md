@@ -255,7 +255,7 @@ npm-api host bulk-add-domain domain3.com --interactive
 npm-api host bulk-remove-domain olddomain.com --ids 1,2,3
 
 # Replace one domain with another
-npm-api host bulk-replace-domain old.com new.com
+npm-api host bulk-replace-domain old.com new.com --pattern old.com
 
 # Update a field across multiple hosts
 npm-api host bulk-update forward_host 192.168.1.100 --ids 1,2,3
@@ -271,8 +271,15 @@ become integers, and a value starting with `[` or `{` is parsed as JSON. Only
 the list fields (`domain_names`, `locations`) are split on commas, so
 `advanced_config` and other free text keep their commas intact.
 
-`host split`, `host ssl-enable` and `host bulk-update` exit non-zero if any
-host failed, so partial failures are visible to scripts.
+Every bulk command takes the same selector set — `--ids`, `--pattern`,
+`--interactive` — plus `--preview/--no-preview` and `-y`. A selector is
+**required**: none of them will act on the whole estate by default. They also
+exit non-zero if any host failed, so partial failures are visible to scripts.
+
+`bulk-add-domain` reuses each existing name's subdomain prefix, so a host
+holding `sub.app.old.com` gains `sub.app.new.com`. Names that are already apex
+domains have no prefix to reuse and are skipped. The base domain is assumed to
+be two labels, so a suffix like `.co.uk` keeps one label too many.
 
 ## JSON Output
 

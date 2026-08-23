@@ -87,9 +87,18 @@ relevant section below.
   host selector.** They previously fell through to every host, so a bare
   `host bulk-remove-domain com` would have rewritten the entire estate.
   `--ids`, `--pattern` (where supported) or `--interactive` is now required.
-- **BREAKING — `host split`, `host ssl-enable` and `host bulk-update` exit
-  non-zero when any host fails.** They previously always exited 0, making
-  partial failures invisible to scripts.
+- **BREAKING — every bulk command exits non-zero when any host fails.** That is
+  `host split`, `host ssl-enable`, `host bulk-update`, `host bulk-add-domain`,
+  `host bulk-remove-domain` and `host bulk-replace-domain`. They previously
+  always exited 0, making partial failures invisible to scripts.
+- **BREAKING — `host bulk-replace-domain` requires a host selector.** It
+  previously defaulted to every host carrying the old domain, so a short
+  argument like `com` would have rewritten the whole estate. Pass
+  `--pattern <old_domain>` for the old behaviour.
+- `host bulk-remove-domain` and `host bulk-replace-domain` gained `--pattern`.
+  `bulk-remove-domain` already named the option in its error message without
+  accepting it. All six bulk commands now take the same
+  `--ids / --pattern / --interactive / --preview / -y` set.
 - **BREAKING — `backup` no longer downloads certificate private keys by
   default.** Pass `--include-keys` to restore the old behaviour. Note that the
   old behaviour largely did not work; see Fixed.
@@ -151,6 +160,20 @@ relevant section below.
   them world-readable in between under a default umask. They are now created
   with mode 600 via `os.open`. Keys extracted from the legacy ZIP route were
   never chmodded at all and kept whatever mode the archive carried.
+- `host bulk-add-domain` dropped subdomain labels. It took only the first label
+  as the prefix, contradicting its own comment, so a host holding
+  `sub.ex.old.com` gained `sub.new.com` instead of `sub.ex.new.com`. Apex names
+  such as `old.com` no longer produce a nonsensical `old.new.com` either; they
+  are skipped, having no prefix to carry over.
+- `host bulk-replace-domain` could store the same domain twice on one host,
+  when the rewrite landed on a name the host already carried. Duplicates are
+  now dropped and the affected hosts named in the preview.
+- `--ids` raised an unhandled `ValueError` on non-numeric input in the three
+  bulk domain commands; they now share the parser that reports it properly and
+  warns about IDs matching no host.
+- The bulk domain apply loops caught bare `Exception`, so a bug in the client
+  was indistinguishable from an API rejection. They now catch
+  `requests.HTTPError` like the rest of the bulk commands.
 - `full_backup` crashed on its own `full_config_latest.json` symlink if the
   backup it pointed at had been pruned: `Path.exists()` follows the link, so a
   dangling one read as absent and `symlink_to` then raised `FileExistsError`.

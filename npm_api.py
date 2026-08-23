@@ -1771,6 +1771,64 @@ def confirm_bulk(yes: bool, prompt: str = "Apply these changes?"):
         raise typer.Exit(0)
 
 
+def domain_prefix(domain: str) -> Optional[str]:
+    """Everything ahead of the registrable base of a domain name.
+
+    "ex.example.com" -> "ex", "sub.ex.example.com" -> "sub.ex",
+    "example.com" -> None, since an apex name has no subdomain to carry over
+    onto a different base.
+
+    The base is assumed to be two labels, so a multi-part suffix such as
+    .co.uk keeps one label too many. Doing better needs public-suffix data
+    that neither this tool nor NPM has.
+    """
+    parts = domain.strip().strip(".").split(".")
+    if len(parts) <= 2:
+        return None
+    return ".".join(parts[:-2])
+
+
+def dedupe_domains(domains: List[str]) -> List[str]:
+    """Drop repeats case-insensitively, keeping first occurrence and order.
+
+    Rewriting one base domain onto another can collide with a name the host
+    already carries; NPM would then hold the same name twice.
+    """
+    seen = set()
+    unique = []
+    for domain in domains:
+        key = domain.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(domain)
+    return unique
+
+
+def apply_domain_changes(client: NPMClient, changes: List[Dict],
+                         describe) -> None:
+    """Write each change's resulting_domains back, then summarise.
+
+    Shared by the bulk domain commands, which previously each carried their
+    own copy of this loop and a summary that exited 0 even after failures.
+    """
+    success_count = 0
+    error_count = 0
+
+    with console.status("[bold green]Applying changes...") as status:
+        for change in changes:
+            host_id = change["host_id"]
+            try:
+                status.update(f"[bold green]Updating host {host_id}...")
+                client.update_host(host_id, {"domain_names": change["resulting_domains"]})
+                console.print(f"  [green]✅ Host {host_id}: {describe(change)}[/green]")
+                success_count += 1
+            except requests.HTTPError as e:
+                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
+                error_count += 1
+
+    print_bulk_summary(success_count, error_count)
+
+
 def print_bulk_summary(success: int, errors: int, skipped: int = 0):
     """Print the shared bulk summary, exiting non-zero when anything failed"""
     console.print(f"\n[cyan]📊 Summary:[/cyan]")
@@ -2536,89 +2594,36 @@ def host_bulk_add_domain(
     Example: If host has [ex.domain1.com, ex.domain2.com] and you run:
         host bulk-add-domain domain3.com
     It will add ex.domain3.com to that host.
-    
+
     The subdomain prefix is extracted from existing domains and combined
-    with the new base domain.
+    with the new base domain. Hosts whose only names are apex domains are
+    skipped, since they carry no prefix to reuse.
     """
     client = get_client()
-    
-    all_hosts = client.list_hosts()
-    
-    if not all_hosts:
-        console.print("[yellow]No proxy hosts found[/yellow]")
-        return
-    
-    # Filter hosts by IDs if specified
-    if host_ids:
-        selected_ids = [int(x.strip()) for x in host_ids.split(",")]
-        hosts_to_process = [h for h in all_hosts if h.get("id") in selected_ids]
-        if not hosts_to_process:
-            console.print(f"[red]❌ No hosts found with IDs: {host_ids}[/red]")
-            raise typer.Exit(1)
-    elif pattern:
-        # Filter by domain pattern
-        hosts_to_process = [
-            h for h in all_hosts 
-            if any(pattern.lower() in d.lower() for d in h.get("domain_names", []))
-        ]
-        if not hosts_to_process:
-            console.print(f"[red]❌ No hosts found matching pattern: {pattern}[/red]")
-            raise typer.Exit(1)
-    elif interactive:
-        # Interactive selection
-        console.print("\n[cyan]Select hosts to update:[/cyan]\n")
-        
-        for idx, host in enumerate(all_hosts):
-            host_id = host.get("id")
-            domains = ", ".join(host.get("domain_names", []))
-            console.print(f"  [{idx + 1}] [yellow]ID {host_id}[/yellow]: [green]{domains}[/green]")
-        
-        console.print("\n[cyan]Enter host numbers (comma-separated) or 'all' for all hosts:[/cyan]")
-        selection = typer.prompt("Selection")
-        
-        if selection.lower() == "all":
-            hosts_to_process = all_hosts
-        else:
-            try:
-                indices = [int(x.strip()) - 1 for x in selection.split(",")]
-                hosts_to_process = [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
-            except (ValueError, IndexError):
-                console.print("[red]❌ Invalid selection[/red]")
-                raise typer.Exit(1)
-    else:
-        # Previously fell through to every host, so a bare invocation with no
-        # filter would rewrite the entire estate
-        console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
-        raise typer.Exit(1)
 
+    hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
     if not hosts_to_process:
         console.print("[yellow]No hosts selected for processing[/yellow]")
         return
-    
+
     # Calculate changes
     changes = []
     for host in hosts_to_process:
         host_id = host.get("id")
         current_domains = host.get("domain_names", [])
-        
-        # Extract unique subdomain prefixes
-        prefixes = set()
-        for domain in current_domains:
-            parts = domain.split(".")
-            if len(parts) >= 2:
-                # Get the subdomain part (everything before the base domain)
-                # e.g., "ex.mydomain.com" -> "ex"
-                # e.g., "sub.ex.mydomain.com" -> "sub.ex"
-                prefix = parts[0]
-                prefixes.add(prefix)
-        
-        # Generate new domains
+
+        # Collect subdomain prefixes, sorted so the output is stable rather
+        # than following set iteration order
+        prefixes = sorted({p for p in (domain_prefix(d) for d in current_domains) if p})
+
+        existing = {d.lower() for d in current_domains}
         new_domains_to_add = []
         for prefix in prefixes:
-            new_domain_full = f"{prefix}.{new_domain}"
-            if new_domain_full not in current_domains:
-                new_domains_to_add.append(new_domain_full)
-        
+            candidate = f"{prefix}.{new_domain}"
+            if candidate.lower() not in existing:
+                new_domains_to_add.append(candidate)
+                existing.add(candidate.lower())
+
         if new_domains_to_add:
             changes.append({
                 "host_id": host_id,
@@ -2626,7 +2631,7 @@ def host_bulk_add_domain(
                 "new_domains": new_domains_to_add,
                 "resulting_domains": current_domains + new_domains_to_add
             })
-    
+
     if not changes:
         console.print("[yellow]No changes to make - all domains already exist or no valid prefixes found[/yellow]")
         return
@@ -2651,90 +2656,37 @@ def host_bulk_add_domain(
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
         console.print(f"[cyan]Total domains to add: [yellow]{sum(len(c['new_domains']) for c in changes)}[/yellow][/cyan]\n")
-    
-    # Confirm
-    if not yes:
-        if not typer.confirm("Apply these changes?"):
-            console.print("[red]❌ Cancelled[/red]")
-            raise typer.Exit(0)
-    
-    # Apply changes
-    success_count = 0
-    error_count = 0
-    
-    with console.status("[bold green]Applying changes...") as status:
-        for change in changes:
-            host_id = change["host_id"]
-            new_domain_list = change["resulting_domains"]
-            
-            try:
-                status.update(f"[bold green]Updating host {host_id}...")
-                client.update_host(host_id, {"domain_names": new_domain_list})
-                console.print(f"  [green]✅ Host {host_id}: Added {', '.join(change['new_domains'])}[/green]")
-                success_count += 1
-            except Exception as e:
-                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
-                error_count += 1
-    
-    # Summary
-    console.print(f"\n[cyan]📊 Summary:[/cyan]")
-    console.print(f"   [green]✅ Successful: {success_count}[/green]")
-    if error_count:
-        console.print(f"   [red]❌ Failed: {error_count}[/red]")
+
+    confirm_bulk(yes)
+    apply_domain_changes(
+        client, changes,
+        lambda c: f"Added {', '.join(c['new_domains'])}"
+    )
 
 
 @host_app.command("bulk-remove-domain")
 def host_bulk_remove_domain(
     domain_pattern: str = typer.Argument(..., help="Domain pattern to remove (e.g., my3rddomain.com or full domain)"),
     host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs to update"),
+    pattern: str = typer.Option(None, "--pattern", "-p", help="Only process hosts matching this domain pattern"),
     preview: bool = typer.Option(True, "--preview/--no-preview", help="Preview changes before applying"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
     interactive: bool = typer.Option(False, "--interactive", "-I", help="Interactively select hosts")
 ):
     """
     Bulk remove domains matching a pattern from existing hosts.
-    
+
     Example: Remove all domains containing 'my3rddomain.com':
-        host bulk-remove-domain my3rddomain.com
+        host bulk-remove-domain my3rddomain.com --pattern my3rddomain.com
+
+    Hosts left with no domains at all are skipped rather than emptied.
     """
     client = get_client()
-    
-    all_hosts = client.list_hosts()
-    
-    if not all_hosts:
-        console.print("[yellow]No proxy hosts found[/yellow]")
+
+    hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
+    if not hosts_to_process:
+        console.print("[yellow]No hosts selected for processing[/yellow]")
         return
-    
-    # Filter hosts by IDs if specified
-    if host_ids:
-        selected_ids = [int(x.strip()) for x in host_ids.split(",")]
-        hosts_to_process = [h for h in all_hosts if h.get("id") in selected_ids]
-    elif interactive:
-        # Interactive selection
-        console.print("\n[cyan]Select hosts to update:[/cyan]\n")
-        
-        for idx, host in enumerate(all_hosts):
-            host_id = host.get("id")
-            domains = ", ".join(host.get("domain_names", []))
-            console.print(f"  [{idx + 1}] [yellow]ID {host_id}[/yellow]: [green]{domains}[/green]")
-        
-        console.print("\n[cyan]Enter host numbers (comma-separated) or 'all' for all hosts:[/cyan]")
-        selection = typer.prompt("Selection")
-        
-        if selection.lower() == "all":
-            hosts_to_process = all_hosts
-        else:
-            try:
-                indices = [int(x.strip()) - 1 for x in selection.split(",")]
-                hosts_to_process = [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
-            except (ValueError, IndexError):
-                console.print("[red]❌ Invalid selection[/red]")
-                raise typer.Exit(1)
-    else:
-        # Previously fell through to every host, so a bare invocation with no
-        # filter would rewrite the entire estate
-        console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
-        raise typer.Exit(1)
 
     # Calculate changes
     changes = []
@@ -2782,36 +2734,12 @@ def host_bulk_remove_domain(
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
         console.print(f"[cyan]Total domains to remove: [red]{sum(len(c['domains_to_remove']) for c in changes)}[/red][/cyan]\n")
-    
-    # Confirm
-    if not yes:
-        if not typer.confirm("Apply these changes?"):
-            console.print("[red]❌ Cancelled[/red]")
-            raise typer.Exit(0)
-    
-    # Apply changes
-    success_count = 0
-    error_count = 0
-    
-    with console.status("[bold green]Applying changes...") as status:
-        for change in changes:
-            host_id = change["host_id"]
-            new_domain_list = change["resulting_domains"]
-            
-            try:
-                status.update(f"[bold green]Updating host {host_id}...")
-                client.update_host(host_id, {"domain_names": new_domain_list})
-                console.print(f"  [green]✅ Host {host_id}: Removed {', '.join(change['domains_to_remove'])}[/green]")
-                success_count += 1
-            except Exception as e:
-                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
-                error_count += 1
-    
-    # Summary
-    console.print(f"\n[cyan]📊 Summary:[/cyan]")
-    console.print(f"   [green]✅ Successful: {success_count}[/green]")
-    if error_count:
-        console.print(f"   [red]❌ Failed: {error_count}[/red]")
+
+    confirm_bulk(yes)
+    apply_domain_changes(
+        client, changes,
+        lambda c: f"Removed {', '.join(c['domains_to_remove'])}"
+    )
 
 
 @host_app.command("bulk-replace-domain")
@@ -2819,96 +2747,62 @@ def host_bulk_replace_domain(
     old_domain: str = typer.Argument(..., help="Old base domain to replace (e.g., olddomain.com)"),
     new_domain: str = typer.Argument(..., help="New base domain (e.g., newdomain.com)"),
     host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs to update"),
+    pattern: str = typer.Option(None, "--pattern", "-p", help="Only process hosts matching this domain pattern"),
     preview: bool = typer.Option(True, "--preview/--no-preview", help="Preview changes before applying"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
     interactive: bool = typer.Option(False, "--interactive", "-I", help="Interactively select hosts")
 ):
     """
     Bulk replace one base domain with another in existing hosts.
-    
-    Example: Replace olddomain.com with newdomain.com:
-        host bulk-replace-domain olddomain.com newdomain.com
-    
-    This will change ex.olddomain.com to ex.newdomain.com
+
+    Example: Replace olddomain.com with newdomain.com everywhere it appears:
+        host bulk-replace-domain olddomain.com newdomain.com -p olddomain.com
+
+    This will change ex.olddomain.com to ex.newdomain.com. A host selector is
+    required; the command no longer defaults to every host carrying the old
+    domain, since a short argument like 'com' would match the whole estate.
     """
     client = get_client()
-    
-    all_hosts = client.list_hosts()
-    
-    if not all_hosts:
-        console.print("[yellow]No proxy hosts found[/yellow]")
-        return
-    
-    # Filter hosts by IDs if specified
-    if host_ids:
-        selected_ids = [int(x.strip()) for x in host_ids.split(",")]
-        hosts_to_process = [h for h in all_hosts if h.get("id") in selected_ids]
-    elif interactive:
-        # Show only hosts that have the old domain
-        matching_hosts = [
-            h for h in all_hosts 
-            if any(old_domain.lower() in d.lower() for d in h.get("domain_names", []))
-        ]
-        
-        if not matching_hosts:
-            console.print(f"[yellow]No hosts found with domain pattern: {old_domain}[/yellow]")
-            return
-        
-        console.print("\n[cyan]Select hosts to update:[/cyan]\n")
-        
-        for idx, host in enumerate(matching_hosts):
-            host_id = host.get("id")
-            domains = ", ".join(host.get("domain_names", []))
-            console.print(f"  [{idx + 1}] [yellow]ID {host_id}[/yellow]: [green]{domains}[/green]")
-        
-        console.print("\n[cyan]Enter host numbers (comma-separated) or 'all' for all hosts:[/cyan]")
-        selection = typer.prompt("Selection")
-        
-        if selection.lower() == "all":
-            hosts_to_process = matching_hosts
-        else:
-            try:
-                indices = [int(x.strip()) - 1 for x in selection.split(",")]
-                hosts_to_process = [matching_hosts[i] for i in indices if 0 <= i < len(matching_hosts)]
-            except (ValueError, IndexError):
-                console.print("[red]❌ Invalid selection[/red]")
-                raise typer.Exit(1)
-    else:
-        hosts_to_process = [
-            h for h in all_hosts 
-            if any(old_domain.lower() in d.lower() for d in h.get("domain_names", []))
-        ]
-    
+
+    hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
     if not hosts_to_process:
-        console.print(f"[yellow]No hosts found with domain pattern: {old_domain}[/yellow]")
+        console.print("[yellow]No hosts selected for processing[/yellow]")
         return
-    
+
     # Calculate changes
     changes = []
+    collisions = []
     for host in hosts_to_process:
         host_id = host.get("id")
         current_domains = host.get("domain_names", [])
-        
-        # Replace domains
+
         new_domains = []
         replaced = []
         for domain in current_domains:
             if old_domain.lower() in domain.lower():
-                # Replace the old domain part with new domain
                 new_domain_full = domain.lower().replace(old_domain.lower(), new_domain.lower())
                 new_domains.append(new_domain_full)
                 replaced.append((domain, new_domain_full))
             else:
                 new_domains.append(domain)
-        
-        if replaced:
-            changes.append({
-                "host_id": host_id,
-                "current_domains": current_domains,
-                "replacements": replaced,
-                "resulting_domains": new_domains
-            })
-    
+
+        if not replaced:
+            continue
+
+        # A rewrite can land on a name the host already carries, e.g. a host
+        # holding both ex.old.com and ex.new.com. NPM would then store the
+        # same name twice.
+        deduped = dedupe_domains(new_domains)
+        if len(deduped) != len(new_domains):
+            collisions.append(host_id)
+
+        changes.append({
+            "host_id": host_id,
+            "current_domains": current_domains,
+            "replacements": replaced,
+            "resulting_domains": deduped
+        })
+
     if not changes:
         console.print("[yellow]No changes to make[/yellow]")
         return
@@ -2930,37 +2824,17 @@ def host_bulk_replace_domain(
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
         console.print(f"[cyan]Total domains to replace: [yellow]{sum(len(c['replacements']) for c in changes)}[/yellow][/cyan]\n")
-    
-    # Confirm
-    if not yes:
-        if not typer.confirm("Apply these changes?"):
-            console.print("[red]❌ Cancelled[/red]")
-            raise typer.Exit(0)
-    
-    # Apply changes
-    success_count = 0
-    error_count = 0
-    
-    with console.status("[bold green]Applying changes...") as status:
-        for change in changes:
-            host_id = change["host_id"]
-            new_domain_list = change["resulting_domains"]
-            
-            try:
-                status.update(f"[bold green]Updating host {host_id}...")
-                client.update_host(host_id, {"domain_names": new_domain_list})
-                replacements_str = ", ".join([f"{old}→{new}" for old, new in change["replacements"]])
-                console.print(f"  [green]✅ Host {host_id}: {replacements_str}[/green]")
-                success_count += 1
-            except Exception as e:
-                console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
-                error_count += 1
-    
-    # Summary
-    console.print(f"\n[cyan]📊 Summary:[/cyan]")
-    console.print(f"   [green]✅ Successful: {success_count}[/green]")
-    if error_count:
-        console.print(f"   [red]❌ Failed: {error_count}[/red]")
+
+    if collisions:
+        console.print(f"[yellow]⚠️  Host(s) {', '.join(str(h) for h in collisions)} already "
+                      f"carry a name the rewrite produces; the duplicate will be "
+                      f"dropped rather than stored twice[/yellow]\n")
+
+    confirm_bulk(yes)
+    apply_domain_changes(
+        client, changes,
+        lambda c: ", ".join(f"{old}→{new}" for old, new in c["replacements"])
+    )
 
 
 @host_app.command("bulk-update")
