@@ -19,6 +19,7 @@ import sys
 import re
 import shutil
 import zipfile
+from fnmatch import fnmatch
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -112,12 +113,14 @@ class Config:
     
     def __post_init__(self):
         if not self.data_dir:
-            # Try to use a sensible default
-            try:
-                self.data_dir = str(Path(__file__).parent / "data")
-            except NameError:
-                # For frozen executables
+            if getattr(sys, "frozen", False):
+                # PyInstaller defines __file__ inside its temp extraction
+                # directory, which the bootloader deletes on exit. Tokens and
+                # backups written there would silently vanish, so anchor the
+                # frozen binary's state in the user's home instead.
                 self.data_dir = str(Path.home() / ".npm-api" / "data")
+            else:
+                self.data_dir = str(Path(__file__).parent / "data")
     
     @property
     def base_url(self) -> str:
@@ -293,6 +296,103 @@ class ProxyHostDefaults:
 
 
 # =============================================================================
+# Host & certificate helpers
+# =============================================================================
+
+# Assigned by NPM; never sent back when creating or updating a host
+HOST_READONLY_FIELDS = {"id", "created_on", "modified_on", "owner_user_id"}
+
+# Runtime status NPM writes into meta, not part of a host's configuration
+HOST_META_RUNTIME_KEYS = {"nginx_online", "nginx_err"}
+
+# Host fields whose values are lists rather than scalars
+HOST_LIST_FIELDS = {"domain_names", "locations"}
+
+
+def host_config_payload(host: Dict, overrides: Optional[Dict] = None) -> Dict:
+    """Reduce a host object to a payload suitable for create or update.
+
+    Copies by exclusion rather than by allowlist so that fields introduced by
+    newer NPM releases survive a clone. NPM 2.15 added trust_forwarded_proto,
+    which an allowlist written against an older release would silently reset.
+    """
+    payload = {k: v for k, v in host.items() if k not in HOST_READONLY_FIELDS}
+
+    payload["meta"] = {
+        k: v for k, v in (payload.get("meta") or {}).items()
+        if k not in HOST_META_RUNTIME_KEYS
+    }
+
+    if overrides:
+        payload.update(overrides)
+    return payload
+
+
+def cert_covers_domain(cert: Dict, domain: str) -> Optional[bool]:
+    """Whether a certificate's recorded domain list covers `domain`.
+
+    Returns None when that list holds nothing usable, which callers should read
+    as "cannot tell" rather than as a failure. NPM keeps domain_names purely as
+    metadata and never consults it when serving TLS, so for uploaded certs it
+    drifts from the real SANs - a recorded entry like "*.internal," can belong
+    to a certificate that genuinely serves *.internal.lan.
+    """
+    domain = str(domain).strip().lower().rstrip(".")
+    checked_any = False
+
+    for raw in cert.get("domain_names") or []:
+        name = str(raw).strip().lower().rstrip(".")
+        if not name:
+            continue
+
+        bare = name[2:] if name.startswith("*.") else name
+        if "." not in bare or any(c in bare for c in ",; "):
+            continue  # unusable metadata, e.g. "*.internal,"
+        checked_any = True
+
+        if name.startswith("*."):
+            # A wildcard matches exactly one label: *.example.com covers
+            # app.example.com but not app.eu.example.com
+            head, _, tail = domain.partition(".")
+            if head and tail == bare:
+                return True
+        elif name == domain:
+            return True
+
+    return False if checked_any else None
+
+
+def coerce_field_value(field_name: str, value: str) -> Any:
+    """Coerce a CLI "field=value" string into the JSON type NPM expects.
+
+    List fields are split on commas so domain_names=a.lan,b.com works, while
+    free-text fields such as advanced_config keep their commas intact. Any
+    value may also be given as a JSON literal for full control.
+    """
+    lowered = value.strip().lower()
+
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if lowered in ("null", "none"):
+        return None
+
+    if value.lstrip()[:1] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name}: invalid JSON ({exc})") from exc
+
+    if field_name in HOST_LIST_FIELDS:
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+    # Matched strictly: "--5" survives lstrip("-").isdigit() but int() rejects it
+    if re.fullmatch(r"-?\d+", value.strip()):
+        return int(value.strip())
+
+    return value
+
+
+# =============================================================================
 # API Client
 # =============================================================================
 
@@ -427,7 +527,10 @@ class NPMClient:
         url = f"{self.config.base_url}/{endpoint.lstrip('/')}"
         headers = self._get_headers()
         headers.update(kwargs.pop("headers", {}))
-        
+
+        # Every auth call sets one; without this a hung NPM blocks forever
+        kwargs.setdefault("timeout", 30)
+
         response = requests.request(method, url, headers=headers, **kwargs)
         return response
     
@@ -497,6 +600,14 @@ class NPMClient:
         response.raise_for_status()
         return response.json()
     
+    def create_host_from(self, source: Dict, overrides: Dict) -> Dict:
+        """Create a proxy host as a copy of an existing host object"""
+        payload = host_config_payload(source, overrides)
+
+        response = self.post("/nginx/proxy-hosts", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def update_host(self, host_id: int, updates: Dict) -> Dict:
         """Update a proxy host"""
         # Get current config
@@ -508,7 +619,7 @@ class NPMClient:
             "caching_enabled", "block_exploits", "allow_websocket_upgrade",
             "http2_support", "ssl_forced", "hsts_enabled", "hsts_subdomains",
             "advanced_config", "locations", "access_list_id", "certificate_id",
-            "enabled", "meta"
+            "enabled", "meta", "trust_forwarded_proto"
         ]
         
         # Build update payload
@@ -532,16 +643,6 @@ class NPMClient:
     def disable_host(self, host_id: int) -> bool:
         """Disable a proxy host"""
         response = self.post(f"/nginx/proxy-hosts/{host_id}/disable")
-        return response.status_code == 200
-    
-    def enable_host_ssl(self, host_id: int, cert_id: int) -> bool:
-        """Enable SSL for a proxy host"""
-        data = {
-            "certificate_id": cert_id,
-            "ssl_forced": True,
-            "http2_support": True
-        }
-        response = self.put(f"/nginx/proxy-hosts/{host_id}", json=data)
         return response.status_code == 200
     
     def disable_host_ssl(self, host_id: int) -> bool:
@@ -798,7 +899,10 @@ class NPMClient:
         try:
             certs = self.list_certificates()
             stats["certificates"]["total"] = len(certs)
-            stats["certificates"]["expired"] = sum(1 for c in certs if c.get("expired"))
+            stats["certificates"]["expired"] = sum(
+                1 for c in certs
+                if (days := cert_days_remaining(c)) is not None and days < 0
+            )
             stats["certificates"]["valid"] = stats["certificates"]["total"] - stats["certificates"]["expired"]
         except Exception:
             pass
@@ -1008,6 +1112,54 @@ def get_client() -> NPMClient:
 
 
 # =============================================================================
+# Display helpers
+# =============================================================================
+
+# Warn when a certificate is inside this many days of expiry
+CERT_EXPIRY_WARN_DAYS = 30
+
+
+def cert_days_remaining(cert: Dict) -> Optional[int]:
+    """Days until a certificate expires; negative if it already has.
+
+    NPM's API returns no "expired" flag on the certificate object, so this is
+    derived from "expires_on". Returns None if that value is missing or
+    unparseable.
+    """
+    raw = cert.get("expires_on")
+    if not raw:
+        return None
+
+    try:
+        # NPM sends "YYYY-MM-DD HH:MM:SS"; tolerate ISO-8601 with "Z" as well.
+        expires = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    # Match naive/aware so the subtraction can't raise
+    now = datetime.now(tz=expires.tzinfo) if expires.tzinfo else datetime.now()
+    return (expires - now).days
+
+
+def cert_status_label(cert: Dict) -> str:
+    """Render a coloured validity label for a certificate."""
+    days = cert_days_remaining(cert)
+
+    if days is None:
+        return "[yellow]❓ UNKNOWN[/yellow]"
+    if days < 0:
+        return f"[red]❌ EXPIRED {abs(days)}d AGO[/red]"
+    if days <= CERT_EXPIRY_WARN_DAYS:
+        return f"[yellow]⚠️ {days}d LEFT[/yellow]"
+    return "[green]✅ VALID[/green]"
+
+
+def print_json(payload: Any):
+    """Emit raw JSON on stdout, unstyled so it stays pipeable into jq."""
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+# =============================================================================
 # CLI Commands - Main
 # =============================================================================
 
@@ -1111,16 +1263,22 @@ def show_defaults():
 # =============================================================================
 
 @host_app.command("list")
-def host_list():
+def host_list(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON instead of a table")
+):
     """List all proxy hosts"""
     client = get_client()
-    
+
     hosts = client.list_hosts()
-    
+
+    if as_json:
+        print_json(hosts)
+        return
+
     if not hosts:
         console.print("[yellow]No proxy hosts found[/yellow]")
         return
-    
+
     table = Table(title="Proxy Hosts", show_header=True, header_style="bold cyan")
     table.add_column("ID", style="yellow", justify="right")
     table.add_column("Domain", style="green")
@@ -1143,16 +1301,23 @@ def host_list():
 
 
 @host_app.command("show")
-def host_show(host_id: int = typer.Argument(..., help="Host ID to show")):
+def host_show(
+    host_id: int = typer.Argument(..., help="Host ID to show"),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON instead of a summary")
+):
     """Show details of a specific proxy host"""
     client = get_client()
-    
+
     try:
         host = client.get_host(host_id)
     except requests.HTTPError:
         console.print(f"[red]❌ Host ID {host_id} not found[/red]")
         raise typer.Exit(1)
-    
+
+    if as_json:
+        print_json(host)
+        return
+
     console.print(f"\n[yellow]📋 Host Details:[/yellow]")
     console.print(f"  [cyan]ID:[/cyan] {host.get('id')}")
     console.print(f"  [cyan]Domains:[/cyan] {', '.join(host.get('domain_names', []))}")
@@ -1166,8 +1331,17 @@ def host_show(host_id: int = typer.Argument(..., help="Host ID to show")):
     console.print(f"  [cyan]Block Exploits:[/cyan] {'[green]Yes[/green]' if host.get('block_exploits') else '[red]No[/red]'}")
     console.print(f"  [cyan]Caching:[/cyan] {'[green]Yes[/green]' if host.get('caching_enabled') else '[red]No[/red]'}")
     console.print(f"  [cyan]Websocket:[/cyan] {'[green]Yes[/green]' if host.get('allow_websocket_upgrade') else '[red]No[/red]'}")
+    console.print(f"  [cyan]HSTS:[/cyan] {'[green]Yes[/green]' if host.get('hsts_enabled') else '[red]No[/red]'}"
+                  f"{' [dim](+subdomains)[/dim]' if host.get('hsts_subdomains') else ''}")
     console.print(f"  [cyan]Access List ID:[/cyan] {host.get('access_list_id') or 'None'}")
-    
+
+    locations = host.get('locations') or []
+    console.print(f"  [cyan]Custom Locations:[/cyan] {len(locations) or 'None'}")
+    for loc in locations:
+        scheme = loc.get('forward_scheme', 'http')
+        console.print(f"    [dim]{loc.get('path', '?')}[/dim] → "
+                      f"{scheme}://{loc.get('forward_host', '?')}:{loc.get('forward_port', '?')}")
+
     if host.get('advanced_config'):
         console.print(f"\n  [cyan]Advanced Config:[/cyan]")
         console.print(Syntax(host['advanced_config'], "nginx", theme="monokai"))
@@ -1301,36 +1475,472 @@ def host_update(
         console.print("[red]❌ Invalid format. Use: field=value[/red]")
         raise typer.Exit(1)
     
-    field, value = field_value.split("=", 1)
-    
-    # Convert value types
-    if value.lower() in ("true", "false"):
-        value = value.lower() == "true"
-    elif value.isdigit():
-        value = int(value)
-    
+    field_name, raw_value = field_value.split("=", 1)
+    field_name = field_name.strip()
+
     try:
-        result = client.update_host(host_id, {field: value})
+        value = coerce_field_value(field_name, raw_value)
+    except ValueError as exc:
+        console.print(f"[red]❌ {exc}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = client.update_host(host_id, {field_name: value})
         console.print(f"[green]✅ Host {host_id} updated successfully![/green]")
-        console.print(f"   {field} = {result.get(field)}")
+        console.print(f"   {field_name} = {result.get(field_name)}")
     except requests.HTTPError as e:
         console.print(f"[red]❌ Failed to update host: {e}[/red]")
         raise typer.Exit(1)
 
 
+def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[str],
+                 interactive: bool, *, detail_field: Optional[str] = None) -> List[Dict]:
+    """Resolve --ids / --pattern / --interactive into a list of hosts.
+
+    Refuses to act when no filter is given. bulk-add-domain and
+    bulk-remove-domain previously fell through to every host, so a bare
+    `bulk-remove-domain com` would have rewritten the entire estate.
+    """
+    all_hosts = client.list_hosts()
+    if not all_hosts:
+        console.print("[yellow]No proxy hosts found[/yellow]")
+        return []
+
+    if host_ids:
+        try:
+            wanted = {int(x.strip()) for x in host_ids.split(",") if x.strip()}
+        except ValueError:
+            console.print(f"[red]❌ --ids must be comma-separated numbers, "
+                          f"got '{host_ids}'[/red]")
+            raise typer.Exit(1)
+
+        selected = [h for h in all_hosts if h.get("id") in wanted]
+        missing = wanted - {h.get("id") for h in selected}
+        if missing:
+            console.print(f"[yellow]⚠️  No such host(s): "
+                          f"{', '.join(str(m) for m in sorted(missing))}[/yellow]")
+        return selected
+
+    if pattern:
+        # Accepts a glob or a plain substring, so '*.example.com' and 'example.com'
+        # both work and the option means the same thing across every command
+        needle = pattern.lower()
+        return [
+            h for h in all_hosts
+            if any(fnmatch(d.lower(), needle) or needle in d.lower()
+                   for d in h.get("domain_names", []))
+        ]
+
+    if interactive:
+        console.print("\n[cyan]Select hosts:[/cyan]\n")
+        for idx, host in enumerate(all_hosts):
+            domains = ", ".join(host.get("domain_names", []))
+            extra = (f" ({detail_field}={host.get(detail_field, 'N/A')})"
+                     if detail_field else "")
+            console.print(f"  [{idx + 1}] [yellow]ID {host.get('id')}[/yellow]: "
+                          f"[green]{domains}[/green]{extra}")
+
+        console.print("\n[cyan]Enter host numbers (comma-separated) or 'all':[/cyan]")
+        selection = typer.prompt("Selection")
+
+        if selection.strip().lower() == "all":
+            return all_hosts
+        try:
+            indices = [int(x.strip()) - 1 for x in selection.split(",")]
+        except ValueError:
+            console.print("[red]❌ Invalid selection[/red]")
+            raise typer.Exit(1)
+        return [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
+
+    console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
+    raise typer.Exit(1)
+
+
+def confirm_bulk(yes: bool, prompt: str = "Apply these changes?"):
+    """Gate a bulk write behind a confirmation unless -y was given"""
+    if yes:
+        return
+    if not typer.confirm(prompt):
+        console.print("[red]❌ Cancelled[/red]")
+        raise typer.Exit(0)
+
+
+def print_bulk_summary(success: int, errors: int, skipped: int = 0):
+    """Print the shared bulk summary, exiting non-zero when anything failed"""
+    console.print(f"\n[cyan]📊 Summary:[/cyan]")
+    console.print(f"   [green]✅ Successful: {success}[/green]")
+    if skipped:
+        console.print(f"   [yellow]⚠️  Skipped: {skipped}[/yellow]")
+    if errors:
+        console.print(f"   [red]❌ Failed: {errors}[/red]")
+        raise typer.Exit(1)
+
+
+def validate_certificate_assignment(client: NPMClient, cert_id: Optional[int],
+                                    hosts: List[Dict]) -> bool:
+    """Report on a certificate about to be assigned to `hosts`.
+
+    Returns False when the certificate does not exist. NPM wraps the whole
+    `listen 443 ssl` block in a conditional on the linked certificate, so
+    pointing a host at a deleted ID silently drops it to HTTP-only rather than
+    failing loudly.
+    """
+    if cert_id is None:
+        return True
+
+    try:
+        cert = client.get_certificate(cert_id)
+    except requests.HTTPError:
+        console.print(f"[red]❌ Certificate {cert_id} does not exist — assigning it would "
+                      f"leave these hosts with no TLS listener at all[/red]")
+        return False
+
+    recorded = ", ".join(cert.get("domain_names", [])) or "empty"
+    console.print(f"\n[cyan]🔒 Certificate {cert_id}[/cyan] ({recorded}) "
+                  f"— {cert_status_label(cert)}")
+
+    unknown = False
+    for host in hosts:
+        uncovered = []
+        for domain in host.get("domain_names", []):
+            covered = cert_covers_domain(cert, domain)
+            if covered is False:
+                uncovered.append(domain)
+            elif covered is None:
+                unknown = True
+        if uncovered:
+            console.print(f"   [yellow]⚠️  Host {host.get('id')}: not covered — "
+                          f"{', '.join(uncovered)}[/yellow]")
+
+    if unknown:
+        console.print(f"   [dim]note: certificate {cert_id} records no usable domain list "
+                      f"({recorded}); coverage not verified[/dim]")
+    return True
+
+
+def _parse_cert_option(value: str) -> Optional[int]:
+    """Parse a --cert value into a certificate ID, or None for no certificate"""
+    if value.strip().lower() in ("none", "null", "0", ""):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        console.print(f"[red]❌ --cert must be a certificate ID or 'none', got '{value}'[/red]")
+        raise typer.Exit(1)
+
+
+def _domain_conflicts(client: NPMClient, domains: List[str],
+                      ignore_host_id: Optional[int] = None) -> Dict[str, int]:
+    """Map each requested domain to the ID of a host already claiming it.
+
+    NPM rejects duplicate domains, and were one to slip through nginx would
+    silently serve whichever server block it saw first.
+    """
+    wanted = {d.strip().lower(): d for d in domains}
+    taken: Dict[str, int] = {}
+
+    for host in client.list_hosts():
+        if host.get("id") == ignore_host_id:
+            continue
+        for existing in host.get("domain_names", []):
+            key = str(existing).strip().lower()
+            if key in wanted:
+                taken[wanted[key]] = host.get("id")
+    return taken
+
+
+@host_app.command("clone")
+def host_clone(
+    host_id: int = typer.Argument(..., help="Host ID to copy"),
+    domains: List[str] = typer.Option(..., "--domain",
+                                      help="Domain for the new host (repeatable)"),
+    cert: Optional[str] = typer.Option(None, "--cert",
+                                       help="Certificate ID, or 'none'. Defaults to the source's"),
+    forward_host: Optional[str] = typer.Option(None, "--forward-host",
+                                               help="Override the forward host"),
+    forward_port: Optional[int] = typer.Option(None, "--forward-port",
+                                               help="Override the forward port"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+):
+    """Copy a proxy host to new domains, leaving the source untouched
+
+    Every other setting is copied verbatim, including websockets, force SSL,
+    HSTS, custom locations and advanced config.
+    """
+    client = get_client()
+
+    try:
+        source = client.get_host(host_id)
+    except requests.HTTPError:
+        console.print(f"[red]❌ Host ID {host_id} not found[/red]")
+        raise typer.Exit(1)
+
+    overrides: Dict[str, Any] = {"domain_names": list(domains)}
+
+    if cert is None:
+        cert_id = source.get("certificate_id") or None
+        cert_note = f"{cert_id or 'none'} (inherited)"
+    else:
+        cert_id = _parse_cert_option(cert)
+        overrides["certificate_id"] = cert_id
+        cert_note = str(cert_id or "none")
+
+    if forward_host:
+        overrides["forward_host"] = forward_host
+    if forward_port:
+        overrides["forward_port"] = forward_port
+
+    wildcards = [d for d in domains if "*" in d]
+    if wildcards:
+        console.print(f"[red]❌ Wildcard domains are not supported for proxy hosts: "
+                      f"{', '.join(wildcards)}[/red]")
+        raise typer.Exit(1)
+
+    conflicts = _domain_conflicts(client, domains)
+    if conflicts:
+        for domain, other in conflicts.items():
+            console.print(f"[red]❌ {domain} is already on host {other}[/red]")
+        raise typer.Exit(1)
+
+    target = host_config_payload(source, overrides)
+
+    if preview:
+        console.print(f"\n[cyan]📋 Clone Preview[/cyan]")
+        console.print(f"[cyan]   Source: [yellow]host {host_id}[/yellow] "
+                      f"({', '.join(source.get('domain_names', []))})[/cyan]\n")
+
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Setting", style="white")
+        table.add_column("New host", style="green")
+        table.add_row("Domain(s)", ", ".join(domains))
+        table.add_row("Forwards to", f"{target.get('forward_scheme')}://"
+                                     f"{target.get('forward_host')}:{target.get('forward_port')}")
+        table.add_row("Certificate", cert_note)
+        table.add_row("Force SSL", str(target.get("ssl_forced")))
+        table.add_row("Websockets", str(target.get("allow_websocket_upgrade")))
+        table.add_row("Custom locations", str(len(target.get("locations") or [])))
+        table.add_row("Advanced config", "yes" if target.get("advanced_config") else "no")
+        console.print(table)
+
+    validate_certificate_assignment(client, cert_id, [{"id": "new", "domain_names": domains}])
+
+    confirm_bulk(yes, "Create this host?")
+
+    try:
+        new_host = client.create_host_from(source, overrides)
+    except requests.HTTPError as exc:
+        console.print(f"[red]❌ Create failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✅ Created host {new_host.get('id')}[/green]")
+
+
+@host_app.command("split")
+def host_split(
+    match: str = typer.Argument(..., help="Glob selecting domains to move out, e.g. '*.internal.lan'"),
+    cert: str = typer.Option(..., "--cert",
+                             help="Certificate ID for the new hosts, or 'none'"),
+    host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs to split"),
+    pattern: str = typer.Option(None, "--pattern", "-p",
+                                help="Only process hosts matching this domain pattern"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    interactive: bool = typer.Option(False, "--interactive", "-I",
+                                     help="Interactively select hosts"),
+):
+    """
+    Move matching domains out of hosts into new hosts of their own.
+
+    The source keeps its unmatched domains and its existing certificate; only
+    the moved domains land on the new host. Hosts with fewer than two domains,
+    or where the pattern matches all or none of them, are skipped so a whole
+    batch can be selected at once.
+
+    Examples:
+        host split '*.internal.lan' --cert 3 --ids 1,2,3
+        host split '*.internal.lan' --cert 3 --pattern internal.lan
+    """
+    client = get_client()
+    cert_id = _parse_cert_option(cert)
+
+    hosts = select_hosts(client, host_ids, pattern, interactive)
+    if not hosts:
+        console.print("[yellow]No hosts selected for processing[/yellow]")
+        return
+
+    # Worked out up front so the preview and the apply pass agree, and so the
+    # conflict check reads the host list once rather than once per host
+    existing_domains: Dict[str, int] = {}
+    for host in client.list_hosts():
+        for domain in host.get("domain_names", []):
+            existing_domains[str(domain).strip().lower()] = host.get("id")
+
+    plans: List[Dict] = []
+    skipped = 0
+
+    for source in hosts:
+        host_id = source.get("id")
+        domains = [str(d) for d in source.get("domain_names", [])]
+        label = ", ".join(domains) or "(no domains)"
+
+        if len(domains) < 2:
+            console.print(f"[yellow]⚠️  Host {host_id} ({label}): needs at least two "
+                          f"domains to split — skipped[/yellow]")
+            skipped += 1
+            continue
+
+        moving = [d for d in domains if fnmatch(d.lower(), match.lower())]
+        staying = [d for d in domains if d not in moving]
+
+        if not moving:
+            console.print(f"[yellow]⚠️  Host {host_id} ({label}): nothing matches "
+                          f"'{match}' — skipped[/yellow]")
+            skipped += 1
+            continue
+
+        if not staying:
+            console.print(f"[yellow]⚠️  Host {host_id} ({label}): '{match}' matches every "
+                          f"domain and would leave the source empty — skipped[/yellow]")
+            skipped += 1
+            continue
+
+        clashes = {d: existing_domains[d.lower()] for d in moving
+                   if existing_domains.get(d.lower(), host_id) != host_id}
+        if clashes:
+            for domain, other in clashes.items():
+                console.print(f"[red]❌ Host {host_id}: {domain} is already on "
+                              f"host {other} — skipped[/red]")
+            skipped += 1
+            continue
+
+        plans.append({"source": source, "id": host_id, "all": domains,
+                      "moving": moving, "staying": staying})
+
+    if not plans:
+        console.print("[yellow]Nothing to split[/yellow]")
+        return
+
+    if preview:
+        console.print(f"\n[cyan]📋 Host Split Preview[/cyan]")
+        console.print(f"[cyan]   Moving domains matching [yellow]{match}[/yellow] onto new "
+                      f"hosts with certificate [yellow]{cert_id or 'none'}[/yellow][/cyan]\n")
+
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Host ID", style="yellow", justify="right")
+        table.add_column("Stays on source", style="white")
+        table.add_column("Moves to new host", style="green")
+        table.add_column("Source cert (kept)", style="cyan", justify="right")
+
+        for plan in plans:
+            table.add_row(
+                str(plan["id"]),
+                ", ".join(plan["staying"]),
+                ", ".join(plan["moving"]),
+                str(plan["source"].get("certificate_id") or "none"),
+            )
+
+        console.print(table)
+        console.print(f"\n[cyan]Total hosts to split: [yellow]{len(plans)}[/yellow][/cyan]")
+
+    validate_certificate_assignment(
+        client, cert_id,
+        [{"id": p["id"], "domain_names": p["moving"]} for p in plans])
+
+    # A split only fixes the half that moves. Warn when the half left behind
+    # keeps a certificate that no longer exists, since NPM renders those hosts
+    # with no TLS listener at all rather than reporting an error.
+    dangling: Dict[int, List[str]] = {}
+    for source_cert in {p["source"].get("certificate_id") for p in plans}:
+        if not source_cert:
+            continue
+        try:
+            client.get_certificate(source_cert)
+        except requests.HTTPError:
+            dangling[source_cert] = [str(p["id"]) for p in plans
+                                     if p["source"].get("certificate_id") == source_cert]
+
+    for source_cert, affected in sorted(dangling.items()):
+        console.print(f"\n[yellow]⚠️  Host(s) {', '.join(affected)} keep certificate "
+                      f"{source_cert}, which no longer exists — their remaining domains "
+                      f"stay HTTP-only until repointed:[/yellow]")
+        console.print(f"     [dim]host bulk-update certificate_id <cert> "
+                      f"--ids {','.join(affected)}[/dim]")
+
+    confirm_bulk(yes)
+
+    success_count = 0
+    error_count = 0
+
+    with console.status("[bold green]Splitting hosts...") as status:
+        for plan in plans:
+            host_id = plan["id"]
+            status.update(f"[bold green]Splitting host {host_id}...")
+
+            # Free the domains before creating the new host so the two never
+            # overlap: NPM rejects duplicates, and nginx would otherwise end up
+            # with two server blocks answering to the same name.
+            try:
+                client.update_host(host_id, {"domain_names": plan["staying"]})
+            except requests.HTTPError as exc:
+                console.print(f"  [red]❌ Host {host_id}: could not trim source - {exc}[/red]")
+                error_count += 1
+                continue
+
+            try:
+                new_host = client.create_host_from(
+                    plan["source"],
+                    {"domain_names": plan["moving"], "certificate_id": cert_id})
+            except requests.HTTPError as exc:
+                console.print(f"  [red]❌ Host {host_id}: create failed - {exc}[/red]")
+                try:
+                    client.update_host(host_id, {"domain_names": plan["all"]})
+                    console.print(f"     [green]↩ Host {host_id} restored[/green]")
+                except requests.HTTPError as restore_exc:
+                    console.print(f"     [red]‼ ROLLBACK FAILED: {restore_exc}[/red]")
+                    console.print(f"     [red]‼ Host {host_id} now holds "
+                                  f"{plan['staying']}; it originally held "
+                                  f"{plan['all']}[/red]")
+                error_count += 1
+                continue
+
+            console.print(f"  [green]✅ Host {host_id} → new host "
+                          f"{new_host.get('id')} ({', '.join(plan['moving'])})[/green]")
+            success_count += 1
+
+    print_bulk_summary(success_count, error_count, skipped)
+
+
 @host_app.command("ssl-enable")
 def host_ssl_enable(
-    host_id: int = typer.Argument(..., help="Host ID"),
-    cert_id: int = typer.Argument(..., help="Certificate ID")
+    cert_id: int = typer.Argument(..., help="Certificate ID to assign"),
+    host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs"),
+    pattern: str = typer.Option(None, "--pattern", "-p",
+                                help="Only process hosts matching this domain pattern"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    interactive: bool = typer.Option(False, "--interactive", "-I",
+                                     help="Interactively select hosts"),
 ):
-    """Enable SSL for a proxy host"""
-    client = get_client()
-    
-    if client.enable_host_ssl(host_id, cert_id):
-        console.print(f"[green]✅ SSL enabled for host {host_id} with certificate {cert_id}[/green]")
-    else:
-        console.print(f"[red]❌ Failed to enable SSL[/red]")
-        raise typer.Exit(1)
+    """
+    Assign a certificate to proxy hosts.
+
+    A convenience alias for `host bulk-update certificate_id <id>`, which is
+    where the cert validation and coverage warnings actually live. Only the
+    certificate changes; ssl_forced and http2_support are left alone.
+    """
+    host_bulk_update(
+        field="certificate_id",
+        value=str(cert_id),
+        host_ids=host_ids,
+        pattern=pattern,
+        preview=preview,
+        yes=yes,
+        interactive=interactive,
+    )
 
 
 @host_app.command("ssl-disable")
@@ -1377,12 +1987,18 @@ def host_acl_disable(host_id: int = typer.Argument(..., help="Host ID")):
 # =============================================================================
 
 @cert_app.command("list")
-def cert_list():
+def cert_list(
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON instead of a table")
+):
     """List all SSL certificates"""
     client = get_client()
-    
+
     certs = client.list_certificates()
-    
+
+    if as_json:
+        print_json(certs)
+        return
+
     if not certs:
         console.print("[yellow]No certificates found[/yellow]")
         return
@@ -1399,19 +2015,21 @@ def cert_list():
         domains = ", ".join(cert.get("domain_names", ["?"]))
         provider = cert.get("provider", "unknown")
         expires = cert.get("expires_on", "N/A")
-        expired = cert.get("expired", False)
-        status = "[red]❌ EXPIRED[/red]" if expired else "[green]✅ VALID[/green]"
-        
+        status = cert_status_label(cert)
+
         table.add_row(cert_id, domains, provider, expires, status)
     
     console.print(table)
 
 
 @cert_app.command("show")
-def cert_show(identifier: str = typer.Argument(..., help="Certificate ID or domain name")):
+def cert_show(
+    identifier: str = typer.Argument(..., help="Certificate ID or domain name"),
+    as_json: bool = typer.Option(False, "--json", help="Output raw JSON instead of a summary")
+):
     """Show certificate details"""
     client = get_client()
-    
+
     # Check if it's an ID
     if identifier.isdigit():
         try:
@@ -1428,15 +2046,18 @@ def cert_show(identifier: str = typer.Argument(..., help="Certificate ID or doma
         if not certs:
             console.print(f"[yellow]No certificates found for '{identifier}'[/yellow]")
             return
-    
+
+    if as_json:
+        print_json(certs[0] if identifier.isdigit() else certs)
+        return
+
     for cert in certs:
         console.print(f"\n[cyan]🔒 Certificate ID: {cert.get('id')}[/cyan]")
         console.print(f"   Domains: {', '.join(cert.get('domain_names', []))}")
         console.print(f"   Provider: {cert.get('provider')}")
         console.print(f"   Created: {cert.get('created_on', 'N/A')}")
         console.print(f"   Expires: {cert.get('expires_on', 'N/A')}")
-        expired = cert.get("expired", False)
-        console.print(f"   Status: {'[red]❌ EXPIRED[/red]' if expired else '[green]✅ VALID[/green]'}")
+        console.print(f"   Status: {cert_status_label(cert)}")
 
 
 @cert_app.command("generate")
@@ -1466,10 +2087,16 @@ def cert_generate(
     
     # Check for existing certificate
     existing = client.find_certificate(domain)
-    if existing and not existing.get("expired"):
-        console.print(f"[yellow]🔔 Valid certificate already exists for {domain}[/yellow]")
-        console.print(f"   Certificate ID: {existing.get('id')}")
-        return
+    if existing:
+        # Only refuse when the existing cert is demonstrably still valid; an
+        # unreadable expiry falls through and regenerates rather than blocking
+        days = cert_days_remaining(existing)
+        if days is not None and days >= 0:
+            console.print(f"[yellow]🔔 Valid certificate already exists for {domain}[/yellow]")
+            console.print(f"   Certificate ID: {existing.get('id')} — {cert_status_label(existing)}")
+            return
+        console.print(f"[yellow]♻️  Replacing certificate {existing.get('id')} for {domain} "
+                      f"— {cert_status_label(existing)}[/yellow]")
     
     if not yes:
         console.print(f"\n[yellow]📝 Certificate generation parameters:[/yellow]")
@@ -1748,8 +2375,11 @@ def host_bulk_add_domain(
                 console.print("[red]❌ Invalid selection[/red]")
                 raise typer.Exit(1)
     else:
-        hosts_to_process = all_hosts
-    
+        # Previously fell through to every host, so a bare invocation with no
+        # filter would rewrite the entire estate
+        console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
+        raise typer.Exit(1)
+
     if not hosts_to_process:
         console.print("[yellow]No hosts selected for processing[/yellow]")
         return
@@ -1791,7 +2421,7 @@ def host_bulk_add_domain(
         return
     
     # Preview changes
-    if preview or not yes:
+    if preview:
         console.print(f"\n[cyan]📋 Bulk Domain Addition Preview[/cyan]")
         console.print(f"[cyan]   New base domain: [yellow]{new_domain}[/yellow][/cyan]\n")
         
@@ -1890,8 +2520,11 @@ def host_bulk_remove_domain(
                 console.print("[red]❌ Invalid selection[/red]")
                 raise typer.Exit(1)
     else:
-        hosts_to_process = all_hosts
-    
+        # Previously fell through to every host, so a bare invocation with no
+        # filter would rewrite the entire estate
+        console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
+        raise typer.Exit(1)
+
     # Calculate changes
     changes = []
     for host in hosts_to_process:
@@ -1917,7 +2550,7 @@ def host_bulk_remove_domain(
         return
     
     # Preview changes
-    if preview or not yes:
+    if preview:
         console.print(f"\n[cyan]📋 Bulk Domain Removal Preview[/cyan]")
         console.print(f"[cyan]   Pattern to remove: [red]{domain_pattern}[/red][/cyan]\n")
         
@@ -2070,7 +2703,7 @@ def host_bulk_replace_domain(
         return
     
     # Preview changes
-    if preview or not yes:
+    if preview:
         console.print(f"\n[cyan]📋 Bulk Domain Replacement Preview[/cyan]")
         console.print(f"[cyan]   Replace: [red]{old_domain}[/red] → [green]{new_domain}[/green][/cyan]\n")
         
@@ -2139,62 +2772,21 @@ def host_bulk_update(
     """
     client = get_client()
     
-    # Convert value to appropriate type
-    if value.lower() == "true":
-        typed_value = True
-    elif value.lower() == "false":
-        typed_value = False
-    elif value.isdigit():
-        typed_value = int(value)
-    else:
-        typed_value = value
-    
-    all_hosts = client.list_hosts()
-    
-    if not all_hosts:
-        console.print("[yellow]No proxy hosts found[/yellow]")
-        return
-    
-    # Filter hosts
-    if host_ids:
-        selected_ids = [int(x.strip()) for x in host_ids.split(",")]
-        hosts_to_process = [h for h in all_hosts if h.get("id") in selected_ids]
-    elif pattern:
-        hosts_to_process = [
-            h for h in all_hosts 
-            if any(pattern.lower() in d.lower() for d in h.get("domain_names", []))
-        ]
-    elif interactive:
-        console.print("\n[cyan]Select hosts to update:[/cyan]\n")
-        
-        for idx, host in enumerate(all_hosts):
-            host_id = host.get("id")
-            domains = ", ".join(host.get("domain_names", []))
-            current_val = host.get(field, "N/A")
-            console.print(f"  [{idx + 1}] [yellow]ID {host_id}[/yellow]: [green]{domains}[/green] ({field}={current_val})")
-        
-        console.print("\n[cyan]Enter host numbers (comma-separated) or 'all' for all hosts:[/cyan]")
-        selection = typer.prompt("Selection")
-        
-        if selection.lower() == "all":
-            hosts_to_process = all_hosts
-        else:
-            try:
-                indices = [int(x.strip()) - 1 for x in selection.split(",")]
-                hosts_to_process = [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
-            except (ValueError, IndexError):
-                console.print("[red]❌ Invalid selection[/red]")
-                raise typer.Exit(1)
-    else:
-        console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
+    try:
+        typed_value = coerce_field_value(field, value)
+    except ValueError as exc:
+        console.print(f"[red]❌ {exc}[/red]")
         raise typer.Exit(1)
-    
+
+    hosts_to_process = select_hosts(client, host_ids, pattern, interactive,
+                                    detail_field=field)
+
     if not hosts_to_process:
         console.print("[yellow]No hosts selected for processing[/yellow]")
         return
     
     # Preview changes
-    if preview or not yes:
+    if preview:
         console.print(f"\n[cyan]📋 Bulk Update Preview[/cyan]")
         console.print(f"[cyan]   Field: [yellow]{field}[/yellow] → [green]{typed_value}[/green][/cyan]\n")
         
@@ -2213,36 +2805,33 @@ def host_bulk_update(
             )
         
         console.print(table)
-        console.print(f"\n[cyan]Total hosts to update: [yellow]{len(hosts_to_process)}[/yellow][/cyan]\n")
-    
-    # Confirm
-    if not yes:
-        if not typer.confirm("Apply these changes?"):
-            console.print("[red]❌ Cancelled[/red]")
-            raise typer.Exit(0)
-    
-    # Apply changes
+        console.print(f"\n[cyan]Total hosts to update: [yellow]{len(hosts_to_process)}[/yellow][/cyan]")
+
+    # Field-aware validation. Pointing a host at a deleted certificate makes
+    # NPM render it with no TLS listener at all rather than failing loudly.
+    if field == "certificate_id":
+        if not validate_certificate_assignment(client, typed_value, hosts_to_process):
+            raise typer.Exit(1)
+
+    confirm_bulk(yes)
+
     success_count = 0
     error_count = 0
-    
+
     with console.status("[bold green]Applying changes...") as status:
         for host in hosts_to_process:
             host_id = host.get("id")
-            
+
             try:
                 status.update(f"[bold green]Updating host {host_id}...")
                 client.update_host(host_id, {field: typed_value})
                 console.print(f"  [green]✅ Host {host_id}: {field}={typed_value}[/green]")
                 success_count += 1
-            except Exception as e:
+            except requests.HTTPError as e:
                 console.print(f"  [red]❌ Host {host_id}: Failed - {e}[/red]")
                 error_count += 1
-    
-    # Summary
-    console.print(f"\n[cyan]📊 Summary:[/cyan]")
-    console.print(f"   [green]✅ Successful: {success_count}[/green]")
-    if error_count:
-        console.print(f"   [red]❌ Failed: {error_count}[/red]")
+
+    print_bulk_summary(success_count, error_count)
 
 
 @acl_app.command("list")

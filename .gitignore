@@ -4,6 +4,10 @@ venv/
 env/
 .env/
 
+# Environment files (the .env/ above only matches a directory)
+.env
+.env.*
+
 # Build artifacts
 build/
 dist/
@@ -32,8 +36,20 @@ npm-api.conf
 # Token and data files
 data/
 token/
+backups/
 *.txt
 !requirements.txt
+!requirements-*.txt
+
+# Certificate material. `cert download` defaults to ./certificates and writes
+# a private key there, so never let one be staged from inside a clone.
+certificates/
+*.key
+*.pem
+*.crt
+*.cer
+*.pfx
+*.p12
 
 # IDE
 .idea/

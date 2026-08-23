@@ -12,7 +12,9 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 - 👥 User management
 - 🛡️ Access list management
 - 📦 Bulk operations (add/remove/replace domains across multiple hosts)
-- 💾 Full backup and restore
+- ✂️ Split and clone hosts so each domain can carry its own certificate
+- 🧾 JSON output (`--json`) for scripting and `jq`
+- 💾 Full backup of hosts, certificates, access lists, users and settings
 - 🔐 Secure credential handling via environment variables or config files
 
 ## Installation
@@ -70,6 +72,7 @@ Config file locations (searched in order):
 1. `./npm-api.conf`
 2. `~/.config/npm-api/npm-api.conf`
 3. `/etc/npm-api/npm-api.conf`
+4. `<directory of the script or binary>/npm-api.conf`
 
 ## Quick Start
 
@@ -86,8 +89,11 @@ npm-api host create example.com -i 192.168.1.10 -p 8080
 # Generate SSL certificate
 npm-api cert generate example.com
 
-# Enable SSL for a host
-npm-api host ssl-enable 42 123
+# Assign certificate 123 to host 42
+npm-api host ssl-enable 123 --ids 42
+
+# Move the internal names off host 42 onto a host of their own, with its own cert
+npm-api host split '*.internal.lan' --cert 5 --ids 42
 
 # Bulk add a domain to multiple hosts
 npm-api host bulk-add-domain newdomain.com --interactive
@@ -110,30 +116,129 @@ npm-api acl --help          Access list management
 
 | Command | Description |
 |---------|-------------|
-| `host list` | List all proxy hosts |
-| `host show <id>` | Show host details |
+| `host list [--json]` | List all proxy hosts |
+| `host show <id> [--json]` | Show host details |
 | `host search <pattern>` | Search hosts by domain |
 | `host create <domain> -i <ip> -p <port>` | Create new host |
+| `host clone <id> --domain <domain>` | Copy a host to new domains |
+| `host split <glob> --cert <cert_id>` | Move matching domains onto new hosts |
 | `host delete <id>` | Delete a host |
 | `host enable <id>` | Enable a host |
 | `host disable <id>` | Disable a host |
 | `host update <id> <field>=<value>` | Update a host field |
-| `host ssl-enable <id> <cert_id>` | Enable SSL |
+| `host ssl-enable <cert_id>` | Assign a certificate to hosts |
 | `host ssl-disable <id>` | Disable SSL |
 | `host bulk-add-domain <domain>` | Add domain to multiple hosts |
 | `host bulk-remove-domain <pattern>` | Remove domains from hosts |
 | `host bulk-replace-domain <old> <new>` | Replace domain in hosts |
 | `host bulk-update <field> <value>` | Update field across hosts |
 
+#### Selecting Hosts
+
+Commands that write to more than one host take a selector, and all but
+`bulk-replace-domain` refuse to run without one — a bare
+`host bulk-remove-domain com` would otherwise rewrite every host you have:
+
+| Command | Selectors |
+|---------|-----------|
+| `host split` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host bulk-update` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host bulk-add-domain` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host bulk-remove-domain` | `--ids 1,2,3` · `--interactive` |
+| `host bulk-replace-domain` | `--ids 1,2,3` · `--interactive` (defaults to every host holding the old domain) |
+
+On `host split`, `host ssl-enable` and `host bulk-update`, `--pattern` accepts
+either a glob or a plain substring, so `*.internal.lan` and `internal.lan` both work;
+on `host bulk-add-domain` it is a plain substring match. Every command in the
+table also takes `--preview/--no-preview` (preview is on by default) and
+`-y`/`--yes` to skip the confirmation prompt.
+
 ### Certificate Commands
 
 | Command | Description |
 |---------|-------------|
-| `cert list` | List all certificates |
-| `cert show <id or domain>` | Show certificate details |
+| `cert list [--json]` | List all certificates |
+| `cert show <id or domain> [--json]` | Show certificate details |
 | `cert generate <domain>` | Generate Let's Encrypt cert |
 | `cert delete <id>` | Delete a certificate |
 | `cert download <id>` | Download certificate files |
+
+Certificate validity is derived from the certificate's `expires_on` date:
+certificates within 30 days of expiry are flagged with the days remaining,
+expired ones are shown with how long ago they lapsed, and a certificate with no
+readable expiry is reported as UNKNOWN rather than assumed valid.
+
+## Splitting Dual-Domain Hosts
+
+NPM renders one nginx `server` block per proxy host, with a single
+`ssl_certificate`. A host that answers to both an internal and a public name —
+say `app.internal.lan` and `app.example.com` — can therefore only ever present
+**one** certificate, and whichever name that certificate does not cover throws
+an SSL error in the browser.
+
+`host split` fixes this by moving the matching names out onto brand-new hosts
+that carry a certificate of their own. The source host keeps its remaining
+domains **and its existing certificate** — split never touches the source's
+cert. Everything else (websockets, force SSL, HSTS, custom locations, advanced
+config, access list) is copied to the new host verbatim.
+
+```bash
+# 1. Always back up first
+npm-api backup
+
+# 2. Preview: move every *.internal.lan name off hosts 11, 12 and 13 onto new
+#    hosts carrying the internal wildcard certificate (ID 5)
+npm-api host split '*.internal.lan' --cert 5 --ids 11,12,13
+```
+
+The preview lists, per host, the domains that stay, the domains that move, and
+the certificate the source will keep. Nothing is written until you confirm —
+add `-y` to skip the prompt, or `--no-preview` to suppress the table.
+
+```bash
+# 3. The sources now hold only their public names, but still carry the
+#    internal certificate they started with. Repoint them at the public one.
+npm-api host bulk-update certificate_id 6 --ids 11,12,13
+```
+
+Quote the glob so your shell does not expand it. Matching uses `fnmatch`, where
+`*` also spans dots, so `*.internal.lan` matches `a.b.internal.lan` as well as
+`app.internal.lan`.
+
+**Safety behaviour:**
+
+- A host is **skipped with a warning** (not a hard failure) when it has fewer
+  than two domains, or when the glob matches none or all of its domains — so
+  you can select a whole batch and let the irrelevant ones fall out.
+- Domain collisions against every existing host are checked before anything is
+  written; a clashing host is skipped and reported.
+- The source's domain list is trimmed **before** the new host is created, so
+  the two never hold the same domain at once (NPM rejects duplicates). If the
+  create then fails, the source is rolled back; if the rollback also fails, the
+  original domain list is printed so you can restore it by hand.
+- The command exits non-zero if any host failed.
+
+## Cloning a Host
+
+`host clone` copies a host onto new domains and never modifies the source.
+
+```bash
+# Inherit the source's certificate
+npm-api host clone 42 --domain app.example.com
+
+# Several domains, an explicit certificate and a different backend port
+npm-api host clone 42 --domain a.example.com --domain b.example.com \
+    --cert 15 --forward-port 8081
+
+# No certificate at all
+npm-api host clone 42 --domain plain.example.com --cert none
+```
+
+`--domain` is required and repeatable — NPM requires unique domain names, so a
+clone always needs new ones. `--cert` is optional and inherits the source's
+certificate when omitted. Wildcard domains, and domains already claimed by
+another host, are rejected.
 
 ## Bulk Operations
 
@@ -146,14 +251,64 @@ Powerful bulk operations for managing multiple hosts:
 npm-api host bulk-add-domain domain3.com --interactive
 
 # Remove domains matching a pattern
-npm-api host bulk-remove-domain olddomain.com
+npm-api host bulk-remove-domain olddomain.com --ids 1,2,3
 
 # Replace one domain with another
 npm-api host bulk-replace-domain old.com new.com
 
 # Update a field across multiple hosts
 npm-api host bulk-update forward_host 192.168.1.100 --ids 1,2,3
+
+# List fields are split on commas; free-text fields keep theirs
+npm-api host update 42 domain_names=a.lan,b.lan
+npm-api host update 42 'locations=[{"path":"/api","forward_host":"10.0.0.5","forward_port":8080,"forward_scheme":"http"}]'
 ```
+
+`host update` and `host bulk-update` take `field=value` / `<field> <value>`
+pairs. `true`/`false` become booleans, `null`/`none` become null, whole numbers
+become integers, and a value starting with `[` or `{` is parsed as JSON. Only
+the list fields (`domain_names`, `locations`) are split on commas, so
+`advanced_config` and other free text keep their commas intact.
+
+`host split`, `host ssl-enable` and `host bulk-update` exit non-zero if any
+host failed, so partial failures are visible to scripts.
+
+## JSON Output
+
+`host list`, `host show`, `cert list` and `cert show` accept `--json`. Output is
+unstyled and written to stdout, so it pipes straight into `jq`:
+
+```bash
+npm-api host list --json | jq '.[] | select(.certificate_id == 27) | .id'
+npm-api host show 42 --json | jq -r '.domain_names[]'
+npm-api cert list --json | jq '.[] | {id, domain_names, expires_on}'
+```
+
+`cert show <id> --json` emits a single object; `cert show <domain> --json`
+emits an array of every matching certificate.
+
+## Gotcha: Deleted Certificates Leave Dangling IDs
+
+If you delete a certificate from the NPM UI, every host still referencing it
+keeps the now-dangling `certificate_id`. NPM then renders those hosts with no
+`listen 443 ssl` line at all, silently dropping them to HTTP-only: HTTPS
+requests fall through to another server block and present the wrong
+certificate. `cert list` will not show the deleted certificate, but `host list`
+still displays its ID in the SSL column.
+
+To find dangling references, compare the two lists:
+
+```bash
+npm-api cert list --json | jq '[.[].id]'
+npm-api host list --json | jq '[.[] | {id, domain_names, certificate_id}]'
+```
+
+Assigning a certificate through `host bulk-update certificate_id <id>` or
+`host ssl-enable <id>` now guards against creating one: the certificate must
+exist, its expiry is reported, and any host domain the certificate does not
+cover is flagged. Coverage is checked against the domain list NPM records for
+the certificate, which for uploaded certificates can be incomplete — when that
+list is unusable the tool says coverage was not verified rather than guessing.
 
 ## Security
 
@@ -161,6 +316,10 @@ npm-api host bulk-update forward_host 192.168.1.100 --ids 1,2,3
 - Use **environment variables** in CI/CD and Docker
 - Config files are automatically excluded via `.gitignore`
 - Secure config files with `chmod 600`
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes, including breaking changes.
 
 ## Credits
 
