@@ -1,6 +1,6 @@
 # NPM-API
 
-[![Build and Release](https://github.com/ghostbuster1002/npm-api/actions/workflows/build.yml/badge.svg)](https://github.com/ghostbuster1002/npm-api/actions/workflows/build.yml)
+[![Build and Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
@@ -21,16 +21,16 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 
 ### Download Pre-built Binary
 
-Download the latest release for your platform from [Releases](https://github.com/ghostbuster1002/npm-api/releases):
+Download the latest release for your platform from [Releases](https://github.com/ghostbuster1002/npm_api/releases):
 
 ```bash
 # Linux
-wget https://github.com/ghostbuster1002/npm-api/releases/latest/download/npm-api-linux-amd64
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-amd64
 chmod +x npm-api-linux-amd64
 sudo mv npm-api-linux-amd64 /usr/local/bin/npm-api
 
 # macOS
-wget https://github.com/ghostbuster1002/npm-api/releases/latest/download/npm-api-macos-amd64
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-amd64
 chmod +x npm-api-macos-amd64
 sudo mv npm-api-macos-amd64 /usr/local/bin/npm-api
 ```
@@ -38,7 +38,7 @@ sudo mv npm-api-macos-amd64 /usr/local/bin/npm-api
 ### Build from Source
 
 ```bash
-git clone https://github.com/ghostbuster1002/npm-api.git
+git clone https://github.com/ghostbuster1002/npm_api.git
 cd npm-api
 make build
 sudo make install
