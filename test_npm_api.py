@@ -4425,5 +4425,1699 @@ class TestCertificateStatusLabelling(_ConsoleTestCase):
         self.assertPrinted("not covered")
 
 
+# =============================================================================
+# host split & host clone: shared doubles
+# =============================================================================
+
+def _live_cert(cert_id=7, domains=("*.internal.lan",)):
+    """A certificate that exists and is nowhere near expiry.
+
+    Given a domain list that covers the names it is handed below, so that the
+    only thing a coverage warning can mean in these tests is a real one.
+    """
+    return {"id": cert_id, "domain_names": list(domains),
+            "expires_on": _expires_in(timedelta(days=90))}
+
+
+class _SplitClient(_MergeClient):
+    """_MergeClient, plus the overrides each create carried.
+
+    Merge calls create_host_from only to undo a delete, so it passes no
+    overrides and the base class records the source ID alone. Split's create is
+    the point of the command — the domains being moved and the certificate the
+    new host is given arrive in that argument and nowhere else — so they are
+    recorded too, on the same ordered list as everything else.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.created_overrides = []
+
+    def create_host_from(self, source, overrides):
+        # Recorded before delegating, because super() raises for the rollback
+        # tests and "the create was attempted, carrying this" is the fact those
+        # tests are about.
+        self.created_overrides.append(overrides)
+        return super().create_host_from(source, overrides)
+
+
+class _SplitCommandTestCase(_MergeCommandTestCase):
+    """Runs host_split end to end against a stub.
+
+    Every argument is passed explicitly for the same reason merge's driver does
+    it: the defaults on a Typer command's signature are typer.OptionInfo
+    objects, so an omitted argument arrives truthy and the run under test would
+    not be the one the test describes. --cert is a required option on split, so
+    it has no default to get wrong; it is spelled out here all the same.
+    """
+
+    def _client(self, target, sources, **kwargs):
+        return _SplitClient(target, sources, self.workdir, **kwargs)
+
+    def _split(self, client, match, **overrides):
+        options = dict(match=match, cert="none", host_ids=None, pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_split(**options)
+
+    def _split_expecting_exit(self, client, match, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._split(client, match, **overrides)
+        return caught.exception
+
+
+class _CloneCommandTestCase(_MixedBaseTestCase):
+    """host_clone's driver already exists on _MixedBaseTestCase.
+
+    Inherited rather than repeated; this subclass exists to add the
+    expecting-an-exit variant and to give the classes below a name that says
+    what they are driving.
+    """
+
+    def _clone_expecting_exit(self, client, domains, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._clone(client, domains, **overrides)
+        return caught.exception
+
+
+# =============================================================================
+# host split: the certificate that is not there
+# =============================================================================
+
+class TestHostSplitMissingCertificate(_SplitCommandTestCase):
+    """Split must not create hosts pointed at a certificate NPM does not have.
+
+    NPM wraps the whole `listen 443 ssl` block in a conditional on the linked
+    certificate, so such a host is rendered with no TLS listener at all and
+    reports nothing wrong — the domains simply stop answering on 443. All three
+    of merge, clone and split ignored validate_certificate_assignment's return
+    value until 86380ad; only merge got a test out of it.
+    """
+
+    def _source(self):
+        return _merge_host(12, ["app.example.com", "api.internal.lan"])
+
+    def test_a_certificate_that_does_not_exist_stops_the_split(self):
+        client = self._client(self._source(), [])
+
+        exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                    cert="99", host_ids="12")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        # Nothing trimmed and nothing created. The refusal has to land before
+        # the first write, because the first write is the one that takes the
+        # moving domains off the source: stopping after it and before the
+        # create would leave them served by nothing at all.
+        self.assertEqual(client.calls, [])
+        self.assertEqual(client.created_overrides, [])
+        self.assertPrinted("Certificate 99 does not exist")
+
+    def test_the_refusal_explains_what_would_have_happened(self):
+        client = self._client(self._source(), [])
+
+        self._split_expecting_exit(client, "*.internal.lan", cert="99", host_ids="12")
+
+        self.assertPrinted("Refusing to split")
+        self.assertPrinted("no TLS listener")
+        # Both ways out are named: a real certificate, or an explicit decision
+        # to create the new hosts HTTP-only.
+        self.assertPrinted("--cert none")
+
+    def test_the_lookup_happens_once_however_many_hosts_are_being_split(self):
+        client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]),
+                              [_merge_host(13, ["shop.example.com", "db.internal.lan"])])
+
+        self._split_expecting_exit(client, "*.internal.lan", cert="99",
+                                   host_ids="12,13")
+
+        self.assertEqual(client.cert_lookups, [99])
+        self.assertEqual(client.calls, [])
+
+    def test_cert_none_needs_no_certificate_lookup(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [])
+        self.assertEqual(client.kinds, ["update", "create"])
+
+    def test_a_certificate_that_exists_lets_the_split_through(self):
+        client = self._client(self._source(), [], certificate=_live_cert())
+
+        self._split(client, "*.internal.lan", cert="7", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [7])
+        self.assertEqual(client.kinds, ["update", "create"])
+
+
+# =============================================================================
+# host clone: the certificate that is not there
+# =============================================================================
+
+class TestHostCloneMissingCertificate(_CloneCommandTestCase):
+    """The same refusal on the command that creates a host from scratch.
+
+    Clone has two ways to arrive at a certificate ID — named with --cert, or
+    inherited from the host being copied — and both have to be checked. The
+    inherited one is the likelier failure in practice: deleting a certificate
+    in NPM's UI leaves every host that referenced it pointing at the dead ID,
+    and cloning one of those hosts propagates the fault to a second host.
+    """
+
+    def test_an_explicit_certificate_that_does_not_exist_stops_the_clone(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        exit_exception = self._clone_expecting_exit(
+            client, ["shop.example.com"], cert="99")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Certificate 99 does not exist")
+
+    def test_an_inherited_certificate_that_is_gone_also_stops_the_clone(self):
+        # No --cert at all: the ID comes off the source host, which NPM is
+        # perfectly happy to keep serving a stale reference on.
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=4), [])
+
+        exit_exception = self._clone_expecting_exit(client, ["shop.example.com"])
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(client.cert_lookups, [4])
+        self.assertPrinted("Certificate 4 does not exist")
+
+    def test_the_refusal_explains_what_would_have_happened(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._clone_expecting_exit(client, ["shop.example.com"], cert="99")
+
+        self.assertPrinted("Refusing to clone")
+        self.assertPrinted("no TLS listener")
+        self.assertPrinted("--cert none")
+
+    def test_cert_none_needs_no_certificate_lookup(self):
+        # Even when the source carries one: --cert none is an override, so the
+        # source's dead reference is never followed.
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=4), [])
+
+        self._clone(client, ["shop.example.com"], cert="none")
+
+        self.assertEqual(client.cert_lookups, [])
+        self.assertEqual(client.recreated_ids, [12])
+
+    def test_a_source_with_no_certificate_needs_no_lookup_either(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._clone(client, ["shop.example.com"])
+
+        self.assertEqual(client.cert_lookups, [])
+        self.assertEqual(client.recreated_ids, [12])
+
+    def test_an_inherited_certificate_that_exists_lets_the_clone_through(self):
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=7),
+                              [], certificate=_live_cert(domains=("*.example.com",)))
+
+        self._clone(client, ["shop.example.com"])
+
+        self.assertEqual(client.cert_lookups, [7])
+        self.assertEqual(client.recreated_ids, [12])
+        self.assertPrinted("Created host")
+
+
+# =============================================================================
+# host split: rollback
+# =============================================================================
+
+class TestHostSplitRollback(_SplitCommandTestCase):
+    """What becomes of the source when the new host cannot be created.
+
+    Split frees the moving domains off the source before creating the host that
+    is to take them, because NPM refuses to let two hosts hold the same name.
+    That leaves a window in which those domains belong to nobody, and a failed
+    create has to close it by writing the original list back. Unlike merge,
+    split writes no snapshot first — the only record of the original list is
+    the one held in memory for the duration of the run.
+    """
+
+    def _source(self):
+        return _merge_host(12, ["app.example.com", "api.internal.lan"])
+
+    _ORIGINAL = ["app.example.com", "api.internal.lan"]
+    _TRIMMED = ["app.example.com"]
+
+    def test_a_failed_create_puts_the_original_domains_back(self):
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"))
+
+        exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                    host_ids="12")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        # Read as a sequence: trim, attempt, undo. The third call is the whole
+        # point — without it the host stays trimmed and api.internal.lan is
+        # served by nothing, which is worse than never having run the command.
+        self.assertEqual(client.calls, [
+            ("update", 12, {"domain_names": self._TRIMMED}),
+            ("create", 12),
+            ("update", 12, {"domain_names": self._ORIGINAL}),
+        ])
+        self.assertPrinted("Host 12 restored")
+
+    def test_the_failure_is_attributed_to_the_host_it_happened_on(self):
+        # A batch split reports per host, so the ID has to be on the line: the
+        # summary at the end gives a count and nothing else.
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"))
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("Host 12: create failed")
+
+    def test_the_failure_carries_the_reason_npm_gave(self):
+        # Regression. Four HTTPError reports in split and clone interpolated
+        # the exception directly, so NPM's "Domain already in use" was replaced
+        # by requests' "400 Client Error: Bad Request for url: http://.../api/
+        # nginx/proxy-hosts" — the URL the operator already knows, and none of
+        # the reason. Every other HTTPError report in the tool goes through
+        # format_http_error; these two commands were added together and missed
+        # the convention.
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"))
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("Create refused")
+        self.assertNotPrinted("Client Error")
+
+    def test_a_failed_trim_never_reaches_the_create(self):
+        # Nothing has moved yet, so there is nothing to undo: the host still
+        # holds every domain it started with.
+        client = self._client(self._source(), [], update_fail_calls={1})
+
+        exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                    host_ids="12")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.kinds, ["update"])
+        self.assertEqual(client.created_overrides, [])
+        self.assertPrinted("could not trim source")
+
+    def test_a_failed_rollback_is_announced_as_one(self):
+        # The trim succeeded (update 1) and the restoring write did not
+        # (update 2), so the host is now short the domains that were to move
+        # and nothing was created to serve them.
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"),
+                              update_fail_calls={2})
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("ROLLBACK FAILED")
+        self.assertNotPrinted("Host 12 restored")
+
+    def test_a_failed_rollback_carries_the_reason_npm_gave(self):
+        # The most important of the four lines that were interpolating the
+        # exception directly. By this point the rollback has already failed and
+        # the domain list has to be repaired by hand, so why NPM refused the
+        # restoring write is the single most useful thing on screen — and a
+        # bare repr replaces it with the URL the operator already knows.
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"),
+                              error=_npm_http_error(message="Restore refused"),
+                              update_fail_calls={2})
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("ROLLBACK FAILED: HTTP 400: Restore refused")
+        self.assertNotPrinted("Client Error")
+
+    def test_a_failed_rollback_prints_the_original_domain_list(self):
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"),
+                              update_fail_calls={2})
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        # It has to be printed in full because at this point it exists nowhere
+        # else. Split takes no snapshot, and NPM has already been told the host
+        # holds the shorter list, so the terminal is the only place left to
+        # read the original from when repairing this by hand.
+        self.assertPrinted(f"it originally held {self._ORIGINAL}")
+
+    def test_a_failed_rollback_also_prints_what_the_host_holds_now(self):
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"),
+                              update_fail_calls={2})
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        # Both halves, so the difference between them is the repair.
+        self.assertPrinted(f"Host 12 now holds {self._TRIMMED}")
+
+    def test_a_failed_host_does_not_abandon_the_ones_after_it(self):
+        # The first host's trim is rejected; the second must still be split.
+        # A bulk command that stopped at the first failure would leave a batch
+        # half-done with no indication of where it got to.
+        client = self._client(self._source(),
+                              [_merge_host(13, ["shop.example.com", "db.internal.lan"])],
+                              update_fail_calls={1})
+
+        exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                    host_ids="12,13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.kinds, ["update", "update", "create"])
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_a_rolled_back_host_is_not_counted_as_a_success(self):
+        client = self._client(self._source(), [],
+                              restore_error=_npm_http_error(message="Create refused"))
+
+        self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("Successful: 0")
+        self.assertPrinted("Failed: 1")
+
+
+# =============================================================================
+# host split: the hosts it steps over
+# =============================================================================
+
+class TestHostSplitSkips(_SplitCommandTestCase):
+    """Which hosts a split declines to touch, and why that is not a failure.
+
+    A split is normally aimed at a batch picked out by --pattern, so a host the
+    glob cannot usefully split is reported and stepped over rather than taking
+    the run down with it. Every skip is decided before the first write, so a
+    skipped host is never left half-processed.
+    """
+
+    def test_a_host_with_one_domain_is_skipped(self):
+        # There is no split to make: the moved half and the kept half cannot
+        # both be non-empty.
+        client = self._client(_merge_host(12, ["api.internal.lan"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("needs at least two")
+
+    def test_a_host_with_no_domains_at_all_is_skipped(self):
+        client = self._client(_merge_host(12, []), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("(no domains)")
+
+    def test_a_glob_matching_nothing_is_skipped(self):
+        client = self._client(_merge_host(12, ["app.example.com", "www.example.com"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("nothing matches")
+
+    def test_a_glob_matching_every_domain_is_skipped(self):
+        # Moving all of them would leave the source holding an empty domain
+        # list — a host NPM keeps and nginx can route nothing to. Splitting a
+        # whole host onto a new one is a certificate change, not a split.
+        client = self._client(_merge_host(12, ["api.internal.lan", "db.internal.lan"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("would leave the source empty")
+
+    def test_a_moving_domain_already_on_another_host_is_skipped(self):
+        # NPM rejects duplicates, so the create would fail and the trim would
+        # have to be rolled back. Cheaper and safer to notice beforehand.
+        client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]),
+                              [_merge_host(13, ["api.internal.lan"])])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("already on host 13")
+
+    def test_every_host_skipped_writes_nothing_and_says_so(self):
+        client = self._client(_merge_host(12, ["api.internal.lan"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Nothing to split")
+
+    def test_no_hosts_selected_writes_nothing(self):
+        client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="99")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("No hosts selected")
+
+    def test_a_skip_beside_a_success_is_reported_without_failing_the_run(self):
+        # The property that matters: a skipped host is a decision the command
+        # made about an input it was given, not an operation that went wrong,
+        # so it must not turn a scheduled batch red.
+        client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]),
+                              [_merge_host(13, ["only.example.com"])])
+
+        self._split(client, "*.internal.lan", host_ids="12,13")
+
+        self.assertEqual(client.kinds, ["update", "create"])
+        self.assertPrinted("Skipped: 1")
+        self.assertPrinted("Successful: 1")
+        self.assertNotPrinted("Failed:")
+
+    def test_a_skip_beside_a_failure_still_exits_1(self):
+        client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]),
+                              [_merge_host(13, ["only.example.com"])],
+                              update_fail_calls={1})
+
+        exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                    host_ids="12,13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertPrinted("Skipped: 1")
+        self.assertPrinted("Failed: 1")
+
+
+# =============================================================================
+# host split: a clean run
+# =============================================================================
+
+class TestHostSplitCleanRun(_SplitCommandTestCase):
+    """What a successful split actually writes, and in what order."""
+
+    def _source(self, **overrides):
+        return _merge_host(12, ["app.example.com", "api.internal.lan"], **overrides)
+
+    def test_the_source_is_trimmed_before_the_new_host_is_created(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.kinds, ["update", "create"])
+
+    def test_the_source_keeps_exactly_the_domains_that_did_not_match(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.updates, [(12, {"domain_names": ["app.example.com"]})])
+
+    def test_only_the_domain_list_is_written_to_the_source(self):
+        # update_host carries every other field over untouched, so naming one
+        # key here is what keeps the source's own certificate, its advanced
+        # config and its custom locations where they were.
+        client = self._client(self._source(certificate_id=7), [],
+                              certificate=_live_cert())
+
+        self._split(client, "*.internal.lan", cert="7", host_ids="12")
+
+        (_, updates), = client.updates
+        self.assertEqual(list(updates), ["domain_names"])
+
+    def test_the_new_host_takes_the_moved_domains_and_the_named_certificate(self):
+        client = self._client(self._source(), [], certificate=_live_cert())
+
+        self._split(client, "*.internal.lan", cert="7", host_ids="12")
+
+        self.assertEqual(client.created_overrides,
+                         [{"domain_names": ["api.internal.lan"], "certificate_id": 7}])
+
+    def test_cert_none_creates_the_new_host_without_one(self):
+        # Spelled as an explicit null rather than left out: the new host is
+        # built from the source's configuration, which may well carry a
+        # certificate that has no business covering the moved names.
+        client = self._client(self._source(certificate_id=4), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertEqual(client.created_overrides,
+                         [{"domain_names": ["api.internal.lan"], "certificate_id": None}])
+
+    def test_the_glob_is_matched_case_insensitively(self):
+        # NPM preserves whatever case a domain was typed in, and DNS does not
+        # care, so a glob that only matched lowercase would silently skip hosts.
+        client = self._client(_merge_host(12, ["app.example.com", "API.Internal.LAN"]), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.created_overrides,
+                         [{"domain_names": ["API.Internal.LAN"], "certificate_id": None}])
+
+    def test_each_host_is_trimmed_immediately_before_its_own_create(self):
+        # Not "all the trims, then all the creates": a host must not be left
+        # open while an unrelated host's create is in flight.
+        client = self._client(self._source(),
+                              [_merge_host(13, ["shop.example.com", "db.internal.lan"])])
+
+        self._split(client, "*.internal.lan", host_ids="12,13")
+
+        self.assertEqual(client.kinds, ["update", "create", "update", "create"])
+
+    def test_a_clean_run_returns_normally(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("Successful: 1")
+        self.assertNotPrinted("Failed:")
+
+    def test_the_new_host_id_is_reported(self):
+        # NPM assigns it on create, so the terminal is the only place the
+        # operator learns what it is.
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertPrinted("Host 12 → new host 101")
+
+    def test_the_preview_names_the_two_halves_before_anything_is_written(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12", preview=True)
+
+        self.assertPrinted("Host Split Preview")
+        self.assertPrinted("Total hosts to split")
+
+
+# =============================================================================
+# host split: the certificate the source keeps
+# =============================================================================
+
+class TestHostSplitDanglingSourceCertificate(_SplitCommandTestCase):
+    """A split only fixes the half that moves.
+
+    The domains left behind keep the source's existing certificate, and if that
+    certificate has already been deleted they stay HTTP-only afterwards. The
+    command cannot repair it — the operator has to choose a replacement — so it
+    says so rather than reporting an unqualified success.
+    """
+
+    def _source(self, **overrides):
+        return _merge_host(12, ["app.example.com", "api.internal.lan"], **overrides)
+
+    def test_a_source_keeping_a_certificate_that_is_gone_is_warned_about(self):
+        client = self._client(self._source(certificate_id=4), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertPrinted("keep certificate 4, which no longer exists")
+
+    def test_the_warning_names_the_command_that_repairs_it(self):
+        client = self._client(self._source(certificate_id=4), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertPrinted("host bulk-update certificate_id <cert> --ids 12")
+
+    def test_the_warning_does_not_block_the_split(self):
+        # Advisory: the moved half is what the command was asked to fix, and
+        # refusing would leave the operator with no way to run it at all.
+        client = self._client(self._source(certificate_id=4), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertEqual(client.kinds, ["update", "create"])
+        self.assertPrinted("Successful: 1")
+
+    def test_a_source_with_no_certificate_says_nothing(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [])
+        self.assertNotPrinted("no longer exists")
+
+    def test_a_source_certificate_that_is_still_there_says_nothing(self):
+        client = self._client(self._source(certificate_id=7), [],
+                              certificate=_live_cert())
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [7])
+        self.assertNotPrinted("no longer exists")
+
+    def test_hosts_sharing_a_dead_certificate_are_named_together(self):
+        # One lookup and one warning per certificate rather than per host: a
+        # batch split after a certificate was deleted in the UI would otherwise
+        # print the same paragraph twenty times.
+        client = self._client(self._source(certificate_id=4),
+                              [_merge_host(13, ["shop.example.com", "db.internal.lan"],
+                                           certificate_id=4)])
+
+        self._split(client, "*.internal.lan", cert="none", host_ids="12,13")
+
+        self.assertEqual(client.cert_lookups, [4])
+        self.assertPrinted("Host(s) 12, 13 keep certificate 4")
+
+
+# =============================================================================
+# Config.load
+# =============================================================================
+
+class _ConfigTestCase(_WorkdirTestCase):
+    """Loads Config against a search path and an environment the test owns.
+
+    Both halves have to be isolated or these tests read the machine they run
+    on. Config._get_config_search_paths() looks in the working directory, the
+    user's ~/.config, /etc/npm-api and the directory npm_api.py sits in — and
+    under `unittest discover` the repo root is both the working directory and
+    the script directory, so an operator's own npm-api.conf beside the script
+    would supply their server address and password to every assertion below.
+    The list is therefore replaced outright rather than merely pointed
+    elsewhere, and the environment is cleared rather than merely added to,
+    since a real NPM_API_PASS exported in the shell would override whatever a
+    test wrote to a file.
+    """
+
+    def _write_conf(self, name, text):
+        path = self.workdir / name
+        path.write_text(text)
+        return path
+
+    def _load(self, search=(), env=None, config_path=None):
+        # os.environ is reached through npm_api rather than imported again at
+        # the top of this file: it is the same mapping object, and it is
+        # specifically the one Config.load reads.
+        with mock.patch.object(npm_api.Config, "_get_config_search_paths",
+                               return_value=[Path(p) for p in search]), \
+                mock.patch.dict(npm_api.os.environ, env or {}, clear=True):
+            return npm_api.Config.load(config_path)
+
+
+class TestConfigDefaults(_ConfigTestCase):
+    """What Config is before anything has configured it."""
+
+    def test_nothing_anywhere_leaves_every_default(self):
+        config = self._load()
+
+        self.assertEqual(config.nginx_ip, "127.0.0.1")
+        self.assertEqual(config.nginx_port, "81")
+        self.assertEqual(config.api_user, "admin@example.com")
+        self.assertEqual(config.api_pass, "changeme")
+
+    def test_the_source_is_reported_as_unconfigured(self):
+        # get_client keys the whole setup banner off this, so a default config
+        # that claimed to come from somewhere would suppress the one message
+        # telling a new user what to do.
+        config = self._load()
+
+        self.assertEqual(config._config_source, "defaults")
+        self.assertEqual(config.get_config_info(), "defaults (not configured)")
+
+    def test_the_base_url_is_assembled_from_host_and_port(self):
+        config = self._load(env={"NPM_API_HOST": "10.0.0.1", "NPM_API_PORT": "8181"})
+
+        self.assertEqual(config.base_url, "http://10.0.0.1:8181/api")
+
+    def test_the_data_directory_is_keyed_by_server_address(self):
+        # One tree per NPM instance: the token cached for one server is not a
+        # token for another, and restoring a backup into the wrong instance is
+        # not a mistake this tool should make easy.
+        config = self._load(env={"NPM_API_HOST": "10.0.0.1", "NPM_API_PORT": "8181",
+                                 "NPM_API_DATA_DIR": str(self.workdir)})
+
+        self.assertEqual(Path(config.data_dir_id), self.workdir / "10_0_0_1_8181")
+        self.assertEqual(Path(config.token_file).parent, Path(config.token_dir))
+        self.assertEqual(Path(config.token_dir).parent, Path(config.data_dir_id))
+        self.assertEqual(Path(config.backup_dir).parent, Path(config.data_dir_id))
+
+    def test_a_default_data_directory_sits_beside_the_script(self):
+        # npm-api is deployed by copying one file, so its state lands next to
+        # that file unless told otherwise.
+        config = self._load()
+
+        self.assertEqual(Path(config.data_dir),
+                         Path(npm_api.__file__).parent / "data")
+
+
+class TestConfigFile(_ConfigTestCase):
+    """Reading a config file: which one, and how its lines are parsed."""
+
+    def test_a_config_file_supplies_every_field(self):
+        path = self._write_conf("npm-api.conf", (
+            "NGINX_IP=10.0.0.1\n"
+            "NGINX_PORT=8181\n"
+            "API_USER=ops@example.com\n"
+            "API_PASS=filepass\n"
+            f"DATA_DIR={self.workdir}\n"
+        ))
+
+        config = self._load(search=[path])
+
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+        self.assertEqual(config.nginx_port, "8181")
+        self.assertEqual(config.api_user, "ops@example.com")
+        self.assertEqual(config.api_pass, "filepass")
+        self.assertEqual(config.data_dir, str(self.workdir))
+
+    def test_the_source_names_the_file_it_read(self):
+        path = self._write_conf("npm-api.conf", "API_USER=ops@example.com\n")
+
+        config = self._load(search=[path])
+
+        self.assertEqual(config._config_source, "file")
+        self.assertEqual(config._config_file_path, str(path))
+        self.assertIn(str(path), config.get_config_info())
+
+    def test_keys_are_case_insensitive(self):
+        # The file format is inherited from the bash original, which spelled
+        # its keys in upper case; the dataclass fields are lower case.
+        for spelling in ("NGINX_IP", "nginx_ip", "Nginx_Ip"):
+            with self.subTest(spelling=spelling):
+                path = self._write_conf("npm-api.conf", f"{spelling}=10.0.0.1\n")
+
+                self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_quotes_around_a_value_are_stripped(self):
+        for quoted in ('"10.0.0.1"', "'10.0.0.1'"):
+            with self.subTest(quoted=quoted):
+                path = self._write_conf("npm-api.conf", f"NGINX_IP={quoted}\n")
+
+                self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_surrounding_whitespace_is_stripped(self):
+        path = self._write_conf("npm-api.conf", "  NGINX_IP  =  10.0.0.1  \n")
+
+        self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_comments_and_blank_lines_are_ignored(self):
+        path = self._write_conf("npm-api.conf", (
+            "# NGINX_IP=192.0.2.1\n"
+            "\n"
+            "   \n"
+            "NGINX_IP=10.0.0.1\n"
+        ))
+
+        self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_a_line_with_no_equals_sign_is_ignored(self):
+        path = self._write_conf("npm-api.conf", "garbage\nNGINX_IP=10.0.0.1\n")
+
+        self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_a_value_may_itself_contain_an_equals_sign(self):
+        # Passwords routinely do, and splitting on every "=" would silently
+        # truncate one.
+        path = self._write_conf("npm-api.conf", "API_PASS=a=b=c\n")
+
+        self.assertEqual(self._load(search=[path]).api_pass, "a=b=c")
+
+    def test_an_unknown_key_is_ignored_rather_than_fatal(self):
+        path = self._write_conf("npm-api.conf", "SOMETHING_ELSE=x\nNGINX_IP=10.0.0.1\n")
+
+        self.assertEqual(self._load(search=[path]).nginx_ip, "10.0.0.1")
+
+    def test_the_first_existing_file_wins(self):
+        first = self._write_conf("first.conf", "NGINX_IP=10.0.0.1\n")
+        second = self._write_conf("second.conf", "NGINX_IP=10.0.0.2\n")
+
+        config = self._load(search=[first, second])
+
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+        self.assertEqual(config._config_file_path, str(first))
+
+    def test_a_path_that_is_not_there_is_skipped(self):
+        real = self._write_conf("real.conf", "NGINX_IP=10.0.0.1\n")
+
+        config = self._load(search=[self.workdir / "absent.conf", real])
+
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+
+    def test_a_directory_of_that_name_is_not_a_config_file(self):
+        # exists() alone would accept it and open() would then raise IsADirectory,
+        # which _load_from_file swallows — leaving the run silently unconfigured
+        # while claiming a file had been found.
+        directory = self.workdir / "npm-api.conf"
+        directory.mkdir()
+        real = self._write_conf("real.conf", "NGINX_IP=10.0.0.1\n")
+
+        config = self._load(search=[directory, real])
+
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+        self.assertEqual(config._config_file_path, str(real))
+
+    def test_every_path_looked_at_is_recorded(self):
+        # get_client prints this list with a tick beside each, so a user who
+        # has put the file somewhere unsearched can see that.
+        missing = self.workdir / "absent.conf"
+        real = self._write_conf("real.conf", "NGINX_IP=10.0.0.1\n")
+
+        config = self._load(search=[missing, real])
+
+        self.assertEqual(config._searched_paths, [str(missing), str(real)])
+
+    def test_the_search_stops_at_the_file_it_found(self):
+        first = self._write_conf("first.conf", "NGINX_IP=10.0.0.1\n")
+        second = self._write_conf("second.conf", "NGINX_IP=10.0.0.2\n")
+
+        config = self._load(search=[first, second])
+
+        self.assertEqual(config._searched_paths, [str(first)])
+
+    def test_an_explicit_path_is_searched_before_the_standard_ones(self):
+        standard = self._write_conf("standard.conf", "NGINX_IP=10.0.0.2\n")
+        named = self._write_conf("named.conf", "NGINX_IP=10.0.0.1\n")
+
+        config = self._load(search=[standard], config_path=str(named))
+
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+
+    def test_an_explicit_path_that_is_not_there_falls_back(self):
+        standard = self._write_conf("standard.conf", "NGINX_IP=10.0.0.2\n")
+
+        config = self._load(search=[standard],
+                            config_path=str(self.workdir / "absent.conf"))
+
+        self.assertEqual(config.nginx_ip, "10.0.0.2")
+
+
+class TestConfigPrecedence(_ConfigTestCase):
+    """Environment over file over defaults, one variable at a time."""
+
+    def _conf(self):
+        return self._write_conf("npm-api.conf", (
+            "NGINX_IP=10.0.0.1\n"
+            "NGINX_PORT=8181\n"
+            "API_USER=file@example.com\n"
+            "API_PASS=filepass\n"
+            "DATA_DIR=/from/file\n"
+        ))
+
+    def test_each_environment_variable_beats_the_file(self):
+        cases = (
+            ("NPM_API_HOST", "nginx_ip", "10.9.9.9"),
+            ("NPM_API_PORT", "nginx_port", "9191"),
+            ("NPM_API_USER", "api_user", "env@example.com"),
+            ("NPM_API_PASS", "api_pass", "envpass"),
+            ("NPM_API_DATA_DIR", "data_dir", "/from/env"),
+        )
+        for env_var, attribute, value in cases:
+            with self.subTest(env_var=env_var):
+                config = self._load(search=[self._conf()], env={env_var: value})
+
+                self.assertEqual(getattr(config, attribute), value)
+
+    def test_the_fields_the_environment_did_not_name_still_come_from_the_file(self):
+        # The override is per field, not wholesale: exporting NPM_API_PASS for
+        # one command must not discard the server address in the file.
+        config = self._load(search=[self._conf()], env={"NPM_API_PASS": "envpass"})
+
+        self.assertEqual(config.api_pass, "envpass")
+        self.assertEqual(config.nginx_ip, "10.0.0.1")
+        self.assertEqual(config.api_user, "file@example.com")
+
+    def test_the_environment_beats_the_defaults_with_no_file_at_all(self):
+        config = self._load(env={"NPM_API_USER": "env@example.com"})
+
+        self.assertEqual(config.api_user, "env@example.com")
+        self.assertEqual(config.api_pass, "changeme")
+        self.assertEqual(config._config_source, "env")
+        self.assertEqual(config.get_config_info(), "environment variables")
+
+    def test_file_and_environment_together_are_reported_as_both(self):
+        # Worth distinguishing in the info output: "the password came from
+        # somewhere other than the file you are looking at" is exactly the
+        # thing that is hard to work out otherwise.
+        path = self._conf()
+
+        config = self._load(search=[path], env={"NPM_API_PASS": "envpass"})
+
+        self.assertEqual(config._config_source, "file+env")
+        self.assertIn(str(path), config.get_config_info())
+        self.assertIn("environment variables", config.get_config_info())
+
+    def test_an_empty_environment_variable_does_not_override(self):
+        # `NPM_API_PASS= npm-api host list` reads as "unset for this command",
+        # not as "the password is the empty string".
+        config = self._load(search=[self._conf()], env={"NPM_API_PASS": ""})
+
+        self.assertEqual(config.api_pass, "filepass")
+        self.assertEqual(config._config_source, "file")
+
+    def test_an_unrelated_environment_variable_is_not_a_source(self):
+        config = self._load(search=[self._conf()], env={"NPM_API_SOMETHING": "x"})
+
+        self.assertEqual(config._config_source, "file")
+
+
+class TestConfigIsUsingDefaults(unittest.TestCase):
+    """The check that stops the tool talking to NPM with its shipped credentials.
+
+    Either half being untouched is enough. NPM's own factory login is
+    admin@example.com / changeme, so a half-configured install is not a
+    harmless one — it is a live guess at a real account.
+    """
+
+    def test_untouched_credentials_are_defaults(self):
+        self.assertTrue(npm_api.Config().is_using_defaults())
+
+    def test_a_real_user_beside_the_default_password_is_still_defaults(self):
+        config = npm_api.Config(api_user="ops@example.com")
+
+        self.assertTrue(config.is_using_defaults())
+
+    def test_a_real_password_beside_the_default_user_is_still_defaults(self):
+        config = npm_api.Config(api_pass="s3cret")
+
+        self.assertTrue(config.is_using_defaults())
+
+    def test_both_replaced_counts_as_configured(self):
+        config = npm_api.Config(api_user="ops@example.com", api_pass="s3cret")
+
+        self.assertFalse(config.is_using_defaults())
+
+    def test_the_server_address_has_no_bearing_on_it(self):
+        # A real address with the shipped credentials is the dangerous case,
+        # not a safe one: 127.0.0.1 is a perfectly ordinary place to run NPM.
+        config = npm_api.Config(nginx_ip="10.0.0.1", nginx_port="8181")
+
+        self.assertTrue(config.is_using_defaults())
+
+
+# =============================================================================
+# --json: shared doubles
+# =============================================================================
+
+def _stats_fixture(**overrides):
+    """A dashboard reading with every section answered."""
+    stats = {
+        "proxy_hosts": {"total": 3, "enabled": 2, "disabled": 1},
+        "certificates": {"total": 2, "valid": 2, "expired": 0},
+        "redirections": 0,
+        "streams": 1,
+        "users": 1,
+        "access_lists": 0,
+        "failures": [],
+    }
+    stats.update(overrides)
+    return stats
+
+
+class _JsonClient(_StubClient):
+    """Serves a fixed inventory to every read-only command at once.
+
+    Carries a real Config rather than a stand-in: `info` reads six separate
+    attributes off it, several of them derived properties, and a Config built
+    with no arguments touches nothing on disk — the directory creation lives in
+    NPMClient.__init__, which _StubClient skips.
+    """
+
+    def __init__(self, *, hosts=None, certs=None, acls=None, users=None,
+                 stats=None, token=True, auth_error=None, read_error=None):
+        self.config = npm_api.Config()
+        self.auth_error = auth_error
+        self.hosts = [_merge_host(12, ["app.example.com"])] if hosts is None else hosts
+        self.certs = [_live_cert(7, ("*.example.com",))] if certs is None else certs
+        self.acls = [{"id": 5, "name": "ops", "satisfy_any": False,
+                      "items": [], "clients": []}] if acls is None else acls
+        self.users = [{"id": 1, "name": "Admin", "email": "admin@example.com",
+                       "roles": ["admin"]}] if users is None else users
+        self.stats = _stats_fixture() if stats is None else stats
+        self._token = token
+        self._read_error = read_error
+
+    # --- authentication ------------------------------------------------------
+
+    def ensure_token(self):
+        return self._token
+
+    # --- reads ---------------------------------------------------------------
+
+    def _maybe_fail(self):
+        if self._read_error is not None:
+            raise self._read_error
+
+    def list_hosts(self):
+        self._maybe_fail()
+        return self.hosts
+
+    def get_host(self, host_id):
+        for host in self.hosts:
+            if host.get("id") == host_id:
+                return host
+        raise requests.HTTPError("404 Not Found", response=_FakeResponse(404))
+
+    def search_hosts(self, term):
+        return [h for h in self.hosts
+                if any(term.lower() in d.lower() for d in h.get("domain_names", []))]
+
+    def list_certificates(self):
+        self._maybe_fail()
+        return self.certs
+
+    def get_certificate(self, cert_id):
+        for cert in self.certs:
+            if cert.get("id") == cert_id:
+                return cert
+        raise requests.HTTPError("404 Not Found", response=_FakeResponse(404))
+
+    def list_access_lists(self):
+        return self.acls
+
+    def get_access_list(self, list_id):
+        for acl in self.acls:
+            if acl.get("id") == list_id:
+                return acl
+        raise requests.HTTPError("404 Not Found", response=_FakeResponse(404))
+
+    def list_users(self):
+        return self.users
+
+    def get_dashboard_stats(self):
+        return self.stats
+
+
+class _JsonCommandTestCase(_ConsoleTestCase):
+    """Captures the real stdout while the diagnostics console is recorded away.
+
+    The split between the two streams is the property under test, so unlike
+    every other command test here this one cannot patch both: `console` is
+    replaced as usual by _ConsoleTestCase, and sys.stdout is captured for real
+    so that anything reaching it is visible. Rich resolves sys.stdout on each
+    write rather than at construction, so out_console is captured too and a
+    table printed by mistake would show up.
+    """
+
+    def stdout_of(self, client, call):
+        """Run `call` against `client`; return (stdout, exit code)."""
+        buffer = io.StringIO()
+        exit_code = 0
+        with mock.patch.object(npm_api, "get_client", lambda: client), \
+                mock.patch.object(sys, "stdout", buffer):
+            try:
+                call()
+            except npm_api.typer.Exit as exc:
+                exit_code = exc.exit_code
+        return buffer.getvalue(), exit_code
+
+
+# =============================================================================
+# --json: stdout under success
+# =============================================================================
+
+class TestJsonOutputOnSuccess(_JsonCommandTestCase):
+    """`--json` output has to survive being piped into jq.
+
+    print_json bypasses both consoles and writes plain stdout for exactly this
+    reason: everything else the tool says goes to stderr, so the document on
+    stdout is the whole of stdout.
+    """
+
+    def test_every_json_command_writes_one_parseable_document(self):
+        client = _JsonClient()
+        cases = (
+            ("host list", lambda: npm_api.host_list(as_json=True), client.hosts),
+            ("host show", lambda: npm_api.host_show(host_id=12, as_json=True),
+             client.hosts[0]),
+            ("host search", lambda: npm_api.host_search(search="app", as_json=True),
+             client.hosts),
+            ("cert list", lambda: npm_api.cert_list(as_json=True), client.certs),
+            ("cert show", lambda: npm_api.cert_show(identifier="7", as_json=True),
+             client.certs[0]),
+            ("acl list", lambda: npm_api.acl_list(as_json=True), client.acls),
+            ("acl show", lambda: npm_api.acl_show(list_id=5, as_json=True),
+             client.acls[0]),
+            ("user list", lambda: npm_api.user_list(as_json=True), client.users),
+        )
+        for label, call, expected in cases:
+            with self.subTest(command=label):
+                text, exit_code = self.stdout_of(client, call)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(json.loads(text), expected)
+
+    def test_cert_show_by_domain_returns_a_list_not_a_bare_object(self):
+        # A domain can match several certificates, so the shape has to be the
+        # same whether it matched one or three — a consumer cannot branch on
+        # something it has not parsed yet.
+        client = _JsonClient()
+
+        text, exit_code = self.stdout_of(
+            client, lambda: npm_api.cert_show(identifier="example.com", as_json=True))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(text), client.certs)
+
+    def test_info_reports_the_dashboard_and_the_configuration_together(self):
+        client = _JsonClient()
+
+        text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=True))
+
+        payload = json.loads(text)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["stats"], client.stats)
+        self.assertEqual(payload["version"], npm_api.VERSION)
+        self.assertEqual(payload["base_url"], client.config.base_url)
+
+    def test_info_json_carries_no_password_or_token(self):
+        # It is meant to be pasteable into an issue. The API user is in there
+        # on purpose; nothing that authenticates as them may be.
+        client = _JsonClient()
+        client.config.api_pass = "s3cret-should-not-appear"
+
+        text, _ = self.stdout_of(client, lambda: npm_api.info(as_json=True))
+
+        self.assertNotIn("s3cret-should-not-appear", text)
+        self.assertNotIn("token", text.lower())
+
+    def test_an_empty_inventory_is_an_empty_array_not_no_output(self):
+        # `host list --json | jq length` on a fresh NPM has to answer 0 rather
+        # than failing to parse.
+        client = _JsonClient(hosts=[], certs=[], acls=[], users=[])
+        cases = (
+            ("host list", lambda: npm_api.host_list(as_json=True)),
+            ("cert list", lambda: npm_api.cert_list(as_json=True)),
+            ("acl list", lambda: npm_api.acl_list(as_json=True)),
+            ("user list", lambda: npm_api.user_list(as_json=True)),
+        )
+        for label, call in cases:
+            with self.subTest(command=label):
+                text, exit_code = self.stdout_of(client, call)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(json.loads(text), [])
+
+    def test_nothing_but_the_document_reaches_stdout(self):
+        # No banner, no spinner, no "Backed up N things" line. json.loads would
+        # catch most of that; the equality below catches a trailing blank line
+        # or a second document too.
+        client = _JsonClient()
+
+        text, _ = self.stdout_of(client, lambda: npm_api.host_list(as_json=True))
+
+        self.assertEqual(text, json.dumps(client.hosts, indent=2, sort_keys=True) + "\n")
+
+
+# =============================================================================
+# --json: stdout under failure
+# =============================================================================
+
+class TestJsonOutputOnFailure(_JsonCommandTestCase):
+    """A failing --json run must leave stdout empty, not half a document.
+
+    Half a document is worse than none: jq fails either way, but a partial one
+    can also parse by accident when the failure happened after a complete
+    top-level value was written.
+    """
+
+    def test_a_missing_object_writes_nothing_at_all_to_stdout(self):
+        client = _JsonClient()
+        cases = (
+            ("host show", lambda: npm_api.host_show(host_id=99, as_json=True)),
+            ("cert show", lambda: npm_api.cert_show(identifier="99", as_json=True)),
+            ("acl show", lambda: npm_api.acl_show(list_id=99, as_json=True)),
+        )
+        for label, call in cases:
+            with self.subTest(command=label):
+                text, exit_code = self.stdout_of(client, call)
+
+                self.assertEqual(text, "")
+                self.assertEqual(exit_code, 1)
+
+    def test_the_diagnostic_goes_to_the_other_console(self):
+        client = _JsonClient()
+
+        self.stdout_of(client, lambda: npm_api.host_show(host_id=99, as_json=True))
+
+        self.assertPrinted("Host ID 99 not found")
+
+    def test_a_domain_matching_no_certificate_is_not_an_empty_document(self):
+        # This one exits 0, because "no certificate is called that" is an
+        # answer rather than a failure. It still may not print half of one.
+        client = _JsonClient()
+
+        text, exit_code = self.stdout_of(
+            client, lambda: npm_api.cert_show(identifier="nowhere.example.net",
+                                              as_json=True))
+
+        self.assertEqual(text, "")
+        self.assertEqual(exit_code, 0)
+        self.assertPrinted("No certificates found")
+
+    def test_a_read_that_fails_outright_writes_nothing(self):
+        # The HTTPError escapes to main(), which reports it on stderr and
+        # exits 1. What matters here is that print_json was never reached.
+        client = _JsonClient(read_error=_npm_http_error(500, "upstream exploded"))
+        cases = (
+            ("host list", lambda: npm_api.host_list(as_json=True)),
+            ("cert list", lambda: npm_api.cert_list(as_json=True)),
+        )
+        for label, call in cases:
+            with self.subTest(command=label):
+                buffer = io.StringIO()
+                with mock.patch.object(npm_api, "get_client", lambda: client), \
+                        mock.patch.object(sys, "stdout", buffer):
+                    with self.assertRaises(requests.HTTPError):
+                        call()
+
+                self.assertEqual(buffer.getvalue(), "")
+
+    def test_info_that_cannot_authenticate_writes_nothing(self):
+        client = _JsonClient(token=False, auth_error="rejected the credentials")
+
+        text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=True))
+
+        self.assertEqual(text, "")
+        self.assertEqual(exit_code, 1)
+        self.assertPrinted("rejected the credentials")
+
+    def test_info_with_an_unreadable_section_prints_the_whole_document_and_exits_1(self):
+        # The one place both happen at once, and deliberately so: the counts a
+        # section could not supply are null rather than 0, so the document is
+        # worth having, while the shell still needs to see that the run did not
+        # come back clean.
+        client = _JsonClient(stats=_stats_fixture(
+            users=None, failures=["users: HTTP 403: Permission denied"]))
+
+        text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=True))
+
+        payload = json.loads(text)
+        self.assertEqual(exit_code, 1)
+        self.assertIsNone(payload["stats"]["users"])
+        self.assertEqual(payload["stats"]["failures"],
+                         ["users: HTTP 403: Permission denied"])
+
+
+# =============================================================================
+# info: the human-readable dashboard
+# =============================================================================
+
+class TestInfoTable(_JsonCommandTestCase):
+    """Without --json the data goes to stdout and the complaints do not."""
+
+    def test_the_dashboard_lands_on_stdout(self):
+        client = _JsonClient()
+
+        text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=False))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Proxy Hosts", text)
+        self.assertIn("NGINX Proxy Manager Dashboard", text)
+
+    def test_an_unreadable_section_renders_as_a_question_mark_not_a_zero(self):
+        # A sick NPM used to render identically to an empty one, and "0 proxy
+        # hosts" reads as a fact.
+        client = _JsonClient(stats=_stats_fixture(
+            proxy_hosts={"total": None, "enabled": None, "disabled": None},
+            failures=["proxy hosts: HTTP 500"]))
+
+        text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=False))
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("?", text)
+        self.assertNotIn("0", text.split("Proxy Hosts")[1].splitlines()[0])
+        self.assertPrinted("section(s) could not be read")
+
+    def test_a_failure_to_authenticate_still_exits_non_zero(self):
+        # The configuration lines are printed before the token is needed, so a
+        # bare return would let an unusable setup look like a clean run.
+        client = _JsonClient(token=False, auth_error="rejected the credentials")
+
+        _, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=False))
+
+        self.assertEqual(exit_code, 1)
+        self.assertPrinted("rejected the credentials")
+
+
+# =============================================================================
+# cert generate
+# =============================================================================
+
+class _CertGenClient(_StubClient):
+    """Certificate lookup and issuance, with every request recorded.
+
+    Carries a real Config because cert_generate falls back to the configured
+    API user as the Let's Encrypt contact address when --email is left out.
+    """
+
+    def __init__(self, existing=None, error=None):
+        self.config = npm_api.Config(api_user="ops@example.com")
+        self.existing = existing
+        self.error = error
+        self.requests = []
+
+    def find_certificate(self, domain):
+        return self.existing
+
+    def generate_certificate(self, domain, email, dns_provider=None,
+                             dns_credentials=None):
+        self.requests.append((domain, email, dns_provider, dns_credentials))
+        if self.error is not None:
+            raise self.error
+        return {"id": 42}
+
+
+class TestCertGenerate(_ConsoleTestCase):
+    """Issuing a certificate: what it refuses, and what it sends."""
+
+    _CREDENTIALS = '{"dns_cloudflare_api_token": "tok"}'
+
+    def _generate(self, client, domain, **overrides):
+        options = dict(domain=domain, email=None, dns_provider=None,
+                       dns_credentials=None, yes=True)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.cert_generate(**options)
+
+    def _generate_expecting_exit(self, client, domain, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._generate(client, domain, **overrides)
+        return caught.exception
+
+    def test_a_wildcard_without_dns_details_is_refused(self):
+        # Let's Encrypt will only issue a wildcard against a DNS-01 challenge,
+        # so NPM cannot even start without a provider and its credentials.
+        for missing, options in (
+            ("both", {}),
+            ("credentials", {"dns_provider": "cloudflare"}),
+            ("provider", {"dns_credentials": self._CREDENTIALS}),
+        ):
+            with self.subTest(missing=missing):
+                client = _CertGenClient()
+
+                exit_exception = self._generate_expecting_exit(
+                    client, "*.example.com", **options)
+
+                self.assertEqual(exit_exception.exit_code, 1)
+                self.assertEqual(client.requests, [])
+
+    def test_a_wildcard_with_both_goes_through(self):
+        client = _CertGenClient()
+
+        self._generate(client, "*.example.com", dns_provider="cloudflare",
+                       dns_credentials=self._CREDENTIALS)
+
+        (domain, _, provider, credentials), = client.requests
+        self.assertEqual(domain, "*.example.com")
+        self.assertEqual(provider, "cloudflare")
+        # Parsed here rather than passed through as text: the client builds the
+        # meta block from it and re-serialises it itself.
+        self.assertEqual(credentials, {"dns_cloudflare_api_token": "tok"})
+
+    def test_malformed_dns_credentials_are_refused_as_a_value_error(self):
+        client = _CertGenClient()
+
+        exit_exception = self._generate_expecting_exit(
+            client, "*.example.com", dns_provider="cloudflare",
+            dns_credentials="{not json")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.requests, [])
+
+    def test_a_certificate_that_is_still_valid_is_not_reissued(self):
+        # Let's Encrypt rate-limits duplicate certificates, and NPM keeps the
+        # old one alongside the new, so a needless reissue costs twice.
+        client = _CertGenClient(existing={"id": 7, "domain_names": ["example.com"],
+                                          "expires_on": _expires_in(timedelta(days=60))})
+
+        self._generate(client, "example.com")
+
+        self.assertEqual(client.requests, [])
+        self.assertPrinted("already exists")
+        self.assertPrinted("Certificate ID: 7")
+
+    def test_an_expired_certificate_is_replaced(self):
+        client = _CertGenClient(existing={"id": 7, "domain_names": ["example.com"],
+                                          "expires_on": _expires_in(timedelta(days=-1))})
+
+        self._generate(client, "example.com")
+
+        self.assertPrinted("Replacing certificate 7")
+        self.assertEqual(len(client.requests), 1)
+
+    def test_an_unreadable_expiry_falls_through_and_reissues(self):
+        # "I cannot tell whether this is still good" must not become "it is
+        # still good": the failure mode of not reissuing is an outage.
+        client = _CertGenClient(existing={"id": 7, "domain_names": ["example.com"],
+                                          "expires_on": "not a date"})
+
+        self._generate(client, "example.com")
+
+        self.assertEqual(len(client.requests), 1)
+
+    def test_the_contact_address_defaults_to_the_configured_user(self):
+        client = _CertGenClient()
+
+        self._generate(client, "example.com")
+
+        (_, email, _, _), = client.requests
+        self.assertEqual(email, "ops@example.com")
+        self.assertPrinted("Using default email")
+
+    def test_an_explicit_email_wins(self):
+        client = _CertGenClient()
+
+        self._generate(client, "example.com", email="certs@example.com")
+
+        (_, email, _, _), = client.requests
+        self.assertEqual(email, "certs@example.com")
+
+    def test_a_rejected_request_exits_1_carrying_npms_message(self):
+        client = _CertGenClient(error=_npm_http_error(
+            400, "Cannot request certificate for example.com"))
+
+        exit_exception = self._generate_expecting_exit(client, "example.com")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertPrinted("Cannot request certificate for example.com")
+
+    def test_a_value_error_from_the_client_exits_1(self):
+        # The client raises this for a wildcard with no DNS provider, which the
+        # command already guards against — but the guard and the client's own
+        # check can drift, and the second one must not surface as a traceback.
+        client = _CertGenClient(error=ValueError("Wildcard certificates require DNS"))
+
+        exit_exception = self._generate_expecting_exit(client, "example.com")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertPrinted("Wildcard certificates require DNS")
+
+    def test_the_new_certificate_id_is_reported(self):
+        client = _CertGenClient()
+
+        self._generate(client, "example.com")
+
+        self.assertPrinted("Certificate ID: 42")
+
+
+# =============================================================================
+# host bulk-update
+# =============================================================================
+
+class TestHostBulkUpdate(_MergeCommandTestCase):
+    """One field written across a selection, and the guard on certificate_id.
+
+    Reuses the merge doubles: _MergeClient already serves an inventory, records
+    every update in order and can answer or refuse a certificate lookup, which
+    is exactly the surface bulk-update touches.
+    """
+
+    def _bulk_update(self, client, field, value, **overrides):
+        options = dict(field=field, value=value, host_ids=None, pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_update(**options)
+
+    def _bulk_update_expecting_exit(self, client, field, value, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._bulk_update(client, field, value, **overrides)
+        return caught.exception
+
+    def _client_with_two_hosts(self, **kwargs):
+        return self._client(_merge_host(12, ["app.example.com"]),
+                            [_merge_host(13, ["api.example.com"])], **kwargs)
+
+    def test_the_value_is_coerced_before_it_is_written(self):
+        # NPM's schema is typed: "true" as a string where a boolean belongs is
+        # a 400, and "8080" where an integer belongs is silently wrong.
+        cases = (
+            ("block_exploits", "true", True),
+            ("forward_port", "8080", 8080),
+            ("forward_host", "10.0.0.9", "10.0.0.9"),
+            ("domain_names", "a.example.com,b.example.com",
+             ["a.example.com", "b.example.com"]),
+        )
+        for field, raw, expected in cases:
+            with self.subTest(field=field):
+                client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+                self._bulk_update(client, field, raw, host_ids="12")
+
+                self.assertEqual(client.updates, [(12, {field: expected})])
+
+    def test_every_selected_host_is_written_once(self):
+        client = self._client_with_two_hosts()
+
+        self._bulk_update(client, "forward_port", "8080", host_ids="12,13")
+
+        self.assertEqual(client.updates, [(12, {"forward_port": 8080}),
+                                          (13, {"forward_port": 8080})])
+
+    def test_a_certificate_that_does_not_exist_refuses_and_writes_nothing(self):
+        # Same guard as split, clone and merge, at the one call site where the
+        # certificate is being assigned to hosts chosen by pattern — so the
+        # blast radius is however many hosts matched.
+        client = self._client_with_two_hosts()
+
+        exit_exception = self._bulk_update_expecting_exit(
+            client, "certificate_id", "99", host_ids="12,13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Certificate 99 does not exist")
+
+    def test_a_certificate_that_exists_is_written(self):
+        client = self._client_with_two_hosts(
+            certificate=_live_cert(7, ("*.example.com",)))
+
+        self._bulk_update(client, "certificate_id", "7", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [7])
+        self.assertEqual(client.updates, [(12, {"certificate_id": 7})])
+
+    def test_clearing_the_certificate_needs_no_lookup(self):
+        # 0 means "nothing linked" to NPM, and coerce_field_value turns it into
+        # a null for the link fields, so there is no certificate to check.
+        client = self._client_with_two_hosts()
+
+        self._bulk_update(client, "certificate_id", "0", host_ids="12")
+
+        self.assertEqual(client.cert_lookups, [])
+        self.assertEqual(client.updates, [(12, {"certificate_id": None})])
+
+    def test_a_malformed_json_value_exits_1_before_any_write(self):
+        client = self._client_with_two_hosts()
+
+        exit_exception = self._bulk_update_expecting_exit(
+            client, "locations", "[{broken", host_ids="12")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("locations: invalid JSON")
+
+    def test_no_selector_writes_nothing(self):
+        # The regression this guard exists for: a bulk command with no --ids
+        # and no --pattern once fell through to every host in the estate. It is
+        # a refusal rather than a no-op, so that a script which forgot to build
+        # its --ids string fails instead of quietly doing nothing.
+        client = self._client_with_two_hosts()
+
+        exit_exception = self._bulk_update_expecting_exit(client, "forward_port", "8080")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Please specify --ids, --pattern, or --interactive")
+
+    def test_a_rejected_write_is_counted_and_the_run_exits_1(self):
+        client = self._client_with_two_hosts(update_fail_calls={1})
+
+        exit_exception = self._bulk_update_expecting_exit(
+            client, "forward_port", "8080", host_ids="12,13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        # The second host was still attempted: one rejection does not abandon
+        # the batch.
+        self.assertEqual([host_id for host_id, _ in client.updates], [12, 13])
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_the_preview_names_the_field_and_the_new_value(self):
+        client = self._client_with_two_hosts()
+
+        self._bulk_update(client, "forward_port", "8080", host_ids="12", preview=True)
+
+        self.assertPrinted("Bulk Update Preview")
+        self.assertPrinted("Total hosts to update")
+
+
+# =============================================================================
+# get_client
+# =============================================================================
+
+class TestGetClient(_ConsoleTestCase):
+    """The gate between an unconfigured install and the API.
+
+    NPM ships with admin@example.com / changeme, so a config that still holds
+    either is not merely incomplete — running against it is a login attempt on
+    a real account with a published password.
+    """
+
+    def _get_client(self, config):
+        """Call get_client with the module global reset and NPMClient stubbed.
+
+        The global is patched rather than assigned so the caching this function
+        does is undone when the test ends; NPMClient is stubbed because its
+        real __init__ creates the token and backup directories on disk.
+        """
+        factory = mock.Mock(return_value=mock.sentinel.client)
+        with mock.patch.object(npm_api, "_client", None), \
+                mock.patch.object(npm_api.Config, "load", return_value=config), \
+                mock.patch.object(npm_api, "NPMClient", factory):
+            try:
+                return npm_api.get_client(), factory, None
+            except npm_api.typer.Exit as exc:
+                return None, factory, exc
+
+    def _configured(self):
+        return npm_api.Config(api_user="ops@example.com", api_pass="s3cret")
+
+    def test_default_credentials_refuse_before_a_client_is_built(self):
+        _, factory, exit_exception = self._get_client(npm_api.Config())
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        factory.assert_not_called()
+
+    def test_the_refusal_lists_every_path_it_looked_in(self):
+        # Without this the user has no way to tell that the file they wrote is
+        # somewhere the tool never looks.
+        config = npm_api.Config()
+        config._searched_paths = ["/nowhere/npm-api.conf", "/elsewhere/npm-api.conf"]
+
+        self._get_client(config)
+
+        self.assertPrinted("/nowhere/npm-api.conf")
+        self.assertPrinted("/elsewhere/npm-api.conf")
+
+    def test_the_refusal_names_both_ways_to_configure_it(self):
+        self._get_client(npm_api.Config())
+
+        self.assertPrinted("Configuration Required")
+        self.assertPrinted("NPM_API_USER")
+        self.assertPrinted("npm-api.conf")
+
+    def test_a_configured_install_builds_a_client_from_that_config(self):
+        config = self._configured()
+
+        client, factory, exit_exception = self._get_client(config)
+
+        self.assertIsNone(exit_exception)
+        self.assertIs(client, mock.sentinel.client)
+        factory.assert_called_once_with(config)
+
+    def test_the_client_is_built_once_and_reused(self):
+        # Every command calls get_client(), and NPMClient.__init__ creates
+        # directories and may fetch a token; doing that per call would turn one
+        # bulk command into one authentication round trip per host.
+        config = self._configured()
+        factory = mock.Mock(return_value=mock.sentinel.client)
+
+        with mock.patch.object(npm_api, "_client", None), \
+                mock.patch.object(npm_api.Config, "load", return_value=config), \
+                mock.patch.object(npm_api, "NPMClient", factory):
+            first = npm_api.get_client()
+            second = npm_api.get_client()
+
+        self.assertIs(first, second)
+        factory.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

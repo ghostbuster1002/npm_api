@@ -2718,7 +2718,7 @@ def host_clone(
     try:
         new_host = client.create_host_from(source, overrides)
     except requests.HTTPError as exc:
-        console.print(f"[red]❌ Create failed: {exc}[/red]")
+        console.print(f"[red]❌ Create failed: {format_http_error(exc)}[/red]")
         raise typer.Exit(1)
 
     console.print(f"[green]✅ Created host {new_host.get('id')}[/green]")
@@ -2876,7 +2876,8 @@ def host_split(
             try:
                 client.update_host(host_id, {"domain_names": plan["staying"]})
             except requests.HTTPError as exc:
-                console.print(f"  [red]❌ Host {host_id}: could not trim source - {exc}[/red]")
+                console.print(f"  [red]❌ Host {host_id}: could not trim source — "
+                              f"{format_http_error(exc)}[/red]")
                 error_count += 1
                 continue
 
@@ -2885,12 +2886,18 @@ def host_split(
                     plan["source"],
                     {"domain_names": plan["moving"], "certificate_id": cert_id})
             except requests.HTTPError as exc:
-                console.print(f"  [red]❌ Host {host_id}: create failed - {exc}[/red]")
+                console.print(f"  [red]❌ Host {host_id}: create failed — "
+                              f"{format_http_error(exc)}[/red]")
                 try:
                     client.update_host(host_id, {"domain_names": plan["all"]})
                     console.print(f"     [green]↩ Host {host_id} restored[/green]")
                 except requests.HTTPError as restore_exc:
-                    console.print(f"     [red]‼ ROLLBACK FAILED: {restore_exc}[/red]")
+                    # format_http_error matters most here of anywhere: the
+                    # rollback has already failed, the domain list has to be
+                    # repaired by hand, and why NPM refused the restoring write
+                    # is exactly what a bare repr throws away.
+                    console.print(f"     [red]‼ ROLLBACK FAILED: "
+                                  f"{format_http_error(restore_exc)}[/red]")
                     console.print(f"     [red]‼ Host {host_id} now holds "
                                   f"{plan['staying']}; it originally held "
                                   f"{plan['all']}[/red]")

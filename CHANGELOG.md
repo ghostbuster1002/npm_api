@@ -234,6 +234,16 @@ relevant section below.
   a normalised one, so mixed spellings of one base are routine. Case is now
   folded at the comparison, as it already was everywhere else in the tool; the
   false alarm mattered because the warning's value depends on firing rarely.
+- `host clone` and `host split` reported HTTP failures with requests' generic
+  repr instead of the message NPM sent — four sites interpolating the exception
+  directly rather than going through `format_http_error`, which every other
+  `HTTPError` report in the tool uses. The operator saw
+  `400 Client Error: Bad Request for url: http://…/api/nginx/proxy-hosts`, which
+  is the URL they already knew and none of the reason, instead of
+  `HTTP 400: Domain already in use`. Worst on split's ROLLBACK FAILED line:
+  at that point the rollback has already failed and the domain list has to be
+  repaired by hand, so why NPM refused the restoring write is the single most
+  useful thing on screen.
 - `host clone` and `host split` called `validate_certificate_assignment` but
   ignored its return value, so the one case it treats as fatal — a certificate
   ID that no longer exists — printed a red refusal and then went ahead anyway.

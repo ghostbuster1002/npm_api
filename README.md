@@ -54,9 +54,17 @@ python3 -m unittest discover -v    # or:
 python3 test_npm_api.py
 ```
 
-The suite uses the standard library only — no pytest, no other dev dependency —
-so any machine that can run `npm-api` can run its tests. It needs no network and
-no live NPM: it imports `npm_api.py` directly and stubs the API client.
+488 tests covering 63% of `npm_api.py`. The suite uses the standard library
+only — no pytest, no other dev dependency — so any machine that can run
+`npm-api` can run its tests. It needs no network and no live NPM: it imports
+`npm_api.py` directly and stubs the API client.
+
+The destructive commands (`split`, `merge`, `restore`) record every write on one
+ordered list, so the tests assert the *order* of calls, not just their contents
+— merge deleting a source before the target claims its names, restore creating
+access lists before the hosts that reference them. New guards are checked by
+mutation: break the guard, confirm the suite goes red, restore. A test that
+passes against both the fixed and the broken code is not worth keeping.
 
 `npm_api.py` stays a single self-contained file and can still be copied to a
 machine on its own; the test file is only needed in the repo.
