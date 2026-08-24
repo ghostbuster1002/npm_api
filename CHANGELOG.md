@@ -58,6 +58,10 @@ relevant section below.
 - Certificate assignments are validated: setting `certificate_id` through
   `host bulk-update` or `host ssl-enable` checks that the certificate exists,
   reports its expiry, and warns about host domains it does not cover.
+- A test suite, `test_npm_api.py`, covering the pure helpers and the backup and
+  dashboard paths against stubbed clients. 127 tests, no network required.
+  `make test` runs it, and `make build` now runs it before building.
+  `npm_api.py` remains a single self-contained file.
 - `backup --output/-o <dir>` writes the backup to a chosen directory instead of
   the configured data directory.
 - `backup --include-keys` downloads certificate private keys. Without it the

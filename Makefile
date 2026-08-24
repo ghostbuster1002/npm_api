@@ -4,7 +4,7 @@ SCRIPT_NAME = npm-api
 PYTHON_FILE = npm_api.py
 INSTALL_DIR = /usr/local/bin
 
-.PHONY: all build install uninstall clean venv deps help
+.PHONY: all build install uninstall clean venv deps help test
 
 all: build
 
@@ -12,13 +12,20 @@ help:
 	@echo "NPM-API CLI Build System"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make build     - Build the standalone binary"
+	@echo "  make test      - Run the test suite"
+	@echo "  make build     - Run tests, then build the standalone binary"
 	@echo "  make install   - Install to $(INSTALL_DIR) (requires sudo)"
 	@echo "  make uninstall - Remove from $(INSTALL_DIR) (requires sudo)"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make venv      - Create virtual environment"
 	@echo "  make deps      - Install dependencies"
 	@echo ""
+
+# Runs against whatever python3 is on PATH rather than ./venv, so the suite is
+# usable without a build. The tests import npm_api directly and need no network.
+test:
+	@echo "Running tests..."
+	python3 -m pytest -q
 
 venv:
 	@echo "Creating virtual environment..."
@@ -31,7 +38,7 @@ deps: venv
 	./venv/bin/pip install requests "typer[all]" rich pyinstaller
 	@echo "Done!"
 
-build: deps
+build: test deps
 	@echo "Building binary..."
 	./venv/bin/pyinstaller \
 		--onefile \

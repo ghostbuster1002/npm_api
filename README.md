@@ -39,10 +39,21 @@ sudo mv npm-api-macos-amd64 /usr/local/bin/npm-api
 
 ```bash
 git clone https://github.com/ghostbuster1002/npm_api.git
-cd npm-api
+cd npm_api
 make build
 sudo make install
 ```
+
+`make build` runs the test suite first. To run it on its own:
+
+```bash
+make test          # or: python3 -m pytest -q
+```
+
+The tests need no network and no running NPM — they import `npm_api.py`
+directly and stub the API client. `npm_api.py` stays a single self-contained
+file, so it can still be copied to a machine on its own; the test file is only
+needed in the repo.
 
 ## Configuration
 
