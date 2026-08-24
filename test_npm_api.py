@@ -33,6 +33,7 @@ import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 import requests
 
@@ -109,6 +110,69 @@ class _WorkdirTestCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix="npm_api_test_")
         self.addCleanup(tmp.cleanup)
         self.workdir = Path(tmp.name).resolve()
+
+
+class _RecordingConsole:
+    """Stand-in for a Rich Console that keeps the markup instead of rendering it.
+
+    The bulk helpers decide a great deal that no return value exposes — which
+    IDs were missing, whether certificate coverage could be checked at all,
+    which host a write failed on — and say it only in print(). Substituting the
+    console object beats capturing the stream: nothing is rendered, so an
+    assertion cannot be broken by terminal width wrapping a long hostname or by
+    Rich swallowing markup, and console.status() stays available.
+    """
+
+    def __init__(self):
+        self.lines = []
+
+    def print(self, *args, **kwargs):
+        self.lines.append(" ".join(str(a) for a in args))
+
+    # apply_domain_changes and bulk-update run their loop inside
+    # `with console.status(...) as status:` and call status.update() per host.
+    # Both are spinner chrome rather than output, so they record nothing.
+    def status(self, *args, **kwargs):
+        return self
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+class _ConsoleTestCase(unittest.TestCase):
+    """Base class for the tests that read what was printed.
+
+    npm_api reports on two consoles by design: `console` writes to stderr and
+    carries every diagnostic, `out_console` writes to stdout and carries only
+    --json payloads, so a piped `--json` run stays machine-readable. Everything
+    in the bulk infrastructure prints on the stderr one, which is what this
+    patches.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.console = _RecordingConsole()
+        patcher = mock.patch.object(npm_api, "console", self.console)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assertPrinted(self, needle):
+        self.assertIn(needle, self.console.text,
+                      msg=f"nothing printed contained {needle!r}:\n{self.console.text}")
+
+    def assertNotPrinted(self, needle):
+        self.assertNotIn(needle, self.console.text,
+                         msg=f"unexpectedly printed {needle!r}:\n{self.console.text}")
 
 
 def _mode(path):
@@ -1137,6 +1201,648 @@ class TestBackupResult(unittest.TestCase):
             npm_api.BackupResult(path="/tmp/backup", failures=["users: 500"]).complete,
             False,
         )
+
+
+# =============================================================================
+# Bulk-command infrastructure: shared doubles
+# =============================================================================
+
+def _hosts_fixture():
+    """Three hosts across two base domains, one of them oddly cased."""
+    return [
+        {"id": 12, "domain_names": ["app.example.com"], "forward_host": "10.0.0.5"},
+        {"id": 13, "domain_names": ["api.internal.lan", "www.example.com"],
+         "forward_host": "10.0.0.6"},
+        {"id": 14, "domain_names": ["Shop.Internal.LAN"], "forward_host": "10.0.0.7"},
+    ]
+
+
+class _HostsClient(_StubClient):
+    """Serves a fixed inventory to select_hosts."""
+
+    def __init__(self, hosts=None):
+        self.hosts = _hosts_fixture() if hosts is None else hosts
+
+    def list_hosts(self):
+        return self.hosts
+
+
+class _UpdateRecordingClient(_StubClient):
+    """Records every update_host call and fails for chosen host IDs.
+
+    The call is recorded before the failure is raised, so a test can tell "the
+    write was attempted and NPM rejected it" from "the host was skipped".
+    """
+
+    def __init__(self, fail_ids=(), error=None):
+        self.calls = []
+        self._fail_ids = set(fail_ids)
+        self._error = error or requests.HTTPError(
+            "400 Client Error",
+            response=_FakeResponse(400, json_body={"error": {"message": "Domain already in use"}}),
+        )
+
+    def update_host(self, host_id, updates):
+        self.calls.append((host_id, updates))
+        if host_id in self._fail_ids:
+            raise self._error
+        return {"id": host_id, **updates}
+
+    @property
+    def written_ids(self):
+        return [host_id for host_id, _ in self.calls]
+
+
+class _CertLookupClient(_StubClient):
+    """One certificate, or one failure, plus a record of the lookups made."""
+
+    def __init__(self, cert=None, error=None):
+        self.cert = cert
+        self.error = error
+        self.lookups = []
+
+    def get_certificate(self, cert_id):
+        self.lookups.append(cert_id)
+        if self.error is not None:
+            raise self.error
+        return self.cert
+
+
+# =============================================================================
+# select_hosts
+# =============================================================================
+
+class TestSelectHosts(_ConsoleTestCase):
+    """The gate in front of every bulk write.
+
+    Whatever it returns gets rewritten, so the interesting property is not what
+    it selects but what it refuses to select.
+    """
+
+    def _select(self, ids=None, pattern=None, interactive=False, hosts=None, **kwargs):
+        return npm_api.select_hosts(_HostsClient(hosts), ids, pattern, interactive, **kwargs)
+
+    def _ids_of(self, hosts):
+        return [h["id"] for h in hosts]
+
+    # --- no selector -------------------------------------------------------
+
+    def test_no_selector_refuses_to_act(self):
+        # The single most important assertion in this file. Falling through to
+        # "everything" is what `bulk-remove-domain com` used to do: no --ids, no
+        # --pattern, no prompt, and every host in the estate rewritten. The
+        # guard has to raise, not return an empty list, because an empty list
+        # reads to a caller as "nothing matched" and is not an error.
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._select()
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("--ids")
+        self.assertPrinted("--pattern")
+        self.assertPrinted("--interactive")
+
+    def test_interactive_false_is_not_a_selector(self):
+        # --interactive is a flag, so callers pass interactive=False rather than
+        # omitting it. False must land on the refusal, not skip past it.
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._select(ids=None, pattern=None, interactive=False)
+        self.assertEqual(caught.exception.exit_code, 1)
+
+    def test_empty_selector_strings_are_no_selector_at_all(self):
+        # `--ids ""` and `--pattern ""` are falsy, so they fall through to the
+        # refusal rather than selecting nothing or, worse, everything.
+        for ids, pattern in (("", ""), (None, ""), ("", None)):
+            with self.subTest(ids=ids, pattern=pattern):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._select(ids=ids, pattern=pattern)
+                self.assertEqual(caught.exception.exit_code, 1)
+
+    def test_empty_host_list_returns_empty_without_raising(self):
+        # Checked before the refusal above, and safely so: an NPM with no hosts
+        # has nothing for a missing selector to damage. Callers then hit their
+        # own "no hosts selected" branch and stop.
+        self.assertEqual(self._select(hosts=[]), [])
+        self.assertPrinted("No proxy hosts found")
+
+    # --- --ids -------------------------------------------------------------
+
+    def test_ids_select_exactly_those_hosts(self):
+        self.assertEqual(self._ids_of(self._select(ids="12,14")), [12, 14])
+
+    def test_ids_tolerate_whitespace_around_the_commas(self):
+        # "12, 13" is what anyone typing a list actually writes, and quoting it
+        # in a shell keeps the spaces.
+        for given in ("12, 14", " 12 , 14 ", "12 ,14"):
+            with self.subTest(given=given):
+                self.assertEqual(self._ids_of(self._select(ids=given)), [12, 14])
+
+    def test_ids_ignore_empty_segments(self):
+        # A trailing comma from an edited command line is not an error.
+        self.assertEqual(self._ids_of(self._select(ids="12,,14,")), [12, 14])
+
+    def test_selection_order_follows_the_host_list_not_the_option(self):
+        # Worth pinning down before a command with a designated survivor (host
+        # merge) reads hosts[0] and assumes it is the first ID typed. It is not:
+        # NPM's ordering wins.
+        self.assertEqual(self._ids_of(self._select(ids="14,12")), [12, 14])
+
+    def test_non_numeric_ids_exit_1_rather_than_raising_valueerror(self):
+        # int() on "abc" used to escape as an unhandled ValueError and print a
+        # traceback at the user.
+        for given in ("abc", "12,abc", "12;13", "12.5"):
+            with self.subTest(given=given):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._select(ids=given)
+                self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("comma-separated numbers")
+
+    def test_unknown_ids_warn_by_name_and_the_rest_still_apply(self):
+        # Silently dropping an unmatched ID would let `--ids 12,99` report a
+        # clean run having touched one host out of the two that were asked for.
+        selected = self._select(ids="99,12,98")
+
+        self.assertEqual(self._ids_of(selected), [12])
+        self.assertPrinted("No such host(s): 98, 99")
+
+    def test_ids_matching_nothing_return_empty_and_warn(self):
+        self.assertEqual(self._select(ids="98,99"), [])
+        self.assertPrinted("No such host(s)")
+
+    # --- --pattern ---------------------------------------------------------
+
+    def test_pattern_works_as_a_glob(self):
+        self.assertEqual(self._ids_of(self._select(pattern="*.internal.lan")), [13, 14])
+
+    def test_pattern_works_as_a_plain_substring(self):
+        # Both spellings are accepted so --pattern means the same thing whether
+        # or not the user thought to add a star.
+        self.assertEqual(self._ids_of(self._select(pattern="internal.lan")), [13, 14])
+
+    def test_pattern_matching_is_case_insensitive(self):
+        # Host 14 is stored as "Shop.Internal.LAN"; DNS does not care about case
+        # and neither may the selector, in either direction.
+        for given in ("*.INTERNAL.LAN", "*.internal.lan", "Internal.LAN", "internal.lan"):
+            with self.subTest(pattern=given):
+                self.assertEqual(self._ids_of(self._select(pattern=given)), [13, 14])
+
+    def test_pattern_matches_a_host_on_any_of_its_domains(self):
+        # Host 13 carries api.internal.lan and www.example.com; either name
+        # brings the whole host into the selection.
+        self.assertEqual(self._ids_of(self._select(pattern="www.example.com")), [13])
+
+    def test_pattern_matching_nothing_selects_nothing(self):
+        # The other half of the fall-through guard: no match means no hosts, not
+        # all hosts.
+        self.assertEqual(self._select(pattern="*.example.net"), [])
+
+    def test_ids_take_precedence_over_pattern(self):
+        # Both options given is ambiguous; --ids is the more specific of the two
+        # and wins, so --pattern cannot widen an explicit list.
+        self.assertEqual(self._ids_of(self._select(ids="12", pattern="internal.lan")), [12])
+
+    # --- --interactive -----------------------------------------------------
+
+    def _interactive(self, answer, **kwargs):
+        with mock.patch.object(npm_api.typer, "prompt", return_value=answer) as prompt:
+            selected = npm_api.select_hosts(_HostsClient(), None, None, True, **kwargs)
+        return selected, prompt
+
+    def test_interactive_all_selects_every_host(self):
+        selected, prompt = self._interactive("all")
+
+        self.assertEqual(self._ids_of(selected), [12, 13, 14])
+        # err=True keeps the prompt off stdout, which --json commands reserve.
+        prompt.assert_called_once_with("Selection", err=True)
+
+    def test_interactive_all_is_case_and_whitespace_tolerant(self):
+        for given in ("ALL", " all ", "All\n"):
+            with self.subTest(answer=given):
+                selected, _ = self._interactive(given)
+                self.assertEqual(self._ids_of(selected), [12, 13, 14])
+
+    def test_interactive_index_list_is_one_based(self):
+        # The menu is numbered from 1, so answering "1,3" must not hand back the
+        # host at index 3.
+        selected, _ = self._interactive("1,3")
+        self.assertEqual(self._ids_of(selected), [12, 14])
+
+    def test_interactive_tolerates_whitespace_between_indices(self):
+        selected, _ = self._interactive(" 1 , 3 ")
+        self.assertEqual(self._ids_of(selected), [12, 14])
+
+    def test_interactive_out_of_range_indices_are_ignored(self):
+        # Typing past the end of the menu drops that entry and keeps the rest,
+        # rather than raising IndexError on a list the user can see.
+        selected, _ = self._interactive("1,99")
+        self.assertEqual(self._ids_of(selected), [12])
+
+    def test_interactive_zero_and_negative_indices_are_ignored(self):
+        # "0" is the off-by-one a 1-based menu invites. It must not resolve to
+        # all_hosts[-1] and rewrite the last host in the list.
+        selected, _ = self._interactive("0,-1")
+        self.assertEqual(selected, [])
+
+    def test_interactive_non_numeric_selection_exits_1(self):
+        for given in ("one", "1;2", ""):
+            with self.subTest(answer=given):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._interactive(given)
+                self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("Invalid selection")
+
+    def test_interactive_menu_lists_ids_and_domains(self):
+        self._interactive("all")
+        self.assertPrinted("ID 12")
+        self.assertPrinted("app.example.com")
+
+    def test_detail_field_is_shown_in_the_menu(self):
+        # bulk-update passes the field being changed so the menu shows the value
+        # about to be overwritten.
+        self._interactive("all", detail_field="forward_host")
+        self.assertPrinted("forward_host=10.0.0.5")
+
+    def test_detail_field_absent_from_a_host_reads_as_na(self):
+        with mock.patch.object(npm_api.typer, "prompt", return_value="all"):
+            npm_api.select_hosts(_HostsClient(), None, None, True, detail_field="certificate_id")
+        self.assertPrinted("certificate_id=N/A")
+
+
+# =============================================================================
+# confirm_bulk
+# =============================================================================
+
+class TestConfirmBulk(_ConsoleTestCase):
+    """The last stop before a destructive write."""
+
+    def test_yes_skips_the_prompt_entirely(self):
+        # -y has to be genuinely non-interactive: a prompt here would hang a
+        # cron run forever rather than failing.
+        with mock.patch.object(npm_api.typer, "confirm") as confirm:
+            self.assertIsNone(npm_api.confirm_bulk(True))
+        confirm.assert_not_called()
+
+    def test_accepting_returns_and_lets_the_caller_continue(self):
+        with mock.patch.object(npm_api.typer, "confirm", return_value=True):
+            self.assertIsNone(npm_api.confirm_bulk(False))
+        self.assertNotPrinted("Cancelled")
+
+    def test_declining_exits_zero_not_one(self):
+        # Declining is the user getting what they asked for, so it is a success.
+        # Exiting 1 would make `npm-api ... <<< n` look like a failed run to any
+        # script wrapping it, and to `set -e`.
+        with mock.patch.object(npm_api.typer, "confirm", return_value=False):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                npm_api.confirm_bulk(False)
+
+        self.assertEqual(caught.exception.exit_code, 0)
+        self.assertPrinted("Cancelled")
+
+    def test_prompt_text_is_passed_through_and_asked_on_stderr(self):
+        # Per-command wording matters for the destructive commands, and err=True
+        # keeps the question off stdout.
+        with mock.patch.object(npm_api.typer, "confirm", return_value=True) as confirm:
+            npm_api.confirm_bulk(False, "Merge these hosts?")
+        confirm.assert_called_once_with("Merge these hosts?", err=True)
+
+    def test_default_prompt_is_used_when_none_is_given(self):
+        with mock.patch.object(npm_api.typer, "confirm", return_value=True) as confirm:
+            npm_api.confirm_bulk(False)
+        self.assertEqual(confirm.call_args.args, ("Apply these changes?",))
+
+
+# =============================================================================
+# print_bulk_summary
+# =============================================================================
+
+class TestPrintBulkSummary(_ConsoleTestCase):
+    """The exit status of every bulk command comes from here."""
+
+    def test_a_clean_run_returns_normally(self):
+        self.assertIsNone(npm_api.print_bulk_summary(3, 0))
+        self.assertPrinted("Successful: 3")
+
+    def test_any_failure_exits_1(self):
+        # The bug this replaced: each command printed its own summary and then
+        # fell off the end, so a run where every single host failed still exited
+        # 0 and a wrapping script carried on.
+        for success, errors in ((0, 1), (5, 1), (0, 5)):
+            with self.subTest(success=success, errors=errors):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    npm_api.print_bulk_summary(success, errors)
+                self.assertEqual(caught.exception.exit_code, 1)
+
+    def test_the_failure_count_is_reported(self):
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.print_bulk_summary(1, 2)
+        self.assertPrinted("Failed: 2")
+
+    def test_skipped_hosts_are_reported_but_are_not_failures(self):
+        # Skipping is routine — a host that already carries the domain, or one
+        # that merge finds nothing to move. It must not colour the exit status.
+        self.assertIsNone(npm_api.print_bulk_summary(2, 0, skipped=3))
+        self.assertPrinted("Skipped: 3")
+
+    def test_zero_skipped_is_left_out_of_the_summary(self):
+        npm_api.print_bulk_summary(2, 0, skipped=0)
+        self.assertNotPrinted("Skipped")
+
+    def test_skipped_and_failed_together_still_exit_1(self):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            npm_api.print_bulk_summary(1, 1, skipped=1)
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("Skipped: 1")
+
+
+# =============================================================================
+# apply_domain_changes
+# =============================================================================
+
+def _change(host_id, resulting, current=None, new=None):
+    return {
+        "host_id": host_id,
+        "current_domains": current or ["app.example.com"],
+        "new_domains": new or [],
+        "resulting_domains": resulting,
+    }
+
+
+class TestApplyDomainChanges(_ConsoleTestCase):
+    """The write loop shared by the bulk domain commands."""
+
+    def _describe(self, change):
+        return f"now {', '.join(change['resulting_domains'])}"
+
+    def test_writes_only_the_domain_list(self):
+        # update_host reads the host back and copies every other field forward,
+        # so the payload here must name domain_names and nothing else; an extra
+        # key would override a field the user never asked to change.
+        client = _UpdateRecordingClient()
+
+        npm_api.apply_domain_changes(
+            client, [_change(12, ["app.example.com", "www.example.com"])], self._describe)
+
+        self.assertEqual(
+            client.calls,
+            [(12, {"domain_names": ["app.example.com", "www.example.com"]})],
+        )
+
+    def test_resulting_domains_is_the_field_that_gets_written(self):
+        # Not current_domains and not new_domains: the caller has already worked
+        # out the final list, including dedupe, and this loop must not re-derive
+        # it from the other two.
+        client = _UpdateRecordingClient()
+        change = _change(12, ["final.example.com"],
+                         current=["old.example.com"], new=["ignored.example.com"])
+
+        npm_api.apply_domain_changes(client, [change], self._describe)
+
+        self.assertEqual(client.calls[0][1], {"domain_names": ["final.example.com"]})
+
+    def test_every_change_is_applied_in_order(self):
+        client = _UpdateRecordingClient()
+
+        npm_api.apply_domain_changes(
+            client,
+            [_change(12, ["a.example.com"]), _change(13, ["b.example.com"]),
+             _change(14, ["c.example.com"])],
+            self._describe,
+        )
+
+        self.assertEqual(client.written_ids, [12, 13, 14])
+
+    def test_one_failing_host_does_not_abandon_the_rest(self):
+        # A partial run is the normal outcome of a bulk write — one host has a
+        # domain conflict, the other twenty are fine. Stopping at the first
+        # rejection would leave the estate half-changed with no way to tell how
+        # far it got.
+        client = _UpdateRecordingClient(fail_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            npm_api.apply_domain_changes(
+                client,
+                [_change(12, ["a.example.com"]), _change(13, ["b.example.com"]),
+                 _change(14, ["c.example.com"])],
+                self._describe,
+            )
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        # 14 comes after the failure, so its presence is the real assertion.
+        self.assertEqual(client.written_ids, [12, 13, 14])
+
+    def test_a_failure_is_counted_and_carries_npms_own_message(self):
+        client = _UpdateRecordingClient(fail_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client, [_change(12, ["a.example.com"]), _change(13, ["b.example.com"])],
+                self._describe)
+
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+        self.assertPrinted("Domain already in use")
+
+    def test_describe_reports_the_successes_only(self):
+        client = _UpdateRecordingClient(fail_ids=[13])
+        described = []
+
+        def describe(change):
+            described.append(change["host_id"])
+            return "ok"
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client, [_change(12, ["a.example.com"]), _change(13, ["b.example.com"])],
+                describe)
+
+        self.assertEqual(described, [12])
+
+    def test_a_clean_run_returns_normally(self):
+        client = _UpdateRecordingClient()
+        self.assertIsNone(
+            npm_api.apply_domain_changes(client, [_change(12, ["a.example.com"])], self._describe))
+
+    def test_an_empty_change_list_is_a_clean_no_op(self):
+        client = _UpdateRecordingClient()
+        npm_api.apply_domain_changes(client, [], self._describe)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Successful: 0")
+
+    def test_only_http_errors_are_absorbed(self):
+        # Deliberately narrow, and asserted so it stays a decision. An HTTPError
+        # means NPM answered and refused this one host, which the loop can count
+        # and move past. A dropped connection means the next host would fail the
+        # same way, so it propagates and the command dies with a traceback and a
+        # non-zero status rather than logging twenty identical failures.
+        client = _UpdateRecordingClient(
+            fail_ids=[13], error=requests.ConnectionError("Connection refused"))
+
+        with self.assertRaises(requests.ConnectionError):
+            npm_api.apply_domain_changes(
+                client,
+                [_change(12, ["a.example.com"]), _change(13, ["b.example.com"]),
+                 _change(14, ["c.example.com"])],
+                self._describe,
+            )
+
+        self.assertEqual(client.written_ids, [12, 13],
+                         msg="the loop should stop at a connection failure")
+
+
+# =============================================================================
+# validate_certificate_assignment
+# =============================================================================
+
+class TestValidateCertificateAssignment(_ConsoleTestCase):
+    """The guard in front of `bulk-update certificate_id`.
+
+    NPM wraps its whole `listen 443 ssl` block in a conditional on the linked
+    certificate, so a host pointed at an ID that no longer exists is rendered
+    with no TLS listener at all: no error, no warning, the site simply stops
+    answering on 443.
+    """
+
+    _HOSTS = [
+        {"id": 12, "domain_names": ["app.example.com"]},
+        {"id": 13, "domain_names": ["api.internal.lan"]},
+    ]
+
+    def _cert(self, domains, expires=timedelta(days=90, minutes=5)):
+        return {"id": 4, "domain_names": domains, "expires_on": _expires_in(expires)}
+
+    def test_no_certificate_requested_needs_no_lookup(self):
+        # `--cert none` clears the link. There is nothing to validate, and a
+        # round trip for it would just be one more thing that can fail.
+        client = _CertLookupClient()
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, None, self._HOSTS), True)
+
+        self.assertEqual(client.lookups, [])
+        self.assertEqual(self.console.text, "")
+
+    def test_a_missing_certificate_is_refused(self):
+        # The one case that returns False. Everything else is advisory.
+        client = _CertLookupClient(
+            error=requests.HTTPError("404 Not Found", response=_FakeResponse(404)))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 99, self._HOSTS), False)
+
+        self.assertEqual(client.lookups, [99])
+        self.assertPrinted("Certificate 99 does not exist")
+        self.assertPrinted("no TLS listener")
+
+    def test_a_covered_host_is_approved_quietly(self):
+        client = _CertLookupClient(self._cert(["*.example.com", "*.internal.lan"]))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        self.assertNotPrinted("not covered")
+        self.assertNotPrinted("coverage not verified")
+
+    def test_uncovered_domains_warn_without_blocking(self):
+        # Advisory on purpose: NPM accepts the assignment, and a certificate
+        # about to be reissued with the missing SAN is a real workflow. The
+        # warning names the host and the domain so the operator can judge.
+        client = _CertLookupClient(self._cert(["*.example.com"]))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        self.assertPrinted("Host 13: not covered")
+        self.assertPrinted("api.internal.lan")
+        self.assertNotPrinted("Host 12: not covered")
+
+    def test_unusable_metadata_is_cannot_tell_rather_than_mismatch(self):
+        # NPM keeps domain_names on a certificate as metadata and never consults
+        # it when serving TLS, so for uploaded certs it drifts into junk. Reading
+        # "*.internal," as a mismatch would paper every run with warnings about
+        # certificates that are in fact correct.
+        client = _CertLookupClient(self._cert(["*.internal,"]))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        self.assertPrinted("coverage not verified")
+        self.assertNotPrinted("not covered")
+
+    def test_an_empty_domain_list_is_also_cannot_tell(self):
+        client = _CertLookupClient(self._cert([]))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        self.assertPrinted("coverage not verified")
+        self.assertPrinted("empty")
+
+    def test_a_real_mismatch_is_still_reported_when_junk_sits_beside_it(self):
+        # One usable entry makes the answer definite for the domains it fails to
+        # match, so the warning must not be downgraded to a note.
+        client = _CertLookupClient(self._cert(["*.internal,", "*.example.com"]))
+
+        npm_api.validate_certificate_assignment(client, 4, self._HOSTS)
+
+        self.assertPrinted("Host 13: not covered")
+
+    def test_an_expired_certificate_is_surfaced(self):
+        # Assigning an expired certificate is legal and leaves every browser
+        # refusing the site, so the state has to be visible before confirming.
+        client = _CertLookupClient(
+            self._cert(["*.example.com", "*.internal.lan"], timedelta(days=-10, minutes=-5)))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        self.assertPrinted("EXPIRED")
+
+    def test_a_certificate_expiring_soon_is_surfaced(self):
+        client = _CertLookupClient(
+            self._cert(["*.example.com", "*.internal.lan"], timedelta(days=7, minutes=5)))
+
+        npm_api.validate_certificate_assignment(client, 4, self._HOSTS)
+
+        self.assertPrinted("7d LEFT")
+
+    def test_an_unreadable_expiry_is_not_reported_as_expired(self):
+        client = _CertLookupClient({"id": 4, "domain_names": ["*.example.com"],
+                                    "expires_on": None})
+
+        npm_api.validate_certificate_assignment(client, 4, self._HOSTS)
+
+        self.assertPrinted("UNKNOWN")
+        self.assertNotPrinted("EXPIRED")
+
+    def test_the_certificate_is_fetched_once_however_many_hosts(self):
+        client = _CertLookupClient(self._cert(["*.example.com"]))
+
+        npm_api.validate_certificate_assignment(client, 4, self._HOSTS * 10)
+
+        self.assertEqual(client.lookups, [4])
+
+    def test_no_hosts_still_reports_the_certificate(self):
+        # bulk-update can reach here with a selection that later turns out to be
+        # empty; the summary line should still print rather than the function
+        # falling over on an empty loop.
+        client = _CertLookupClient(self._cert(["*.example.com"]))
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, []), True)
+
+        self.assertPrinted("Certificate 4")
+
+    def test_null_domain_names_warns_rather_than_crashing(self):
+        # Regression. This read `", ".join(cert.get("domain_names", []))`, and
+        # cert.get returns None rather than the default when NPM sends the key
+        # holding an explicit null — str.join(None) then raised "TypeError: can
+        # only join an iterable". cert_covers_domain already guarded the same
+        # shape (see test_null_domain_list_is_unknown), so the null is a shape
+        # this codebase expects.
+        #
+        # It mattered more than a cosmetic nit because this is the
+        # deleted-certificate guard: it raised before looking at coverage, from
+        # inside `bulk-update certificate_id`, and the traceback was
+        # indistinguishable from a bug in the tool rather than a warning about
+        # the certificate.
+        client = _CertLookupClient({"id": 4, "domain_names": None, "expires_on": None})
+
+        self.assertIs(npm_api.validate_certificate_assignment(client, 4, self._HOSTS), True)
+
+        # "empty" rather than a crash, and coverage still could not be judged
+        self.assertPrinted("Certificate 4")
+        self.assertPrinted("empty")
 
 
 if __name__ == "__main__":

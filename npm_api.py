@@ -2061,7 +2061,11 @@ def validate_certificate_assignment(client: NPMClient, cert_id: Optional[int],
                       f"leave these hosts with no TLS listener at all[/red]")
         return False
 
-    recorded = ", ".join(cert.get("domain_names", [])) or "empty"
+    # `or []` rather than a get() default: NPM sends domain_names as an
+    # explicit null on some certificates, and a default only applies when the
+    # key is absent. Joining None raised here, inside the guard meant to stop a
+    # host being pointed at a certificate that cannot serve it.
+    recorded = ", ".join(cert.get("domain_names") or []) or "empty"
     console.print(f"\n[cyan]🔒 Certificate {cert_id}[/cyan] ({recorded}) "
                   f"— {cert_status_label(cert)}")
 

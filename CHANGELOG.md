@@ -58,8 +58,9 @@ relevant section below.
 - Certificate assignments are validated: setting `certificate_id` through
   `host bulk-update` or `host ssl-enable` checks that the certificate exists,
   reports its expiry, and warns about host domains it does not cover.
-- A test suite, `test_npm_api.py`, covering the pure helpers and the backup and
-  dashboard paths against stubbed clients. 127 cases, standard library only —
+- A test suite, `test_npm_api.py`, covering the pure helpers, the shared bulk
+  infrastructure, and the backup and dashboard paths against stubbed clients.
+  171 cases, standard library only —
   no pytest or other dev dependency, so any machine that can run `npm-api` can
   run its tests. No network and no live NPM required. `make test` runs it, and
   `make build` runs it after installing dependencies. `npm_api.py` remains a
@@ -177,6 +178,11 @@ relevant section below.
 - `host show` omitted `trust_forwarded_proto`.
 - `info` and `check-token` exited 0 when authentication failed, so a scheduled
   health check could not tell a working NPM from an unreachable one.
+- Assigning a certificate whose `domain_names` NPM reports as null crashed with
+  `TypeError: can only join an iterable`. `dict.get` returns `None` rather than
+  the default when a key is present holding null. This was inside the guard
+  that refuses to point a host at a certificate which cannot serve it, so the
+  guard aborted with a traceback instead of warning.
 - `info` reported 0 for any dashboard section whose request failed, making a
   sick NPM render identically to an empty one. Unreadable sections now show `?`
   (`null` under `--json`), the reasons are listed, and the command exits
