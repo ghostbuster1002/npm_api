@@ -103,6 +103,15 @@ relevant section below.
   instead of trying to look up a certificate with ID 0 and failing. `0`,
   `none` and `null` all mean the same thing, matching what `--cert 0` already
   did for `host split` and `host clone`.
+- **Diagnostics now go to stderr; only a command's own output goes to stdout.**
+  Previously every message shared stdout, so a warning or the
+  "Configuration Required" banner landed in the middle of `--json` output and
+  broke `jq` with a parse error. Tables and detail blocks still go to stdout,
+  so `host list | grep` keeps working.
+- Authentication and connection failures report one clear line instead of a
+  Rich traceback: wrong credentials name the host and the env vars to check, an
+  unreachable NPM says so plainly rather than printing urllib3's nested
+  exception repr.
 - API errors report the message NPM sent rather than requests' generic repr,
   so a rejected write says `HTTP 400: Domain already in use` instead of
   `400 Client Error: Bad Request for url: ...`.
@@ -160,6 +169,8 @@ relevant section below.
   `owner` and `access_list` objects are excluded, so a host fetched with
   expansions can be written back without sending an object where an ID belongs.
 - `host show` omitted `trust_forwarded_proto`.
+- `info` and `check-token` exited 0 when authentication failed, so a scheduled
+  health check could not tell a working NPM from an unreachable one.
 - **Certificate backups failed silently.** `download_certificate` wrapped both
   of its download routes in `except Exception: pass` and returned `False`,
   which `full_backup` ignored — so `backup` reported "Backed up N certificates"

@@ -297,6 +297,15 @@ npm-api info --json | jq '.stats.proxy_hosts'
 `cert show <id> --json` emits a single object; `cert show <domain> --json`
 emits an array of every matching certificate.
 
+Only a command's own output goes to stdout — tables, detail blocks and JSON.
+Warnings, previews, progress and errors go to stderr, so `--json` stays
+parseable even when a run fails before producing any. If a command cannot
+authenticate or reach NPM it writes nothing to stdout and exits non-zero:
+
+```bash
+npm-api host list --json | jq '.[].id' || echo "NPM unreachable"
+```
+
 ## Backups
 
 ```bash

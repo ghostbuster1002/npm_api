@@ -33,29 +33,48 @@ try:
     from rich.table import Table
     from rich.panel import Panel
     from rich.syntax import Syntax
-    from rich import print as rprint
 except ImportError as e:
-    print("\n" + "=" * 60)
-    print("ERROR: Required Python packages are not installed!")
-    print("=" * 60)
-    print(f"\nMissing module: {e.name}")
-    print("\nPlease install the required packages:")
-    print("\n  Option 1 - Using pip (recommended):")
-    print('    pip install requests "typer[all]" rich')
-    print("\n  Option 2 - Using a virtual environment:")
-    print("    python3 -m venv venv")
-    print("    source venv/bin/activate  # On Windows: venv\\Scripts\\activate")
-    print('    pip install requests "typer[all]" rich')
-    print("\n  Option 3 - Using pipx (for isolated installation):")
-    print("    pipx install npm-api  # If packaged")
-    print("\n" + "=" * 60)
+    # stderr, like every other diagnostic here: a caller piping our stdout into
+    # jq should get a clean parse failure on empty input, not this banner.
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("ERROR: Required Python packages are not installed!", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(f"\nMissing module: {e.name}", file=sys.stderr)
+    print("\nPlease install the required packages:", file=sys.stderr)
+    print("\n  Option 1 - Using pip (recommended):", file=sys.stderr)
+    print('    pip install requests "typer[all]" rich', file=sys.stderr)
+    print("\n  Option 2 - Using a virtual environment:", file=sys.stderr)
+    print("    python3 -m venv venv", file=sys.stderr)
+    print("    source venv/bin/activate  # On Windows: venv\\Scripts\\activate",
+          file=sys.stderr)
+    print('    pip install requests "typer[all]" rich', file=sys.stderr)
+    print("\n  Option 3 - Using pipx (for isolated installation):", file=sys.stderr)
+    print("    pipx install npm-api  # If packaged", file=sys.stderr)
+    print("\n" + "=" * 60, file=sys.stderr)
     sys.exit(1)
 
 # Version
 VERSION = "3.0.7-py"
 
-# Initialize Rich console and Typer app
-console = Console()
+# Initialize Rich consoles and Typer app.
+#
+# Two streams, split the usual Unix way:
+#
+#   console      (stderr) — diagnostics. Status, warnings, errors, previews,
+#                           progress spinners, confirmation prompts, and the
+#                           per-item success/failure lines write commands emit.
+#   out_console  (stdout) — primary output. The data the user ran the command
+#                           to see: the list tables, the show/detail blocks,
+#                           the info dashboard, show-defaults.
+#
+# stderr is the default so a print added later lands there unless someone
+# deliberately reaches for out_console, and so `host list | grep example.com`
+# keeps working while a failed run still leaves the pipe empty.
+#
+# print_json() bypasses both and writes plain stdout: it is the one path with a
+# hard guarantee, so `--json | jq` stays valid under every failure mode.
+console = Console(stderr=True)
+out_console = Console()
 app = typer.Typer(
     name="npm-api",
     help="Nginx Proxy Manager CLI - Manage NPM via API",
@@ -304,6 +323,16 @@ class CertificateDownloadError(RuntimeError):
     """Raised when a certificate's files could not be retrieved from NPM."""
 
 
+class NPMError(RuntimeError):
+    """An operational failure talking to NPM, not a bug in this script.
+
+    Bad credentials, an unreachable server and a reply that is not NPM's are
+    all things the user can fix. The message is written to be the whole of
+    what they see: main() prints it on one line and exits non-zero, so no
+    traceback escapes for any of them.
+    """
+
+
 @dataclass
 class CertKeyFailure:
     """A certificate whose key material NPM's API would not hand over.
@@ -376,6 +405,37 @@ def format_http_error(exc: Exception) -> str:
     if isinstance(error, str) and error:
         return f"HTTP {response.status_code}: {error}"
     return f"HTTP {response.status_code}: {json.dumps(body)[:200]}"
+
+
+# urllib3 nests the real cause inside a chain of pool and retry reprs; the
+# only actionable part is the OS-level reason it ends with, e.g.
+# "[Errno 111] Connection refused" or "[Errno -2] Name or service not known".
+_ERRNO_REASON_RE = re.compile(r"\[Errno -?\d+\]\s*([^'\")]+)")
+
+
+def describe_connection_error(exc: Exception) -> str:
+    """Reduce a requests transport failure to one readable clause.
+
+    str() on a ConnectionError runs to a couple of hundred characters of
+    library internals, which buries "the host is not listening" — the only
+    thing the user can act on.
+    """
+    if isinstance(exc, requests.Timeout):
+        return "timed out"
+
+    match = _ERRNO_REASON_RE.search(str(exc))
+    if match:
+        return match.group(1).strip()
+
+    if isinstance(exc, requests.ConnectionError):
+        return "connection failed"
+    return type(exc).__name__
+
+
+def describe_unreachable(config: "Config", exc: Exception) -> str:
+    """Name the endpoint alongside the reason; a wrong port looks identical
+    to a stopped server otherwise."""
+    return f"Cannot reach NPM at {config.base_url} — {describe_connection_error(exc)}"
 
 
 def write_secret(path: Path, content: str) -> Path:
@@ -516,6 +576,10 @@ class NPMClient:
     def __init__(self, config: Config):
         self.config = config
         self.token: Optional[str] = None
+        # Why the last token attempt failed, kept so the caller that actually
+        # needs a token can report it rather than generate_token()'s bool
+        # losing the detail on the way out.
+        self.auth_error: Optional[str] = None
         self._ensure_directories()
     
     def _ensure_directories(self):
@@ -565,9 +629,15 @@ class NPMClient:
         return False
     
     def generate_token(self) -> bool:
-        """Generate a new API token"""
+        """Generate a new API token.
+
+        On failure the reason lands in self.auth_error rather than on the
+        console: the caller knows whether this was a --json run that must keep
+        stdout clean, and whether to exit or carry on.
+        """
         console.print("[yellow]🔄 Generating new API token...[/yellow]")
-        
+        self.auth_error = None
+
         # First get temporary token
         try:
             response = requests.post(
@@ -575,55 +645,77 @@ class NPMClient:
                 json={"identity": self.config.api_user, "secret": self.config.api_pass},
                 timeout=10
             )
-            
+
             if response.status_code != 200:
-                console.print(f"[red]❌ Failed to authenticate. Status: {response.status_code}[/red]")
+                if response.status_code in (401, 403):
+                    self.auth_error = (
+                        f"NPM at {self.config.base_url} rejected the credentials "
+                        f"for {self.config.api_user} (HTTP {response.status_code}). "
+                        f"Check NPM_API_USER / NPM_API_PASS or your npm-api.conf."
+                    )
+                else:
+                    self.auth_error = (
+                        f"Authentication request to {self.config.base_url} returned "
+                        f"HTTP {response.status_code}. Is this really an NPM API?"
+                    )
                 return False
-            
+
             temp_token = response.json().get("token")
-            
+
             # Get long-term token
             response = requests.get(
                 f"{self.config.base_url}/tokens?expiry={self.config.token_expiry}",
                 headers={"Authorization": f"Bearer {temp_token}"},
                 timeout=10
             )
-            
+
             if response.status_code != 200:
-                console.print(f"[red]❌ Failed to generate long-term token. Status: {response.status_code}[/red]")
+                self.auth_error = (
+                    f"NPM accepted the credentials but refused a "
+                    f"{self.config.token_expiry} token (HTTP {response.status_code})."
+                )
                 return False
-            
+
             data = response.json()
             self.token = data["token"]
             expiry = data["expires"]
-            
+
             # Save token and expiry, owner-readable only from creation
             write_secret(Path(self.config.token_file), self.token)
             write_secret(Path(self.config.expiry_file), expiry)
-            
+
             console.print("[green]✅ Token generated successfully![/green]")
             console.print(f"[yellow]📅 Expires: {expiry}[/yellow]")
             return True
-            
-        except requests.RequestException as e:
-            console.print(f"[red]❌ Connection error: {e}[/red]")
+
+        except (ValueError, KeyError) as e:
+            # A 200 whose body is not NPM's token JSON: wrong port, a login
+            # page, a captive proxy. Must precede RequestException because
+            # requests' JSONDecodeError inherits from both.
+            self.auth_error = (
+                f"Unexpected reply from {self.config.base_url} ({e!r}). "
+                f"Check NPM_API_HOST / NPM_API_PORT — is that an NPM API?"
+            )
             return False
-    
+        except requests.RequestException as e:
+            self.auth_error = describe_unreachable(self.config, e)
+            return False
+
     def ensure_token(self) -> bool:
         """Ensure we have a valid token"""
         if self.token:
             return True
-        
+
         if self.load_token():
             return True
-        
+
         return self.generate_token()
-    
+
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
         """Make an API request"""
         if not self.ensure_token():
-            raise RuntimeError("Failed to obtain API token")
-        
+            raise NPMError(self.auth_error or "Failed to obtain API token")
+
         url = f"{self.config.base_url}/{endpoint.lstrip('/')}"
         headers = self._get_headers()
         headers.update(kwargs.pop("headers", {}))
@@ -631,7 +723,13 @@ class NPMClient:
         # Every auth call sets one; without this a hung NPM blocks forever
         kwargs.setdefault("timeout", 30)
 
-        response = requests.request(method, url, headers=headers, **kwargs)
+        try:
+            response = requests.request(method, url, headers=headers, **kwargs)
+        except requests.RequestException as exc:
+            # A cached token skips generate_token(), so this is the first place
+            # a dead server shows up on a warm run. Re-raise named rather than
+            # letting urllib3's repr reach the terminal.
+            raise NPMError(describe_unreachable(self.config, exc)) from exc
         return response
     
     def get(self, endpoint: str, **kwargs) -> requests.Response:
@@ -1377,7 +1475,7 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
 
     if as_json:
         if not client.ensure_token():
-            console.print("[red]❌ Failed to authenticate[/red]")
+            console.print(f"[red]❌ {client.auth_error or 'Failed to authenticate'}[/red]")
             raise typer.Exit(1)
         # The API user is included but no token or password: this output is
         # meant to be pipeable and pasteable into an issue
@@ -1392,21 +1490,23 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
         })
         return
 
-    console.print(f"\n[yellow]Script Info: [green]{VERSION}[/green][/yellow]")
-    console.print(f"[green]Config from[/green] : {config.get_config_info()}")
-    console.print(f"[green]BASE URL[/green]   : {config.base_url}")
-    console.print(f"[green]NGINX IP[/green]   : {config.nginx_ip}")
-    console.print(f"[green]USER NPM[/green]   : {config.api_user}")
-    console.print(f"[green]BACKUP DIR[/green] : {config.data_dir_id}")
+    out_console.print(f"\n[yellow]Script Info: [green]{VERSION}[/green][/yellow]")
+    out_console.print(f"[green]Config from[/green] : {config.get_config_info()}")
+    out_console.print(f"[green]BASE URL[/green]   : {config.base_url}")
+    out_console.print(f"[green]NGINX IP[/green]   : {config.nginx_ip}")
+    out_console.print(f"[green]USER NPM[/green]   : {config.api_user}")
+    out_console.print(f"[green]BACKUP DIR[/green] : {config.data_dir_id}")
     
     # Dashboard
     if not client.ensure_token():
-        console.print("[red]❌ Failed to authenticate[/red]")
-        return
-    
+        # Exit non-zero: the config lines above are printed unconditionally, so
+        # a bare return would let an unusable configuration look like success.
+        console.print(f"[red]❌ {client.auth_error or 'Failed to authenticate'}[/red]")
+        raise typer.Exit(1)
+
     stats = client.get_dashboard_stats()
     
-    console.print("\n[cyan]📊 NGINX Proxy Manager Dashboard 🔧[/cyan]")
+    out_console.print("\n[cyan]📊 NGINX Proxy Manager Dashboard 🔧[/cyan]")
     
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Component", style="white")
@@ -1423,8 +1523,8 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
     table.add_row("🔒 Access Lists", str(stats['access_lists']))
     table.add_row("👥 Users", str(stats['users']))
     
-    console.print(table)
-    console.print("\n[yellow]💡 Use --help to see available commands[/yellow]")
+    out_console.print(table)
+    out_console.print("\n[yellow]💡 Use --help to see available commands[/yellow]")
 
 
 @app.command()
@@ -1443,7 +1543,8 @@ def check_token():
         if client.generate_token():
             console.print("[green]✅ New token generated[/green]")
         else:
-            console.print("[red]❌ Failed to generate token[/red]")
+            console.print(f"[red]❌ {client.auth_error or 'Failed to generate token'}[/red]")
+            raise typer.Exit(1)
 
 
 @app.command()
@@ -1493,18 +1594,18 @@ def show_defaults():
     """Show default settings for host creation"""
     defaults = ProxyHostDefaults()
     
-    console.print("\n[yellow]📝 Default Settings for Creating Hosts:[/yellow]")
-    console.print("\n[green]Basic Settings:[/green]")
-    console.print(f"  Forward Scheme:          [cyan]{defaults.forward_scheme}[/cyan]")
-    console.print(f"  Caching Enabled:         {'[green]true[/green]' if defaults.caching_enabled else '[red]false[/red]'}")
-    console.print(f"  Block Exploits:          {'[green]true[/green]' if defaults.block_exploits else '[red]false[/red]'}")
-    console.print(f"  Allow Websocket Upgrade: {'[green]true[/green]' if defaults.allow_websocket_upgrade else '[red]false[/red]'}")
+    out_console.print("\n[yellow]📝 Default Settings for Creating Hosts:[/yellow]")
+    out_console.print("\n[green]Basic Settings:[/green]")
+    out_console.print(f"  Forward Scheme:          [cyan]{defaults.forward_scheme}[/cyan]")
+    out_console.print(f"  Caching Enabled:         {'[green]true[/green]' if defaults.caching_enabled else '[red]false[/red]'}")
+    out_console.print(f"  Block Exploits:          {'[green]true[/green]' if defaults.block_exploits else '[red]false[/red]'}")
+    out_console.print(f"  Allow Websocket Upgrade: {'[green]true[/green]' if defaults.allow_websocket_upgrade else '[red]false[/red]'}")
     
-    console.print("\n[green]SSL Settings:[/green]")
-    console.print(f"  HTTP/2 Support:          {'[green]true[/green]' if defaults.http2_support else '[red]false[/red]'}")
-    console.print(f"  SSL Forced:              {'[green]true[/green]' if defaults.ssl_forced else '[red]false[/red]'}")
-    console.print(f"  HSTS Enabled:            {'[green]true[/green]' if defaults.hsts_enabled else '[red]false[/red]'}")
-    console.print(f"  HSTS Subdomains:         {'[green]true[/green]' if defaults.hsts_subdomains else '[red]false[/red]'}")
+    out_console.print("\n[green]SSL Settings:[/green]")
+    out_console.print(f"  HTTP/2 Support:          {'[green]true[/green]' if defaults.http2_support else '[red]false[/red]'}")
+    out_console.print(f"  SSL Forced:              {'[green]true[/green]' if defaults.ssl_forced else '[red]false[/red]'}")
+    out_console.print(f"  HSTS Enabled:            {'[green]true[/green]' if defaults.hsts_enabled else '[red]false[/red]'}")
+    out_console.print(f"  HSTS Subdomains:         {'[green]true[/green]' if defaults.hsts_subdomains else '[red]false[/red]'}")
 
 
 # =============================================================================
@@ -1546,7 +1647,7 @@ def host_list(
         
         table.add_row(host_id, domain, status, ssl, forward)
     
-    console.print(table)
+    out_console.print(table)
 
 
 @host_app.command("show")
@@ -1567,35 +1668,35 @@ def host_show(
         print_json(host)
         return
 
-    console.print(f"\n[yellow]📋 Host Details:[/yellow]")
-    console.print(f"  [cyan]ID:[/cyan] {host.get('id')}")
-    console.print(f"  [cyan]Domains:[/cyan] {', '.join(host.get('domain_names', []))}")
-    console.print(f"  [cyan]Forward Host:[/cyan] {host.get('forward_host')}")
-    console.print(f"  [cyan]Forward Port:[/cyan] {host.get('forward_port')}")
-    console.print(f"  [cyan]Forward Scheme:[/cyan] {host.get('forward_scheme')}")
-    console.print(f"  [cyan]Enabled:[/cyan] {'[green]Yes[/green]' if host.get('enabled') else '[red]No[/red]'}")
-    console.print(f"  [cyan]Certificate ID:[/cyan] {host.get('certificate_id') or 'None'}")
-    console.print(f"  [cyan]SSL Forced:[/cyan] {'[green]Yes[/green]' if host.get('ssl_forced') else '[red]No[/red]'}")
-    console.print(f"  [cyan]HTTP/2:[/cyan] {'[green]Yes[/green]' if host.get('http2_support') else '[red]No[/red]'}")
-    console.print(f"  [cyan]Block Exploits:[/cyan] {'[green]Yes[/green]' if host.get('block_exploits') else '[red]No[/red]'}")
-    console.print(f"  [cyan]Caching:[/cyan] {'[green]Yes[/green]' if host.get('caching_enabled') else '[red]No[/red]'}")
-    console.print(f"  [cyan]Websocket:[/cyan] {'[green]Yes[/green]' if host.get('allow_websocket_upgrade') else '[red]No[/red]'}")
-    console.print(f"  [cyan]Trust Forwarded Proto:[/cyan] "
-                  f"{'[green]Yes[/green]' if host.get('trust_forwarded_proto') else '[red]No[/red]'}")
-    console.print(f"  [cyan]HSTS:[/cyan] {'[green]Yes[/green]' if host.get('hsts_enabled') else '[red]No[/red]'}"
-                  f"{' [dim](+subdomains)[/dim]' if host.get('hsts_subdomains') else ''}")
-    console.print(f"  [cyan]Access List ID:[/cyan] {host.get('access_list_id') or 'None'}")
+    out_console.print(f"\n[yellow]📋 Host Details:[/yellow]")
+    out_console.print(f"  [cyan]ID:[/cyan] {host.get('id')}")
+    out_console.print(f"  [cyan]Domains:[/cyan] {', '.join(host.get('domain_names', []))}")
+    out_console.print(f"  [cyan]Forward Host:[/cyan] {host.get('forward_host')}")
+    out_console.print(f"  [cyan]Forward Port:[/cyan] {host.get('forward_port')}")
+    out_console.print(f"  [cyan]Forward Scheme:[/cyan] {host.get('forward_scheme')}")
+    out_console.print(f"  [cyan]Enabled:[/cyan] {'[green]Yes[/green]' if host.get('enabled') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]Certificate ID:[/cyan] {host.get('certificate_id') or 'None'}")
+    out_console.print(f"  [cyan]SSL Forced:[/cyan] {'[green]Yes[/green]' if host.get('ssl_forced') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]HTTP/2:[/cyan] {'[green]Yes[/green]' if host.get('http2_support') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]Block Exploits:[/cyan] {'[green]Yes[/green]' if host.get('block_exploits') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]Caching:[/cyan] {'[green]Yes[/green]' if host.get('caching_enabled') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]Websocket:[/cyan] {'[green]Yes[/green]' if host.get('allow_websocket_upgrade') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]Trust Forwarded Proto:[/cyan] "
+                      f"{'[green]Yes[/green]' if host.get('trust_forwarded_proto') else '[red]No[/red]'}")
+    out_console.print(f"  [cyan]HSTS:[/cyan] {'[green]Yes[/green]' if host.get('hsts_enabled') else '[red]No[/red]'}"
+                      f"{' [dim](+subdomains)[/dim]' if host.get('hsts_subdomains') else ''}")
+    out_console.print(f"  [cyan]Access List ID:[/cyan] {host.get('access_list_id') or 'None'}")
 
     locations = host.get('locations') or []
-    console.print(f"  [cyan]Custom Locations:[/cyan] {len(locations) or 'None'}")
+    out_console.print(f"  [cyan]Custom Locations:[/cyan] {len(locations) or 'None'}")
     for loc in locations:
         scheme = loc.get('forward_scheme', 'http')
-        console.print(f"    [dim]{loc.get('path', '?')}[/dim] → "
-                      f"{scheme}://{loc.get('forward_host', '?')}:{loc.get('forward_port', '?')}")
+        out_console.print(f"    [dim]{loc.get('path', '?')}[/dim] → "
+                          f"{scheme}://{loc.get('forward_host', '?')}:{loc.get('forward_port', '?')}")
 
     if host.get('advanced_config'):
-        console.print(f"\n  [cyan]Advanced Config:[/cyan]")
-        console.print(Syntax(host['advanced_config'], "nginx", theme="monokai"))
+        out_console.print(f"\n  [cyan]Advanced Config:[/cyan]")
+        out_console.print(Syntax(host['advanced_config'], "nginx", theme="monokai"))
 
 
 @host_app.command("search")
@@ -1617,7 +1718,7 @@ def host_search(
         return
 
     for host in hosts:
-        console.print(f"  [yellow]{host.get('id'):4}[/yellow] [green]{', '.join(host.get('domain_names', []))}[/green]")
+        out_console.print(f"  [yellow]{host.get('id'):4}[/yellow] [green]{', '.join(host.get('domain_names', []))}[/green]")
 
 
 @host_app.command("create")
@@ -1686,7 +1787,7 @@ def host_delete(
         console.print(f"   ID: {host_id}")
         console.print(f"   Domain: {domain}")
         
-        if not typer.confirm("Are you sure?"):
+        if not typer.confirm("Are you sure?", err=True):
             console.print("[red]❌ Cancelled[/red]")
             raise typer.Exit(0)
     
@@ -1799,7 +1900,7 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
                           f"[green]{domains}[/green]{extra}")
 
         console.print("\n[cyan]Enter host numbers (comma-separated) or 'all':[/cyan]")
-        selection = typer.prompt("Selection")
+        selection = typer.prompt("Selection", err=True)
 
         if selection.strip().lower() == "all":
             return all_hosts
@@ -1815,10 +1916,19 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
 
 
 def confirm_bulk(yes: bool, prompt: str = "Apply these changes?"):
-    """Gate a bulk write behind a confirmation unless -y was given"""
+    """Gate a bulk write behind a confirmation unless -y was given.
+
+    err=True here and at every other prompt: click writes prompts to stdout by
+    default, which would put "Apply these changes? [y/N]:" in the middle of a
+    pipe. stderr still reaches the terminal the user is answering on.
+
+    click still emits one space on stdout per prompt — its readline backspace
+    workaround, which err= does not cover. Harmless: no --json command prompts,
+    so the "stdout is JSON or empty" guarantee is unaffected.
+    """
     if yes:
         return
-    if not typer.confirm(prompt):
+    if not typer.confirm(prompt, err=True):
         console.print("[red]❌ Cancelled[/red]")
         raise typer.Exit(0)
 
@@ -2335,7 +2445,7 @@ def cert_list(
 
         table.add_row(cert_id, domains, provider, expires, status)
     
-    console.print(table)
+    out_console.print(table)
 
 
 @cert_app.command("show")
@@ -2368,12 +2478,12 @@ def cert_show(
         return
 
     for cert in certs:
-        console.print(f"\n[cyan]🔒 Certificate ID: {cert.get('id')}[/cyan]")
-        console.print(f"   Domains: {', '.join(cert.get('domain_names', []))}")
-        console.print(f"   Provider: {cert.get('provider')}")
-        console.print(f"   Created: {cert.get('created_on', 'N/A')}")
-        console.print(f"   Expires: {cert.get('expires_on', 'N/A')}")
-        console.print(f"   Status: {cert_status_label(cert)}")
+        out_console.print(f"\n[cyan]🔒 Certificate ID: {cert.get('id')}[/cyan]")
+        out_console.print(f"   Domains: {', '.join(cert.get('domain_names', []))}")
+        out_console.print(f"   Provider: {cert.get('provider')}")
+        out_console.print(f"   Created: {cert.get('created_on', 'N/A')}")
+        out_console.print(f"   Expires: {cert.get('expires_on', 'N/A')}")
+        out_console.print(f"   Status: {cert_status_label(cert)}")
 
 
 @cert_app.command("generate")
@@ -2421,7 +2531,7 @@ def cert_generate(
         if dns_provider:
             console.print(f"   DNS Provider: {dns_provider}")
         
-        if not typer.confirm("Generate certificate?"):
+        if not typer.confirm("Generate certificate?", err=True):
             console.print("[red]❌ Cancelled[/red]")
             raise typer.Exit(0)
     
@@ -2490,7 +2600,7 @@ def cert_delete(
         console.print(f"   ID: {cert_id}")
         console.print(f"   Domains: {domains}")
         
-        if not typer.confirm("Are you sure?"):
+        if not typer.confirm("Are you sure?", err=True):
             console.print("[red]❌ Cancelled[/red]")
             raise typer.Exit(0)
     
@@ -2566,7 +2676,7 @@ def user_list(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON 
         
         table.add_row(user_id, name, email, roles, status)
     
-    console.print(table)
+    out_console.print(table)
 
 
 @user_app.command("create")
@@ -2628,7 +2738,7 @@ def user_delete(
         console.print(f"   Name: {user.get('name')}")
         console.print(f"   Email: {user.get('email')}")
         
-        if not typer.confirm("Are you sure?"):
+        if not typer.confirm("Are you sure?", err=True):
             console.print("[red]❌ Cancelled[/red]")
             raise typer.Exit(0)
     
@@ -3016,7 +3126,7 @@ def acl_list(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON o
         
         table.add_row(al_id, name, str(items_count), str(clients_count), satisfy, proxy_count)
     
-    console.print(table)
+    out_console.print(table)
 
 
 @acl_app.command("show")
@@ -3037,25 +3147,25 @@ def acl_show(
         print_json(al)
         return
 
-    console.print(f"\n[cyan]🔑 Access List Details:[/cyan]")
-    console.print(f"   ID: {al.get('id')}")
-    console.print(f"   Name: {al.get('name')}")
-    console.print(f"   Satisfy: {'Any' if al.get('satisfy_any') else 'All'}")
-    console.print(f"   Pass Auth: {'Yes' if al.get('pass_auth') else 'No'}")
+    out_console.print(f"\n[cyan]🔑 Access List Details:[/cyan]")
+    out_console.print(f"   ID: {al.get('id')}")
+    out_console.print(f"   Name: {al.get('name')}")
+    out_console.print(f"   Satisfy: {'Any' if al.get('satisfy_any') else 'All'}")
+    out_console.print(f"   Pass Auth: {'Yes' if al.get('pass_auth') else 'No'}")
     
     items = al.get("items", [])
     if items:
-        console.print(f"\n   [cyan]Authorized Users:[/cyan]")
+        out_console.print(f"\n   [cyan]Authorized Users:[/cyan]")
         for item in items:
-            console.print(f"      • {item.get('username')}")
+            out_console.print(f"      • {item.get('username')}")
     
     clients = al.get("clients", [])
     if clients:
-        console.print(f"\n   [cyan]IP Rules:[/cyan]")
+        out_console.print(f"\n   [cyan]IP Rules:[/cyan]")
         for client_item in clients:
             directive = client_item.get("directive", "allow")
             color = "green" if directive == "allow" else "red"
-            console.print(f"      • [{color}]{directive}[/{color}] {client_item.get('address')}")
+            out_console.print(f"      • [{color}]{directive}[/{color}] {client_item.get('address')}")
 
 
 @acl_app.command("create")
@@ -3076,7 +3186,7 @@ def acl_create(
     if users:
         for user in users.split(","):
             user = user.strip()
-            password = typer.prompt(f"Password for {user}", hide_input=True)
+            password = typer.prompt(f"Password for {user}", hide_input=True, err=True)
             items.append({"username": user, "password": password})
     
     clients = []
@@ -3117,7 +3227,7 @@ def acl_delete(
         console.print(f"   ID: {list_id}")
         console.print(f"   Name: {al.get('name')}")
         
-        if not typer.confirm("Are you sure?"):
+        if not typer.confirm("Are you sure?", err=True):
             console.print("[red]❌ Cancelled[/red]")
             raise typer.Exit(0)
     
@@ -3178,8 +3288,25 @@ def acl_update(
 # =============================================================================
 
 def main():
-    """Main entry point"""
-    app()
+    """Main entry point.
+
+    Typer re-raises whatever a command lets escape, so an unreachable server or
+    a rejected password used to print a full Rich traceback. Those are the
+    user's environment, not our bug: report each in one line on stderr and exit
+    non-zero. Anything not listed here is a real defect and keeps its traceback.
+    """
+    try:
+        app()
+    except NPMError as exc:
+        console.print(f"[red]❌ {exc}[/red]")
+        sys.exit(1)
+    except requests.HTTPError as exc:
+        console.print(f"[red]❌ {format_http_error(exc)}[/red]")
+        sys.exit(1)
+    except requests.RequestException as exc:
+        console.print(f"[red]❌ NPM request failed — "
+                      f"{describe_connection_error(exc)}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
