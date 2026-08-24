@@ -59,9 +59,11 @@ relevant section below.
   `host bulk-update` or `host ssl-enable` checks that the certificate exists,
   reports its expiry, and warns about host domains it does not cover.
 - A test suite, `test_npm_api.py`, covering the pure helpers and the backup and
-  dashboard paths against stubbed clients. 127 tests, no network required.
-  `make test` runs it, and `make build` now runs it before building.
-  `npm_api.py` remains a single self-contained file.
+  dashboard paths against stubbed clients. 127 cases, standard library only —
+  no pytest or other dev dependency, so any machine that can run `npm-api` can
+  run its tests. No network and no live NPM required. `make test` runs it, and
+  `make build` runs it after installing dependencies. `npm_api.py` remains a
+  single self-contained file and is not needed to run the suite from elsewhere.
 - `backup --output/-o <dir>` writes the backup to a chosen directory instead of
   the configured data directory.
 - `backup --include-keys` downloads certificate private keys. Without it the

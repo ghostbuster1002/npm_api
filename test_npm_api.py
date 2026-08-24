@@ -5,6 +5,10 @@ Deliberately a separate file. npm-api ships as one self-contained module that
 gets deployed by copy-pasting npm_api.py as text, so nothing here may become a
 runtime dependency of the tool: these tests import npm_api, never the reverse.
 
+Standard library only, on the same principle. The suite runs on unittest rather
+than pytest so that a machine that can run npm-api can also run its tests: the
+only third-party import here is requests, which npm_api.py already requires.
+
 Everything runs without a live NPM and without network. The API client is
 exercised by subclassing NPMClient with a no-op __init__ (the real one creates
 token and backup directories) and overriding only the few methods the code
@@ -13,7 +17,11 @@ removed afterwards.
 
 Run from the repo root:
 
-    python3 -m pytest test_npm_api.py -q
+    python3 -m unittest discover -v
+
+or run this file directly:
+
+    python3 test_npm_api.py
 """
 
 import io
@@ -21,16 +29,17 @@ import json
 import stat
 import sys
 import tempfile
+import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
 import requests
 
 # The tool is a script, not an installed package, and some Python builds strip
 # the working directory from sys.path. Anchor the import on this file's own
-# directory so the suite runs the same way under pytest and unittest.
+# directory so the suite runs the same way under `unittest discover` and when
+# this file is executed directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import npm_api  # noqa: E402
@@ -86,12 +95,20 @@ class _StubClient(npm_api.NPMClient):
         pass
 
 
-@pytest.fixture
-def workdir():
-    """A private directory, resolved so symlinked temp roots don't skew
-    path-containment assertions, removed when the test ends."""
-    with tempfile.TemporaryDirectory(prefix="npm_api_test_") as raw:
-        yield Path(raw).resolve()
+class _WorkdirTestCase(unittest.TestCase):
+    """Base class for the tests that touch disk.
+
+    Gives each test a private directory, resolved so symlinked temp roots don't
+    skew path-containment assertions, removed when the test ends. addCleanup
+    rather than tearDown so the removal still happens if setUp itself is
+    extended later and fails partway.
+    """
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory(prefix="npm_api_test_")
+        self.addCleanup(tmp.cleanup)
+        self.workdir = Path(tmp.name).resolve()
 
 
 def _mode(path):
@@ -108,207 +125,227 @@ def _expires_in(delta):
 # domain_prefix
 # =============================================================================
 
-class TestDomainPrefix:
+class TestDomainPrefix(unittest.TestCase):
     """The part of a name carried over when rebasing onto another domain."""
 
     def test_single_subdomain_label(self):
-        assert npm_api.domain_prefix("ex.example.com") == "ex"
+        self.assertEqual(npm_api.domain_prefix("ex.example.com"), "ex")
 
     def test_keeps_every_subdomain_label(self):
         # Regression: this took only the first label, so rebasing a host that
         # held sub.ex.example.com produced sub.example.net, dropping "ex".
-        assert npm_api.domain_prefix("sub.ex.example.com") == "sub.ex"
+        self.assertEqual(npm_api.domain_prefix("sub.ex.example.com"), "sub.ex")
 
     def test_deep_subdomain_keeps_all_labels(self):
-        assert npm_api.domain_prefix("a.b.c.example.com") == "a.b.c"
+        self.assertEqual(npm_api.domain_prefix("a.b.c.example.com"), "a.b.c")
 
     def test_apex_has_no_prefix(self):
         # None means "skip this one"; rebasing an apex would invent a label.
-        assert npm_api.domain_prefix("example.com") is None
+        self.assertIsNone(npm_api.domain_prefix("example.com"))
 
     def test_single_label_has_no_prefix(self):
-        assert npm_api.domain_prefix("localhost") is None
+        self.assertIsNone(npm_api.domain_prefix("localhost"))
 
     def test_wildcard_label_is_a_prefix_like_any_other(self):
-        assert npm_api.domain_prefix("*.example.com") == "*"
+        self.assertEqual(npm_api.domain_prefix("*.example.com"), "*")
 
     def test_trailing_dot_and_surrounding_space_ignored(self):
-        assert npm_api.domain_prefix("  ex.example.com.  ") == "ex"
+        self.assertEqual(npm_api.domain_prefix("  ex.example.com.  "), "ex")
 
     def test_multipart_suffix_keeps_one_label_too_many(self):
         # Documented limitation, not a bug: the registrable base is assumed to
         # be two labels. Getting .co.uk right needs public-suffix data that
         # neither this tool nor NPM carries. Asserted so the behaviour is a
         # decision on record rather than a surprise.
-        assert npm_api.domain_prefix("ex.example.co.uk") == "ex.example"
+        self.assertEqual(npm_api.domain_prefix("ex.example.co.uk"), "ex.example")
 
 
 # =============================================================================
 # dedupe_domains
 # =============================================================================
 
-class TestDedupeDomains:
+class TestDedupeDomains(unittest.TestCase):
     """Rewriting one base onto another can collide with a name the host
     already carries; NPM would otherwise store the same name twice."""
 
     def test_preserves_order_of_first_occurrence(self):
-        assert npm_api.dedupe_domains(
-            ["b.example.com", "a.example.com", "c.example.com"]
-        ) == ["b.example.com", "a.example.com", "c.example.com"]
+        self.assertEqual(
+            npm_api.dedupe_domains(["b.example.com", "a.example.com", "c.example.com"]),
+            ["b.example.com", "a.example.com", "c.example.com"],
+        )
 
     def test_case_insensitive(self):
-        assert npm_api.dedupe_domains(
-            ["App.Example.com", "app.example.com", "APP.EXAMPLE.COM"]
-        ) == ["App.Example.com"]
+        self.assertEqual(
+            npm_api.dedupe_domains(["App.Example.com", "app.example.com", "APP.EXAMPLE.COM"]),
+            ["App.Example.com"],
+        )
 
     def test_keeps_the_first_spelling_not_the_last(self):
-        assert npm_api.dedupe_domains(
-            ["APP.example.com", "app.example.com"]
-        ) == ["APP.example.com"]
+        self.assertEqual(
+            npm_api.dedupe_domains(["APP.example.com", "app.example.com"]),
+            ["APP.example.com"],
+        )
 
     def test_surrounding_whitespace_does_not_defeat_the_match(self):
-        assert npm_api.dedupe_domains(
-            [" app.example.com ", "app.example.com"]
-        ) == [" app.example.com "]
+        self.assertEqual(
+            npm_api.dedupe_domains([" app.example.com ", "app.example.com"]),
+            [" app.example.com "],
+        )
 
     def test_drops_empty_and_whitespace_only_entries(self):
-        assert npm_api.dedupe_domains(
-            ["a.example.com", "", "   ", "b.example.com"]
-        ) == ["a.example.com", "b.example.com"]
+        self.assertEqual(
+            npm_api.dedupe_domains(["a.example.com", "", "   ", "b.example.com"]),
+            ["a.example.com", "b.example.com"],
+        )
 
     def test_empty_input(self):
-        assert npm_api.dedupe_domains([]) == []
+        self.assertEqual(npm_api.dedupe_domains([]), [])
 
 
 # =============================================================================
 # coerce_field_value
 # =============================================================================
 
-class TestCoerceFieldValue:
+class TestCoerceFieldValue(unittest.TestCase):
     """CLI "field=value" strings into the JSON types NPM expects."""
 
-    @pytest.mark.parametrize("given", ["true", "True", "  TRUE  "])
-    def test_true_in_any_case(self, given):
-        assert npm_api.coerce_field_value("block_exploits", given) is True
+    def test_true_in_any_case(self):
+        for given in ("true", "True", "  TRUE  "):
+            with self.subTest(given=given):
+                self.assertIs(npm_api.coerce_field_value("block_exploits", given), True)
 
-    @pytest.mark.parametrize("given", ["false", "False", " FALSE "])
-    def test_false_in_any_case(self, given):
-        assert npm_api.coerce_field_value("block_exploits", given) is False
+    def test_false_in_any_case(self):
+        for given in ("false", "False", " FALSE "):
+            with self.subTest(given=given):
+                self.assertIs(npm_api.coerce_field_value("block_exploits", given), False)
 
-    @pytest.mark.parametrize("given", ["null", "none", "NULL", "None"])
-    def test_null_spellings(self, given):
-        assert npm_api.coerce_field_value("advanced_config", given) is None
+    def test_null_spellings(self):
+        for given in ("null", "none", "NULL", "None"):
+            with self.subTest(given=given):
+                self.assertIsNone(npm_api.coerce_field_value("advanced_config", given))
 
     def test_json_array_literal(self):
-        assert npm_api.coerce_field_value(
-            "locations", '[{"path": "/api"}]'
-        ) == [{"path": "/api"}]
+        self.assertEqual(
+            npm_api.coerce_field_value("locations", '[{"path": "/api"}]'),
+            [{"path": "/api"}],
+        )
 
     def test_json_object_literal(self):
-        assert npm_api.coerce_field_value(
-            "meta", '{"letsencrypt_agree": true}'
-        ) == {"letsencrypt_agree": True}
+        self.assertEqual(
+            npm_api.coerce_field_value("meta", '{"letsencrypt_agree": true}'),
+            {"letsencrypt_agree": True},
+        )
 
     def test_leading_whitespace_still_reads_as_json(self):
-        assert npm_api.coerce_field_value("locations", '  ["/api"]') == ["/api"]
+        self.assertEqual(npm_api.coerce_field_value("locations", '  ["/api"]'), ["/api"])
 
     def test_json_literal_wins_over_comma_splitting_for_list_fields(self):
-        assert npm_api.coerce_field_value(
-            "domain_names", '["a.example.com", "b.example.com"]'
-        ) == ["a.example.com", "b.example.com"]
+        self.assertEqual(
+            npm_api.coerce_field_value("domain_names", '["a.example.com", "b.example.com"]'),
+            ["a.example.com", "b.example.com"],
+        )
 
     def test_malformed_json_names_the_field(self):
-        with pytest.raises(ValueError, match="locations"):
+        with self.assertRaisesRegex(ValueError, "locations"):
             npm_api.coerce_field_value("locations", "[not json")
 
     def test_list_field_splits_on_commas_and_strips(self):
-        assert npm_api.coerce_field_value(
-            "domain_names", "a.example.com, b.example.com ,c.example.com"
-        ) == ["a.example.com", "b.example.com", "c.example.com"]
+        self.assertEqual(
+            npm_api.coerce_field_value(
+                "domain_names", "a.example.com, b.example.com ,c.example.com"
+            ),
+            ["a.example.com", "b.example.com", "c.example.com"],
+        )
 
     def test_list_field_drops_empty_segments(self):
-        assert npm_api.coerce_field_value(
-            "domain_names", "a.example.com,,b.example.com,"
-        ) == ["a.example.com", "b.example.com"]
+        self.assertEqual(
+            npm_api.coerce_field_value("domain_names", "a.example.com,,b.example.com,"),
+            ["a.example.com", "b.example.com"],
+        )
 
     def test_free_text_field_keeps_its_commas(self):
         # advanced_config is nginx config, not a list; splitting it would
         # corrupt every directive containing a comma.
-        assert npm_api.coerce_field_value(
-            "advanced_config", "add_header X-A a, b;"
-        ) == "add_header X-A a, b;"
+        self.assertEqual(
+            npm_api.coerce_field_value("advanced_config", "add_header X-A a, b;"),
+            "add_header X-A a, b;",
+        )
 
     def test_plain_integer(self):
-        assert npm_api.coerce_field_value("forward_port", "8080") == 8080
+        self.assertEqual(npm_api.coerce_field_value("forward_port", "8080"), 8080)
 
     def test_negative_integer(self):
-        assert npm_api.coerce_field_value("forward_port", "-1") == -1
+        self.assertEqual(npm_api.coerce_field_value("forward_port", "-1"), -1)
 
     def test_malformed_numeric_stays_a_string(self):
         # Regression: an lstrip("-").isdigit() test accepted "--5" and then
         # int() raised an uncaught ValueError. Strict matching sends it on as
         # a string and lets NPM reject it.
-        assert npm_api.coerce_field_value("forward_port", "--5") == "--5"
+        self.assertEqual(npm_api.coerce_field_value("forward_port", "--5"), "--5")
 
-    @pytest.mark.parametrize("given", ["5.5", "1e3", "12abc", "0x10", "+5"])
-    def test_other_non_integers_stay_strings(self, given):
-        assert npm_api.coerce_field_value("forward_port", given) == given
+    def test_other_non_integers_stay_strings(self):
+        for given in ("5.5", "1e3", "12abc", "0x10", "+5"):
+            with self.subTest(given=given):
+                self.assertEqual(npm_api.coerce_field_value("forward_port", given), given)
 
-    @pytest.mark.parametrize("field", sorted(npm_api.HOST_UNSET_ON_ZERO_FIELDS))
-    def test_zero_clears_a_link_field(self, field):
+    def test_zero_clears_a_link_field(self):
         # 0 is NPM's "nothing linked" for these two, so `bulk-update
         # certificate_id 0` has to clear rather than point at host 0.
-        assert npm_api.coerce_field_value(field, "0") is None
+        for field in sorted(npm_api.HOST_UNSET_ON_ZERO_FIELDS):
+            with self.subTest(field=field):
+                self.assertIsNone(npm_api.coerce_field_value(field, "0"))
 
     def test_zero_is_a_real_value_everywhere_else(self):
         result = npm_api.coerce_field_value("forward_port", "0")
-        assert result == 0 and isinstance(result, int)
+        self.assertEqual(result, 0)
+        self.assertIsInstance(result, int)
 
     def test_nonzero_link_field_stays_an_integer(self):
-        assert npm_api.coerce_field_value("certificate_id", "7") == 7
+        self.assertEqual(npm_api.coerce_field_value("certificate_id", "7"), 7)
 
     def test_unrecognised_value_passes_through_unchanged(self):
-        assert npm_api.coerce_field_value(
-            "forward_host", "backend.internal.lan"
-        ) == "backend.internal.lan"
+        self.assertEqual(
+            npm_api.coerce_field_value("forward_host", "backend.internal.lan"),
+            "backend.internal.lan",
+        )
 
 
 # =============================================================================
 # cert_covers_domain
 # =============================================================================
 
-class TestCertCoversDomain:
+class TestCertCoversDomain(unittest.TestCase):
     """Three-valued on purpose: True, False, or None for "cannot tell"."""
 
     def test_exact_match(self):
         cert = {"domain_names": ["app.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.example.com") is True
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.example.com"), True)
 
     def test_match_is_case_and_trailing_dot_insensitive(self):
         cert = {"domain_names": ["App.Example.COM."]}
-        assert npm_api.cert_covers_domain(cert, "  APP.example.com.  ") is True
+        self.assertIs(npm_api.cert_covers_domain(cert, "  APP.example.com.  "), True)
 
     def test_non_matching_name(self):
         cert = {"domain_names": ["other.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.example.com") is False
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.example.com"), False)
 
     def test_wildcard_covers_one_label(self):
         cert = {"domain_names": ["*.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.example.com") is True
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.example.com"), True)
 
     def test_wildcard_does_not_cover_two_labels(self):
         # RFC 6125: *.example.com is not valid for app.eu.example.com. Getting
         # this wrong would attach a cert that browsers then reject.
         cert = {"domain_names": ["*.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.eu.example.com") is False
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.eu.example.com"), False)
 
     def test_wildcard_does_not_cover_the_apex(self):
         cert = {"domain_names": ["*.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "example.com") is False
+        self.assertIs(npm_api.cert_covers_domain(cert, "example.com"), False)
 
     def test_matches_any_entry_in_the_list(self):
         cert = {"domain_names": ["a.example.com", "*.internal.lan", "b.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.internal.lan") is True
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.internal.lan"), True)
 
     def test_unusable_metadata_is_unknown_not_absent(self):
         # NPM keeps domain_names as metadata only and never consults it when
@@ -316,50 +353,51 @@ class TestCertCoversDomain:
         # can belong to a cert that really does serve *.internal.lan; answering
         # False here would refuse a valid assignment.
         cert = {"domain_names": ["*.internal,"]}
-        assert npm_api.cert_covers_domain(cert, "app.internal.lan") is None
+        self.assertIsNone(npm_api.cert_covers_domain(cert, "app.internal.lan"))
 
-    @pytest.mark.parametrize("entry", ["*.internal,", "a.example.com b.example.com",
-                                       "a.example.com;b.example.com", "localhost", ""])
-    def test_entries_without_a_usable_name_are_skipped(self, entry):
-        cert = {"domain_names": [entry]}
-        assert npm_api.cert_covers_domain(cert, "app.example.com") is None
+    def test_entries_without_a_usable_name_are_skipped(self):
+        for entry in ("*.internal,", "a.example.com b.example.com",
+                      "a.example.com;b.example.com", "localhost", ""):
+            with self.subTest(entry=entry):
+                cert = {"domain_names": [entry]}
+                self.assertIsNone(npm_api.cert_covers_domain(cert, "app.example.com"))
 
     def test_empty_domain_list_is_unknown(self):
-        assert npm_api.cert_covers_domain({"domain_names": []}, "app.example.com") is None
+        self.assertIsNone(npm_api.cert_covers_domain({"domain_names": []}, "app.example.com"))
 
     def test_missing_domain_list_is_unknown(self):
-        assert npm_api.cert_covers_domain({}, "app.example.com") is None
+        self.assertIsNone(npm_api.cert_covers_domain({}, "app.example.com"))
 
     def test_null_domain_list_is_unknown(self):
-        assert npm_api.cert_covers_domain({"domain_names": None}, "app.example.com") is None
+        self.assertIsNone(npm_api.cert_covers_domain({"domain_names": None}, "app.example.com"))
 
     def test_one_usable_entry_makes_the_answer_definite(self):
         # Junk alongside a real name is still a real answer: the usable entry
         # was checked and did not match.
         cert = {"domain_names": ["*.internal,", "other.example.com"]}
-        assert npm_api.cert_covers_domain(cert, "app.example.com") is False
+        self.assertIs(npm_api.cert_covers_domain(cert, "app.example.com"), False)
 
 
 # =============================================================================
 # cert_days_remaining / cert_status_label
 # =============================================================================
 
-class TestCertExpiry:
+class TestCertExpiry(unittest.TestCase):
     """NPM sends no "expired" flag, so validity is derived from expires_on."""
 
     def test_future_expiry(self):
         cert = {"expires_on": _expires_in(timedelta(days=45, minutes=5))}
-        assert npm_api.cert_days_remaining(cert) == 45
+        self.assertEqual(npm_api.cert_days_remaining(cert), 45)
 
     def test_naive_timestamp_in_npms_own_format(self):
         # NPM's usual shape is "YYYY-MM-DD HH:MM:SS" with no zone; it must not
         # collide with an aware `now` and raise on the subtraction.
         naive = (datetime.now() + timedelta(days=10, minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        assert npm_api.cert_days_remaining({"expires_on": naive}) == 10
+        self.assertEqual(npm_api.cert_days_remaining({"expires_on": naive}), 10)
 
     def test_expired_certificate_is_negative(self):
         cert = {"expires_on": _expires_in(timedelta(days=-3, minutes=-5))}
-        assert npm_api.cert_days_remaining(cert) < 0
+        self.assertLess(npm_api.cert_days_remaining(cert), 0)
 
     def test_days_floor_toward_the_past(self):
         # timedelta.days floors, so a cert three days and a bit past its date
@@ -371,53 +409,56 @@ class TestCertExpiry:
         # toward "expired" is the safe direction for a TLS check; erring the
         # other way hands someone a dead certificate labelled fine.
         cert = {"expires_on": _expires_in(timedelta(days=-3, minutes=-5))}
-        assert npm_api.cert_days_remaining(cert) == -4
+        self.assertEqual(npm_api.cert_days_remaining(cert), -4)
 
     def test_a_certificate_expired_within_the_last_day_still_reads_expired(self):
         # The case that makes flooring the right choice above.
         cert = {"expires_on": _expires_in(timedelta(hours=-1))}
-        assert npm_api.cert_days_remaining(cert) < 0
-        assert "EXPIRED" in npm_api.cert_status_label(cert)
+        self.assertLess(npm_api.cert_days_remaining(cert), 0)
+        self.assertIn("EXPIRED", npm_api.cert_status_label(cert))
 
     def test_missing_expires_on(self):
-        assert npm_api.cert_days_remaining({}) is None
+        self.assertIsNone(npm_api.cert_days_remaining({}))
 
     def test_empty_expires_on(self):
-        assert npm_api.cert_days_remaining({"expires_on": ""}) is None
+        self.assertIsNone(npm_api.cert_days_remaining({"expires_on": ""}))
 
     def test_unparseable_expires_on(self):
-        assert npm_api.cert_days_remaining({"expires_on": "not-a-date"}) is None
+        self.assertIsNone(npm_api.cert_days_remaining({"expires_on": "not-a-date"}))
 
     def test_valid_label(self):
         cert = {"expires_on": _expires_in(timedelta(days=45, minutes=5))}
-        assert "VALID" in npm_api.cert_status_label(cert)
+        self.assertIn("VALID", npm_api.cert_status_label(cert))
 
     def test_warning_label_inside_the_window(self):
         cert = {"expires_on": _expires_in(timedelta(days=7, minutes=5))}
-        assert "7d LEFT" in npm_api.cert_status_label(cert)
+        self.assertIn("7d LEFT", npm_api.cert_status_label(cert))
 
     def test_warning_window_boundary_is_inclusive(self):
         cert = {"expires_on": _expires_in(
             timedelta(days=npm_api.CERT_EXPIRY_WARN_DAYS, minutes=5))}
         label = npm_api.cert_status_label(cert)
-        assert "LEFT" in label and "VALID" not in label
+        self.assertIn("LEFT", label)
+        self.assertNotIn("VALID", label)
 
     def test_one_day_past_the_window_is_valid(self):
         cert = {"expires_on": _expires_in(
             timedelta(days=npm_api.CERT_EXPIRY_WARN_DAYS + 1, minutes=5))}
-        assert "VALID" in npm_api.cert_status_label(cert)
+        self.assertIn("VALID", npm_api.cert_status_label(cert))
 
     def test_expired_label_reports_age(self):
         cert = {"expires_on": _expires_in(timedelta(days=-10, minutes=-5))}
         label = npm_api.cert_status_label(cert)
-        assert "EXPIRED" in label and "11d AGO" in label
+        self.assertIn("EXPIRED", label)
+        self.assertIn("11d AGO", label)
 
     def test_unknown_label_is_not_a_failure_claim(self):
         # An unreadable date must not render as expired; that would push
         # someone into regenerating a working certificate.
         for cert in ({}, {"expires_on": "not-a-date"}):
             label = npm_api.cert_status_label(cert)
-            assert "UNKNOWN" in label and "EXPIRED" not in label
+            self.assertIn("UNKNOWN", label, msg=f"for cert {cert!r}")
+            self.assertNotIn("EXPIRED", label, msg=f"for cert {cert!r}")
 
 
 # =============================================================================
@@ -450,39 +491,39 @@ def _host_fixture():
     }
 
 
-class TestHostConfigPayload:
+class TestHostConfigPayload(unittest.TestCase):
     """Copy-by-exclusion: whatever NPM sends is written back untouched unless
     it is explicitly known to be unwritable."""
 
     def test_strips_server_assigned_fields(self):
         payload = npm_api.host_config_payload(_host_fixture())
         for key in ("id", "created_on", "modified_on", "owner_user_id"):
-            assert key not in payload
+            self.assertNotIn(key, payload)
 
     def test_strips_expanded_objects_but_keeps_their_ids(self):
         # Echoing the expanded object back sends a nested object where the API
         # wants an integer, and the write fails.
         payload = npm_api.host_config_payload(_host_fixture())
         for key in ("certificate", "owner", "access_list"):
-            assert key not in payload
-        assert payload["certificate_id"] == 4
-        assert payload["access_list_id"] == 2
+            self.assertNotIn(key, payload)
+        self.assertEqual(payload["certificate_id"], 4)
+        self.assertEqual(payload["access_list_id"], 2)
 
     def test_readonly_set_is_fully_covered(self):
         payload = npm_api.host_config_payload(_host_fixture())
-        assert not (npm_api.HOST_READONLY_FIELDS & payload.keys())
+        self.assertEqual(npm_api.HOST_READONLY_FIELDS & payload.keys(), set())
 
     def test_strips_runtime_meta_but_keeps_configuration_meta(self):
         payload = npm_api.host_config_payload(_host_fixture())
-        assert payload["meta"] == {"letsencrypt_agree": True}
+        self.assertEqual(payload["meta"], {"letsencrypt_agree": True})
 
     def test_meta_absent_becomes_empty_dict(self):
         payload = npm_api.host_config_payload({"domain_names": ["app.example.com"]})
-        assert payload["meta"] == {}
+        self.assertEqual(payload["meta"], {})
 
     def test_meta_null_becomes_empty_dict(self):
         payload = npm_api.host_config_payload({"meta": None})
-        assert payload["meta"] == {}
+        self.assertEqual(payload["meta"], {})
 
     def test_preserves_fields_this_script_has_never_heard_of(self):
         # The whole point of copying by exclusion: an allowlist written against
@@ -490,122 +531,126 @@ class TestHostConfigPayload:
         host = _host_fixture()
         host["some_future_npm_field"] = {"nested": ["value"]}
         payload = npm_api.host_config_payload(host)
-        assert payload["some_future_npm_field"] == {"nested": ["value"]}
-        assert payload["trust_forwarded_proto"] is True
+        self.assertEqual(payload["some_future_npm_field"], {"nested": ["value"]})
+        self.assertIs(payload["trust_forwarded_proto"], True)
 
     def test_overrides_replace_existing_values(self):
         payload = npm_api.host_config_payload(
             _host_fixture(), {"forward_port": 9090, "enabled": False}
         )
-        assert payload["forward_port"] == 9090
-        assert payload["enabled"] is False
+        self.assertEqual(payload["forward_port"], 9090)
+        self.assertIs(payload["enabled"], False)
 
     def test_overrides_can_add_and_null_fields(self):
         payload = npm_api.host_config_payload(
             _host_fixture(), {"certificate_id": None, "brand_new": "x"}
         )
-        assert payload["certificate_id"] is None
-        assert payload["brand_new"] == "x"
+        self.assertIsNone(payload["certificate_id"])
+        self.assertEqual(payload["brand_new"], "x")
 
     def test_source_host_is_not_mutated(self):
         # Callers reuse the fetched host afterwards, e.g. to print a summary.
         host = _host_fixture()
         npm_api.host_config_payload(host, {"forward_port": 9090})
-        assert host["id"] == 12
-        assert host["forward_port"] == 8080
-        assert host["meta"]["nginx_online"] is True
+        self.assertEqual(host["id"], 12)
+        self.assertEqual(host["forward_port"], 8080)
+        self.assertIs(host["meta"]["nginx_online"], True)
 
 
 # =============================================================================
 # format_http_error
 # =============================================================================
 
-class TestFormatHttpError:
+class TestFormatHttpError(unittest.TestCase):
     """requests stringifies an HTTPError as "400 Client Error: Bad Request for
     url: ...", which buries the reason NPM actually gave."""
 
     def test_npm_error_object(self):
         response = _FakeResponse(400, json_body={"error": {"message": "Domain already in use"}})
         exc = requests.HTTPError("400 Client Error", response=response)
-        assert npm_api.format_http_error(exc) == "HTTP 400: Domain already in use"
+        self.assertEqual(npm_api.format_http_error(exc), "HTTP 400: Domain already in use")
 
     def test_error_given_as_a_bare_string(self):
         response = _FakeResponse(403, json_body={"error": "Forbidden"})
         exc = requests.HTTPError("403", response=response)
-        assert npm_api.format_http_error(exc) == "HTTP 403: Forbidden"
+        self.assertEqual(npm_api.format_http_error(exc), "HTTP 403: Forbidden")
 
     def test_json_body_in_some_other_shape(self):
         response = _FakeResponse(422, json_body={"detail": "bad input"})
         exc = requests.HTTPError("422", response=response)
         result = npm_api.format_http_error(exc)
-        assert result.startswith("HTTP 422: ") and "bad input" in result
+        self.assertTrue(result.startswith("HTTP 422: "),
+                        msg=f"expected an 'HTTP 422: ' prefix, got {result!r}")
+        self.assertIn("bad input", result)
 
     def test_non_json_body_is_reported_verbatim(self):
         # A reverse proxy in front of NPM answers with HTML, not NPM's JSON.
         response = _FakeResponse(502, text="<html><body>Bad Gateway</body></html>")
         exc = requests.HTTPError("502", response=response)
-        assert npm_api.format_http_error(exc) == \
-            "HTTP 502: <html><body>Bad Gateway</body></html>"
+        self.assertEqual(
+            npm_api.format_http_error(exc),
+            "HTTP 502: <html><body>Bad Gateway</body></html>",
+        )
 
     def test_long_non_json_body_is_truncated(self):
         response = _FakeResponse(502, text="x" * 5000)
         exc = requests.HTTPError("502", response=response)
-        assert npm_api.format_http_error(exc) == "HTTP 502: " + "x" * 200
+        self.assertEqual(npm_api.format_http_error(exc), "HTTP 502: " + "x" * 200)
 
     def test_empty_non_json_body_gives_the_status_alone(self):
         response = _FakeResponse(500, text="   ")
         exc = requests.HTTPError("500", response=response)
-        assert npm_api.format_http_error(exc) == "HTTP 500"
+        self.assertEqual(npm_api.format_http_error(exc), "HTTP 500")
 
     def test_exception_with_no_response_falls_back_to_its_own_message(self):
         # Connection errors never reach a status code.
         exc = requests.ConnectionError("Connection refused")
-        assert npm_api.format_http_error(exc) == "Connection refused"
+        self.assertEqual(npm_api.format_http_error(exc), "Connection refused")
 
     def test_plain_exception(self):
-        assert npm_api.format_http_error(ValueError("boom")) == "boom"
+        self.assertEqual(npm_api.format_http_error(ValueError("boom")), "boom")
 
 
 # =============================================================================
 # write_secret
 # =============================================================================
 
-class TestWriteSecret:
+class TestWriteSecret(_WorkdirTestCase):
     """Private keys and API tokens must never exist world-readable, not even
     for the instant between write_text() and chmod()."""
 
-    def test_creates_owner_only_file_with_the_content(self, workdir):
-        path = npm_api.write_secret(workdir / "token.txt", "s3cret-token")
-        assert path.read_text() == "s3cret-token"
-        assert _mode(path) == 0o600
+    def test_creates_owner_only_file_with_the_content(self):
+        path = npm_api.write_secret(self.workdir / "token.txt", "s3cret-token")
+        self.assertEqual(path.read_text(), "s3cret-token")
+        self.assertEqual(_mode(path), 0o600)
 
-    def test_overwriting_a_world_readable_file_tightens_the_mode(self, workdir):
+    def test_overwriting_a_world_readable_file_tightens_the_mode(self):
         # O_CREAT leaves an existing file's mode alone, so write_secret has to
         # unlink first. Without that, a token file created by an older version
         # would stay 0644 forever.
-        path = workdir / "token.txt"
+        path = self.workdir / "token.txt"
         path.write_text("old")
         path.chmod(0o644)
 
         npm_api.write_secret(path, "new")
 
-        assert path.read_text() == "new"
-        assert _mode(path) == 0o600
+        self.assertEqual(path.read_text(), "new")
+        self.assertEqual(_mode(path), 0o600)
 
-    def test_replaces_a_symlink_instead_of_writing_through_it(self, workdir):
+    def test_replaces_a_symlink_instead_of_writing_through_it(self):
         # Writing through the link would spray the secret into whatever the
         # link points at, and leave that file's permissive mode in place.
-        target = workdir / "innocent.txt"
+        target = self.workdir / "innocent.txt"
         target.write_text("untouched")
-        link = workdir / "token.txt"
+        link = self.workdir / "token.txt"
         link.symlink_to(target)
 
         npm_api.write_secret(link, "s3cret-token")
 
-        assert target.read_text() == "untouched"
-        assert not link.is_symlink()
-        assert link.read_text() == "s3cret-token"
-        assert _mode(link) == 0o600
+        self.assertEqual(target.read_text(), "untouched")
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), "s3cret-token")
+        self.assertEqual(_mode(link), 0o600)
 
 
 # =============================================================================
@@ -627,7 +672,8 @@ class _JsonRouteClient(_StubClient):
         self._body = body
 
     def get(self, endpoint, **kwargs):
-        assert endpoint.endswith("/certificates")
+        if not endpoint.endswith("/certificates"):
+            raise AssertionError(f"unexpected endpoint {endpoint}")
         return _FakeResponse(200, json_body=self._body)
 
     def get_certificate(self, cert_id):
@@ -646,23 +692,23 @@ class _ZipRouteClient(_StubClient):
         return _FakeResponse(404)  # force the fallback
 
 
-class TestDownloadCertificate:
+class TestDownloadCertificate(_WorkdirTestCase):
 
-    def test_json_route_writes_key_at_owner_only_mode(self, workdir):
+    def test_json_route_writes_key_at_owner_only_mode(self):
         client = _JsonRouteClient({
             "certificate": "-----BEGIN CERTIFICATE-----\nleaf\n",
             "private": "-----BEGIN PRIVATE KEY-----\nkey\n",
             "intermediate": "-----BEGIN CERTIFICATE-----\nchain\n",
         })
 
-        written = client.download_certificate(1, str(workdir), "example.com")
+        written = client.download_certificate(1, str(self.workdir), "example.com")
 
         names = {p.name for p in written}
-        assert names == {"example.com.key", "example.com.crt",
-                         "example.com.chain.crt", "example.com_metadata.json"}
-        assert _mode(workdir / "example.com.key") == 0o600
+        self.assertEqual(names, {"example.com.key", "example.com.crt",
+                                 "example.com.chain.crt", "example.com_metadata.json"})
+        self.assertEqual(_mode(self.workdir / "example.com.key"), 0o600)
 
-    def test_json_route_with_empty_key_material_is_a_failure(self, workdir):
+    def test_json_route_with_empty_key_material_is_a_failure(self):
         # NPM answers 200 with empty bodies for certs whose key it does not
         # hold. Writing an empty .key reads as a successful backup of an
         # unusable key, so it has to raise instead.
@@ -672,33 +718,34 @@ class TestDownloadCertificate:
             if endpoint.endswith("/certificates") else _FakeResponse(404)
         )
 
-        with pytest.raises(npm_api.CertificateDownloadError, match="no key material"):
-            client.download_certificate(1, str(workdir), "example.com")
+        with self.assertRaisesRegex(npm_api.CertificateDownloadError, "no key material"):
+            client.download_certificate(1, str(self.workdir), "example.com")
 
-        assert list(workdir.iterdir()) == []
+        self.assertEqual(list(self.workdir.iterdir()), [])
 
-    def test_zip_member_escaping_into_a_prefix_sibling_is_rejected(self, workdir):
+    def test_zip_member_escaping_into_a_prefix_sibling_is_rejected(self):
         # Regression, and the exact case the old guard got wrong: it compared
         # resolved paths with str.startswith, so ".../out-evil/pwned.txt"
         # passed the ".../out" prefix test and extracted outside the target.
-        out = workdir / "out"
+        out = self.workdir / "out"
         out.mkdir()
-        sibling = workdir / "out-evil"
+        sibling = self.workdir / "out-evil"
         sibling.mkdir()
 
         client = _ZipRouteClient(_zip_bytes({"../out-evil/pwned.txt": "owned"}))
 
-        with pytest.raises(npm_api.CertificateDownloadError) as caught:
+        with self.assertRaises(npm_api.CertificateDownloadError) as caught:
             client.download_certificate(1, str(out), "example.com")
 
-        assert "skipped unsafe path" in str(caught.value)
-        assert list(sibling.iterdir()) == []
-        assert not (out / "example.com.download.zip").exists()  # temp zip cleaned up
+        self.assertIn("skipped unsafe path", str(caught.exception))
+        self.assertEqual(list(sibling.iterdir()), [])
+        # temp zip cleaned up
+        self.assertFalse((out / "example.com.download.zip").exists())
 
-    def test_safe_members_survive_alongside_a_rejected_one(self, workdir):
-        out = workdir / "out"
+    def test_safe_members_survive_alongside_a_rejected_one(self):
+        out = self.workdir / "out"
         out.mkdir()
-        sibling = workdir / "out-evil"
+        sibling = self.workdir / "out-evil"
         sibling.mkdir()
 
         client = _ZipRouteClient(_zip_bytes({
@@ -708,39 +755,40 @@ class TestDownloadCertificate:
 
         written = client.download_certificate(1, str(out), "example.com")
 
-        assert [p.name for p in written] == ["fullchain.pem"]
-        assert (out / "fullchain.pem").exists()
-        assert list(sibling.iterdir()) == []
+        self.assertEqual([p.name for p in written], ["fullchain.pem"])
+        self.assertTrue((out / "fullchain.pem").exists())
+        self.assertEqual(list(sibling.iterdir()), [])
 
-    def test_extracted_key_material_is_chmodded(self, workdir):
+    def test_extracted_key_material_is_chmodded(self):
         # The archive's stored mode is whatever NPM chose; keys taken from it
         # used never to be tightened at all.
         client = _ZipRouteClient(_zip_bytes({"privkey.pem": "-----BEGIN PRIVATE KEY-----\n"}))
 
-        client.download_certificate(1, str(workdir), "example.com")
+        client.download_certificate(1, str(self.workdir), "example.com")
 
-        assert _mode(workdir / "privkey.pem") == 0o600
+        self.assertEqual(_mode(self.workdir / "privkey.pem"), 0o600)
 
-    def test_both_routes_failing_names_each_attempt(self, workdir):
+    def test_both_routes_failing_names_each_attempt(self):
         client = _ZipRouteClient(b"")
         client.get = lambda endpoint, **kw: _FakeResponse(404)
 
-        with pytest.raises(npm_api.CertificateDownloadError) as caught:
-            client.download_certificate(9, str(workdir), "example.com")
+        with self.assertRaises(npm_api.CertificateDownloadError) as caught:
+            client.download_certificate(9, str(self.workdir), "example.com")
 
-        message = str(caught.value)
-        assert "certificate 9" in message
-        assert "JSON route" in message and "ZIP route" in message
+        message = str(caught.exception)
+        self.assertIn("certificate 9", message)
+        self.assertIn("JSON route", message)
+        self.assertIn("ZIP route", message)
 
-    def test_certificate_name_is_sanitised_into_the_output_directory(self, workdir):
+    def test_certificate_name_is_sanitised_into_the_output_directory(self):
         # Defense in depth: the name comes from NPM, not from the user, but it
         # still lands in a filename.
         client = _JsonRouteClient({"certificate": "leaf", "private": "key"})
 
-        written = client.download_certificate(1, str(workdir), "../../etc/passwd")
+        written = client.download_certificate(1, str(self.workdir), "../../etc/passwd")
 
         for path in written:
-            assert path.parent == workdir
+            self.assertEqual(path.parent, self.workdir)
 
 
 # =============================================================================
@@ -818,49 +866,58 @@ class _HealthyEmptyClient(_StubClient):
         return []
 
 
-class TestDashboardStats:
+class TestDashboardStats(unittest.TestCase):
     """A failed section reports None, never 0 — "0 proxy hosts" used to read
     as a fact when it actually meant the request had failed."""
 
     def test_working_sections_report_real_counts(self):
         stats = _DashboardClient().get_dashboard_stats()
-        assert stats["proxy_hosts"] == {"total": 3, "enabled": 2, "disabled": 1}
-        assert stats["redirections"] == 2
-        assert stats["users"] == 1
+        self.assertEqual(stats["proxy_hosts"], {"total": 3, "enabled": 2, "disabled": 1})
+        self.assertEqual(stats["redirections"], 2)
+        self.assertEqual(stats["users"], 1)
 
     def test_failed_sections_report_none(self):
         stats = _DashboardClient().get_dashboard_stats()
-        assert stats["certificates"] == {"total": None, "valid": None, "expired": None}
-        assert stats["streams"] is None
-        assert stats["access_lists"] is None
+        self.assertEqual(stats["certificates"],
+                         {"total": None, "valid": None, "expired": None})
+        self.assertIsNone(stats["streams"])
+        self.assertIsNone(stats["access_lists"])
 
     def test_every_section_failing_reports_none_never_zero(self):
         stats = _TotallyBrokenClient().get_dashboard_stats()
 
-        assert stats["proxy_hosts"] == {"total": None, "enabled": None, "disabled": None}
-        assert stats["certificates"] == {"total": None, "valid": None, "expired": None}
+        self.assertEqual(stats["proxy_hosts"],
+                         {"total": None, "enabled": None, "disabled": None})
+        self.assertEqual(stats["certificates"],
+                         {"total": None, "valid": None, "expired": None})
         for section in ("redirections", "streams", "users", "access_lists"):
-            assert stats[section] is None, f"{section} reported {stats[section]!r}, not None"
-        assert len(stats["failures"]) == 6
+            self.assertIsNone(
+                stats[section],
+                msg=f"{section} reported {stats[section]!r}, not None",
+            )
+        self.assertEqual(len(stats["failures"]), 6)
 
     def test_one_failure_entry_per_failed_section(self):
         stats = _DashboardClient().get_dashboard_stats()
-        assert len(stats["failures"]) == 3
+        self.assertEqual(len(stats["failures"]), 3)
         joined = " | ".join(stats["failures"])
-        assert "certificates" in joined
-        assert "streams" in joined
-        assert "access lists" in joined
+        self.assertIn("certificates", joined)
+        self.assertIn("streams", joined)
+        self.assertIn("access lists", joined)
 
     def test_failure_text_carries_npms_own_message(self):
         stats = _DashboardClient().get_dashboard_stats()
-        assert any("db locked" in f for f in stats["failures"])
+        self.assertTrue(
+            any("db locked" in f for f in stats["failures"]),
+            msg=f"no failure mentioned 'db locked': {stats['failures']!r}",
+        )
 
     def test_an_empty_but_healthy_npm_reports_zeros(self):
         stats = _HealthyEmptyClient().get_dashboard_stats()
-        assert stats["failures"] == []
-        assert stats["proxy_hosts"] == {"total": 0, "enabled": 0, "disabled": 0}
-        assert stats["users"] == 0
-        assert stats["streams"] == 0
+        self.assertEqual(stats["failures"], [])
+        self.assertEqual(stats["proxy_hosts"], {"total": 0, "enabled": 0, "disabled": 0})
+        self.assertEqual(stats["users"], 0)
+        self.assertEqual(stats["streams"], 0)
 
     def test_expired_certificates_are_counted_from_expires_on(self):
         class _CertClient(_HealthyEmptyClient):
@@ -872,7 +929,7 @@ class TestDashboardStats:
                 ]
 
         stats = _CertClient().get_dashboard_stats()
-        assert stats["certificates"] == {"total": 3, "valid": 2, "expired": 1}
+        self.assertEqual(stats["certificates"], {"total": 3, "valid": 2, "expired": 1})
 
 
 # =============================================================================
@@ -924,104 +981,111 @@ class _BackupClient(_StubClient):
         return [key, crt]
 
 
-class TestFullBackup:
+class TestFullBackup(_WorkdirTestCase):
 
-    def test_without_keys_no_key_material_is_written_anywhere(self, workdir):
+    def test_without_keys_no_key_material_is_written_anywhere(self):
         client = _BackupClient()
 
-        result = client.full_backup(str(workdir), include_keys=False)
+        result = client.full_backup(str(self.workdir), include_keys=False)
 
-        assert list(workdir.rglob("*.key")) == []
-        assert client.downloaded == []  # not even attempted
-        assert result.complete and result.failures == [] and result.key_failures == []
+        self.assertEqual(list(self.workdir.rglob("*.key")), [])
+        self.assertEqual(client.downloaded, [], msg="not even attempted")
+        self.assertTrue(result.complete)
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.key_failures, [])
 
-    def test_without_keys_metadata_is_still_captured(self, workdir):
+    def test_without_keys_metadata_is_still_captured(self):
         client = _BackupClient()
 
-        client.full_backup(str(workdir), include_keys=False)
+        client.full_backup(str(self.workdir), include_keys=False)
 
-        assert (workdir / ".ssl" / "app.example.com" / "certificate_meta.json").exists()
-        assert (workdir / ".Proxy_Hosts" / "app.example.com" / "proxy_config.json").exists()
-        assert (workdir / "full_config_latest.json").is_symlink()
+        self.assertTrue(
+            (self.workdir / ".ssl" / "app.example.com" / "certificate_meta.json").exists())
+        self.assertTrue(
+            (self.workdir / ".Proxy_Hosts" / "app.example.com" / "proxy_config.json").exists())
+        self.assertTrue((self.workdir / "full_config_latest.json").is_symlink())
 
-        full_config = json.loads((workdir / "full_config_latest.json").read_text())
-        assert set(full_config) == {"users", "settings", "access_lists",
-                                    "proxy_hosts", "certificates"}
+        full_config = json.loads((self.workdir / "full_config_latest.json").read_text())
+        self.assertEqual(set(full_config), {"users", "settings", "access_lists",
+                                            "proxy_hosts", "certificates"})
 
-    def test_with_keys_the_key_lands_owner_readable_only(self, workdir):
+    def test_with_keys_the_key_lands_owner_readable_only(self):
         client = _BackupClient()
 
-        client.full_backup(str(workdir), include_keys=True)
+        client.full_backup(str(self.workdir), include_keys=True)
 
-        keys = list(workdir.rglob("*.key"))
-        assert len(keys) == 1
-        assert _mode(keys[0]) == 0o600
+        keys = list(self.workdir.rglob("*.key"))
+        self.assertEqual(len(keys), 1)
+        self.assertEqual(_mode(keys[0]), 0o600)
 
-    def test_an_unexportable_certificate_is_not_a_backup_failure(self, workdir):
+    def test_an_unexportable_certificate_is_not_a_backup_failure(self):
         # Uploaded certificates fail here on every single run; treating that as
         # fatal would make every scheduled backup exit non-zero.
         client = _BackupClient()
 
-        result = client.full_backup(str(workdir), include_keys=True)
+        result = client.full_backup(str(self.workdir), include_keys=True)
 
-        assert result.failures == []
-        assert result.complete is True
+        self.assertEqual(result.failures, [])
+        self.assertIs(result.complete, True)
 
-    def test_an_unexportable_certificate_is_reported_as_a_key_failure(self, workdir):
+    def test_an_unexportable_certificate_is_reported_as_a_key_failure(self):
         client = _BackupClient()
 
-        result = client.full_backup(str(workdir), include_keys=True)
+        result = client.full_backup(str(self.workdir), include_keys=True)
 
-        assert len(result.key_failures) == 1
+        self.assertEqual(len(result.key_failures), 1)
         failure = result.key_failures[0]
-        assert failure.cert_id == _UPLOADED_CERT["id"]
-        assert failure.name == _UPLOADED_CERT["nice_name"]
-        assert failure.provider == "other"
-        assert "no key material" in failure.reason
+        self.assertEqual(failure.cert_id, _UPLOADED_CERT["id"])
+        self.assertEqual(failure.name, _UPLOADED_CERT["nice_name"])
+        self.assertEqual(failure.provider, "other")
+        self.assertIn("no key material", failure.reason)
 
-    def test_a_failing_section_marks_the_backup_incomplete(self, workdir):
+    def test_a_failing_section_marks_the_backup_incomplete(self):
         # A scheduled run has to be able to fail loudly rather than exit 0 over
         # a half-written backup.
         class _BrokenHostsClient(_BackupClient):
             def list_hosts(self):
                 raise requests.HTTPError("500 Server Error")
 
-        result = _BrokenHostsClient().full_backup(str(workdir), include_keys=False)
+        result = _BrokenHostsClient().full_backup(str(self.workdir), include_keys=False)
 
-        assert result.complete is False
-        assert len(result.failures) == 1
-        assert "proxy hosts" in result.failures[0]
+        self.assertIs(result.complete, False)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("proxy hosts", result.failures[0])
 
-    def test_a_failing_section_does_not_stop_the_others(self, workdir):
+    def test_a_failing_section_does_not_stop_the_others(self):
         class _BrokenHostsClient(_BackupClient):
             def list_hosts(self):
                 raise requests.HTTPError("500 Server Error")
 
-        _BrokenHostsClient().full_backup(str(workdir), include_keys=False)
+        _BrokenHostsClient().full_backup(str(self.workdir), include_keys=False)
 
-        assert list((workdir / ".user").glob("users_*.json"))
-        assert list((workdir / ".access_lists").glob("access_lists_*.json"))
+        self.assertTrue(list((self.workdir / ".user").glob("users_*.json")),
+                        msg="the users section was not written")
+        self.assertTrue(list((self.workdir / ".access_lists").glob("access_lists_*.json")),
+                        msg="the access lists section was not written")
 
-    def test_result_path_points_at_the_output_directory(self, workdir):
-        result = _BackupClient().full_backup(str(workdir), include_keys=False)
-        assert Path(result.path) == workdir
+    def test_result_path_points_at_the_output_directory(self):
+        result = _BackupClient().full_backup(str(self.workdir), include_keys=False)
+        self.assertEqual(Path(result.path), self.workdir)
 
-    def test_a_stale_latest_symlink_is_replaced(self, workdir):
+    def test_a_stale_latest_symlink_is_replaced(self):
         # exists() follows the link, so a symlink pointing at a pruned backup
         # read as absent and symlink_to() then raised FileExistsError.
-        (workdir / "full_config_latest.json").symlink_to("full_config_pruned.json")
+        (self.workdir / "full_config_latest.json").symlink_to("full_config_pruned.json")
 
-        _BackupClient().full_backup(str(workdir), include_keys=False)
+        _BackupClient().full_backup(str(self.workdir), include_keys=False)
 
-        latest = workdir / "full_config_latest.json"
-        assert latest.is_symlink() and latest.exists()
+        latest = self.workdir / "full_config_latest.json"
+        self.assertTrue(latest.is_symlink())
+        self.assertTrue(latest.exists())
 
 
 # =============================================================================
 # CertKeyFailure.container_paths
 # =============================================================================
 
-class TestCertKeyFailurePaths:
+class TestCertKeyFailurePaths(unittest.TestCase):
     """The remedy printed to the user is a docker cp command, so the path has
     to be right — npm-api speaks HTTP and cannot look inside the container."""
 
@@ -1032,43 +1096,48 @@ class TestCertKeyFailurePaths:
         )
 
     def test_letsencrypt_points_only_at_the_issued_location(self):
-        assert self._failure("letsencrypt").container_paths == \
-            ["/etc/letsencrypt/live/npm-42"]
+        self.assertEqual(self._failure("letsencrypt").container_paths,
+                         ["/etc/letsencrypt/live/npm-42"])
 
     def test_another_provider_points_only_at_the_upload_location(self):
-        assert self._failure("other").container_paths == ["/data/custom_ssl/npm-42"]
+        self.assertEqual(self._failure("other").container_paths,
+                         ["/data/custom_ssl/npm-42"])
 
     def test_missing_provider_offers_both_rather_than_guessing(self):
         # NPM is under no obligation to send the field, and one confident wrong
         # path is worse than two candidates.
-        assert self._failure(None).container_paths == \
-            ["/data/custom_ssl/npm-42", "/etc/letsencrypt/live/npm-42"]
+        self.assertEqual(self._failure(None).container_paths,
+                         ["/data/custom_ssl/npm-42", "/etc/letsencrypt/live/npm-42"])
 
     def test_string_form_identifies_the_certificate(self):
-        assert str(self._failure(None)) == \
-            "certificate 42 (app.example.com): response carried no key material"
+        self.assertEqual(
+            str(self._failure(None)),
+            "certificate 42 (app.example.com): response carried no key material",
+        )
 
 
 # =============================================================================
 # BackupResult
 # =============================================================================
 
-class TestBackupResult:
+class TestBackupResult(unittest.TestCase):
 
     def test_complete_when_nothing_failed(self):
-        assert npm_api.BackupResult(path="/tmp/backup").complete is True
+        self.assertIs(npm_api.BackupResult(path="/tmp/backup").complete, True)
 
     def test_key_failures_alone_do_not_make_it_incomplete(self):
         result = npm_api.BackupResult(
             path="/tmp/backup",
             key_failures=[npm_api.CertKeyFailure(1, "app.example.com", "other", "no key")],
         )
-        assert result.complete is True
+        self.assertIs(result.complete, True)
 
     def test_section_failures_make_it_incomplete(self):
-        assert npm_api.BackupResult(path="/tmp/backup", failures=["users: 500"]).complete is False
+        self.assertIs(
+            npm_api.BackupResult(path="/tmp/backup", failures=["users: 500"]).complete,
+            False,
+        )
 
 
 if __name__ == "__main__":
-    # Also runnable without pytest installed as a console script entry point.
-    sys.exit(pytest.main([__file__, "-q"]))
+    unittest.main()

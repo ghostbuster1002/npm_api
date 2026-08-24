@@ -44,16 +44,21 @@ make build
 sudo make install
 ```
 
-`make build` runs the test suite first. To run it on its own:
+`make build` installs dependencies, runs the test suite, then builds. To run the
+tests on their own:
 
 ```bash
-make test          # or: python3 -m pytest -q
+make test                          # or:
+python3 -m unittest discover -v    # or:
+python3 test_npm_api.py
 ```
 
-The tests need no network and no running NPM — they import `npm_api.py`
-directly and stub the API client. `npm_api.py` stays a single self-contained
-file, so it can still be copied to a machine on its own; the test file is only
-needed in the repo.
+The suite uses the standard library only — no pytest, no other dev dependency —
+so any machine that can run `npm-api` can run its tests. It needs no network and
+no live NPM: it imports `npm_api.py` directly and stubs the API client.
+
+`npm_api.py` stays a single self-contained file and can still be copied to a
+machine on its own; the test file is only needed in the repo.
 
 ## Configuration
 
