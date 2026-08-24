@@ -14,7 +14,8 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 - 📦 Bulk operations (add/remove/replace domains across multiple hosts)
 - ✂️ Split, clone and merge hosts so each domain can carry its own certificate
 - 🧾 JSON output (`--json`) for scripting and `jq`
-- 💾 Full backup of hosts, certificates, access lists, users and settings
+- 💾 Full backup of hosts, certificates, access lists, users and settings, and
+  restore of the parts that can be safely rebuilt
 - 🔐 Secure credential handling via environment variables or config files
 
 ## Installation
@@ -122,6 +123,8 @@ npm-api --help              Show all commands
 npm-api info                Dashboard and configuration info
 npm-api backup              Full backup of all configurations
                             (add --include-keys to capture private keys)
+npm-api restore <backup>    Rebuild hosts, access lists and settings
+                            from a backup
 
 npm-api host --help         Proxy host management
 npm-api cert --help         SSL certificate management
@@ -410,6 +413,78 @@ Two limits worth knowing:
   not fail the backup, since an uploaded certificate fails every single run.
 - If a section fails, `backup` reports which one and **exits non-zero**, so a
   cron job will not record a partial backup as a success.
+
+## Restoring
+
+```bash
+npm-api restore ~/.npm-api/backups                  # newest backup in a directory
+npm-api restore /mnt/nas/npm-2026-08-23/full_config_2026_08_23__09_14_55.json
+```
+
+Point it at a backup file, or at a directory — it follows
+`full_config_latest.json`, or falls back to the newest `full_config_*.json` if
+that symlink is stale.
+
+Restore is built for a **freshly set up NPM**. Pointing it at one that already
+holds hosts deletes them first: this replaces configuration, it does not
+reconcile it. The preview says how many objects go, and the command names the
+backup you should take first.
+
+### What comes back, and what does not
+
+| Section | Restored? |
+|---------|-----------|
+| Access lists | Yes — recreated first, because hosts reference them |
+| Proxy hosts | Yes — with certificate and access-list IDs remapped |
+| Settings | Only IDs this NPM already defines |
+| Certificates | **No** — matched only; the target's are left untouched |
+| Users | **No** |
+
+**Users** cannot be restored: NPM's API never exports password material, so the
+only alternative would be recreating them with invented passwords. Make them by
+hand.
+
+**Certificates** are matched, never written. Restoring them would mean reading
+private keys off disk and POSTing them to an endpoint that is plain HTTP by
+default, so the tool does not do it. Each backed-up certificate is instead
+matched against one already installed here — on its **set of domain names**,
+since `nice_name` is free text a user can edit. The name is the fallback
+whenever the domain match finds nothing on either side, which most often means
+an uploaded certificate installed here whose `domain_names` NPM never filled
+in.
+
+IDs are never carried across. NPM assigns them on create, so a backup's
+`certificate_id` means nothing in a different instance; writing one back
+unchecked is exactly how a host ends up pointing at a certificate that is not
+there. Any host whose certificate has no match comes back with
+`certificate_id`, `ssl_forced` and `hsts_enabled` all cleared — HTTP-only and
+honest, rather than redirecting to an HTTPS listener that was never rendered.
+Those hosts are named twice, in the preview and again at the end:
+
+```bash
+# Install the certificates in NPM, then repoint the hosts
+npm-api cert list
+npm-api host bulk-update certificate_id 6 --pattern example.com
+```
+
+**Settings** are written only for IDs the target already defines. In NPM 2.x
+that means `default-site` and nothing else; the guard exists so a backup taken
+from a later release cannot introduce settings this instance has never had.
+Skipped ones are named.
+
+**Access list passwords** may not survive. If the backup holds an entry with no
+password, restore says which user on which list, and you set it again in NPM.
+
+**Safety behaviour:**
+
+- Before the first delete, the target's current hosts, access lists and
+  settings are written to `pre_restore_<timestamp>.json` in the backup
+  directory at mode `0600`. If that file cannot be written, restore refuses to
+  run.
+- Existing hosts are deleted before existing access lists — NPM will not drop
+  an access list a host still references.
+- A single failed create is reported and counted; the rest of the restore
+  continues. The command exits non-zero if anything failed.
 
 ## Gotcha: Deleted Certificates Leave Dangling IDs
 

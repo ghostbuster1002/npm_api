@@ -1888,7 +1888,7 @@ def _npm_http_error(status=400, message="Domain already in use"):
 
 
 class _MergeConfig:
-    """The one Config attribute write_merge_snapshot reads.
+    """The one Config attribute write_state_snapshot reads.
 
     Config.backup_dir is a read-only property derived from data_dir and the
     server address, so pointing a real Config at a temp directory would mean
@@ -2167,21 +2167,22 @@ class TestDescribeHostDifferences(unittest.TestCase):
 
 
 # =============================================================================
-# write_merge_snapshot
+# write_state_snapshot
 # =============================================================================
 
-class TestWriteMergeSnapshot(_WorkdirTestCase):
-    """The floor under a merge.
+class TestWriteStateSnapshot(_WorkdirTestCase):
+    """The floor under merge and restore.
 
-    Merge deletes hosts and NPM has no undo. The in-process rollback can only
-    recreate a source under a new ID, and cannot run at all if the process is
+    Both delete objects NPM has no undo for. Their in-process rollbacks can
+    only recreate under a new ID, and cannot run at all if the process is
     killed partway through, so this file is the only thing guaranteeing the
     original configuration still exists somewhere.
     """
 
     def _write(self, target, sources, directory=None):
         config = _MergeConfig(directory or self.workdir)
-        return npm_api.write_merge_snapshot(config, target, sources)
+        return npm_api.write_state_snapshot(config, "pre_merge_12",
+                                            {"target": target, "sources": sources})
 
     def test_lands_in_the_backup_directory_named_for_the_target(self):
         path = self._write(_merge_host(12, ["app.example.com"]),
@@ -2426,7 +2427,7 @@ class TestHostMergeSafety(_MergeCommandTestCase):
         client = self._client(_merge_host(12, ["app.example.com"]),
                               [_merge_host(13, ["old.example.com"])])
 
-        with mock.patch.object(npm_api, "write_merge_snapshot",
+        with mock.patch.object(npm_api, "write_state_snapshot",
                                side_effect=OSError("Read-only file system")):
             exit_exc = self._merge_expecting_exit(client, host_ids="13")
 
@@ -2754,6 +2755,1302 @@ class TestHostMergeCleanRun(_MergeCommandTestCase):
         self.assertPrinted("Merge Preview")
         self.assertPrinted("Deleting host(s) 13")
         self.assertPrinted("no way to undo")
+
+
+# =============================================================================
+# restore: shared doubles
+# =============================================================================
+
+def _backup_cert(cert_id, domains, nice_name=""):
+    """A certificate as a backup carries it: metadata only, no key material."""
+    return {"id": cert_id, "domain_names": list(domains), "nice_name": nice_name}
+
+
+def _backup_acl(acl_id, name, **overrides):
+    """An access list as full_backup writes it, items and clients expanded.
+
+    Both nested rows carry their own `id` and an `access_list_id` pointing at
+    the instance the backup came from, which is the whole reason
+    restore_acl_payload rebuilds them field by field rather than echoing them.
+    """
+    acl = {
+        "id": acl_id,
+        "name": name,
+        "satisfy_any": False,
+        "pass_auth": False,
+        "items": [{"id": 90, "access_list_id": acl_id,
+                   "username": "ops", "password": "s3cret"}],
+        "clients": [{"id": 91, "access_list_id": acl_id,
+                     "address": "10.0.0.0/8", "directive": "allow"}],
+    }
+    acl.update(overrides)
+    return acl
+
+
+def _backup_setting(setting_id, value="congratulations"):
+    return {"id": setting_id, "name": setting_id, "value": value, "meta": {}}
+
+
+class _RestoreCommandClient(_StubClient):
+    """A whole NPM instance, with every write recorded on one ordered list.
+
+    Restore's correctness is almost entirely an ordering: the pre-restore
+    snapshot before the first delete, hosts before access lists on the way out
+    (NPM will not drop an access list a host still references), access lists
+    before hosts on the way back in (a host carries access_list_id, so the new
+    IDs have to exist first). Separate per-method logs would lose exactly that.
+
+    The operations restore must never perform are recorded too rather than left
+    unstubbed. An unstubbed method would fail loudly, which is the right
+    default, but "no user was created" is a property worth asserting directly
+    instead of inferring from the absence of a crash.
+    """
+
+    def __init__(self, backup_dir, *, hosts=(), acls=(), certs=(), settings=(),
+                 delete_host_error_ids=(), delete_host_refuse_ids=(),
+                 delete_acl_error_ids=(), acl_create_failures=(),
+                 host_create_failures=(), setting_failures=(), error=None):
+        self.config = _MergeConfig(backup_dir)
+        self._hosts = list(hosts)
+        self._acls = list(acls)
+        self._certs = list(certs)
+        self._settings = list(settings)
+        self.calls = []
+        self._delete_host_error_ids = set(delete_host_error_ids)
+        self._delete_host_refuse_ids = set(delete_host_refuse_ids)
+        self._delete_acl_error_ids = set(delete_acl_error_ids)
+        self._acl_create_failures = set(acl_create_failures)
+        self._host_create_failures = set(host_create_failures)
+        self._setting_failures = set(setting_failures)
+        self._error = error or _npm_http_error()
+        self._next_acl_id = 500
+        self._next_host_id = 900
+
+    # --- reads -------------------------------------------------------------
+
+    def list_hosts(self):
+        return self._hosts
+
+    def list_access_lists(self):
+        return self._acls
+
+    def list_certificates(self):
+        return self._certs
+
+    def list_settings(self):
+        return self._settings
+
+    # --- writes ------------------------------------------------------------
+
+    def delete_host(self, host_id):
+        self.calls.append(("delete_host", host_id))
+        if host_id in self._delete_host_error_ids:
+            raise self._error
+        return host_id not in self._delete_host_refuse_ids
+
+    def delete_access_list(self, list_id):
+        self.calls.append(("delete_acl", list_id))
+        if list_id in self._delete_acl_error_ids:
+            raise self._error
+        return True
+
+    def create_access_list(self, name, satisfy_any=False, pass_auth=False,
+                           items=None, clients=None):
+        kwargs = {"name": name, "satisfy_any": satisfy_any, "pass_auth": pass_auth,
+                  "items": items, "clients": clients}
+        self.calls.append(("create_acl", name, kwargs))
+        if name in self._acl_create_failures:
+            raise self._error
+        self._next_acl_id += 1
+        return {"id": self._next_acl_id, "name": name}
+
+    def create_host_from(self, source, overrides):
+        self.calls.append(("create_host", source.get("id"), overrides))
+        if source.get("id") in self._host_create_failures:
+            raise self._error
+        self._next_host_id += 1
+        return dict(source, id=self._next_host_id, **overrides)
+
+    def update_setting(self, setting_id, payload):
+        self.calls.append(("setting", setting_id, payload))
+        if setting_id in self._setting_failures:
+            raise self._error
+        return {"id": setting_id, **payload}
+
+    # --- operations restore must never perform ------------------------------
+
+    def create_user(self, username, email, password):
+        self.calls.append(("create_user", username))
+        return {"id": 1}
+
+    def delete_user(self, user_id):
+        self.calls.append(("delete_user", user_id))
+        return True
+
+    def generate_certificate(self, *args, **kwargs):
+        self.calls.append(("create_cert", args))
+        return {"id": 1}
+
+    def delete_certificate(self, cert_id):
+        self.calls.append(("delete_cert", cert_id))
+        return True
+
+    def download_certificate(self, cert_id, output_dir, cert_name):
+        self.calls.append(("download_cert", cert_id))
+        return []
+
+    # --- views the assertions read ------------------------------------------
+
+    FORBIDDEN = ("create_user", "delete_user", "create_cert", "delete_cert",
+                 "download_cert")
+
+    @property
+    def kinds(self):
+        return [call[0] for call in self.calls]
+
+    @property
+    def forbidden_calls(self):
+        return [call for call in self.calls if call[0] in self.FORBIDDEN]
+
+    @property
+    def deleted_host_ids(self):
+        return [c[1] for c in self.calls if c[0] == "delete_host"]
+
+    @property
+    def deleted_acl_ids(self):
+        return [c[1] for c in self.calls if c[0] == "delete_acl"]
+
+    @property
+    def created_acls(self):
+        return [c[2] for c in self.calls if c[0] == "create_acl"]
+
+    @property
+    def created_hosts(self):
+        return [(c[1], c[2]) for c in self.calls if c[0] == "create_host"]
+
+    @property
+    def written_settings(self):
+        return [(c[1], c[2]) for c in self.calls if c[0] == "setting"]
+
+
+# =============================================================================
+# load_backup
+# =============================================================================
+
+class TestLoadBackup(_WorkdirTestCase):
+    """Turning whatever the user typed into a backup object, or into a sentence.
+
+    Every failure here has to arrive as NPMError: main() prints that on one
+    line and exits, while a JSONDecodeError or a KeyError reaches the terminal
+    as a traceback and reads like a bug in the tool rather than a truncated
+    file or a mistyped path.
+    """
+
+    _BACKUP = {"proxy_hosts": [{"id": 1, "domain_names": ["app.example.com"]}],
+               "access_lists": [], "certificates": [], "settings": [], "users": []}
+
+    def _write(self, name, payload=None, directory=None):
+        directory = directory or self.workdir
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(json.dumps(self._BACKUP if payload is None else payload))
+        return path
+
+    def test_a_file_path_is_read_directly(self):
+        path = self._write("full_config_2026_08_24__11_20_02.json")
+
+        loaded = npm_api.load_backup(str(path))
+
+        self.assertEqual(loaded["path"], path)
+        self.assertEqual(loaded["data"], self._BACKUP)
+
+    def test_a_directory_follows_its_latest_link(self):
+        self._write("full_config_2026_01_01__00_00_00.json", {"proxy_hosts": []})
+        newest = self._write("full_config_2026_08_24__11_20_02.json")
+        (self.workdir / "full_config_latest.json").symlink_to(newest.name)
+
+        loaded = npm_api.load_backup(str(self.workdir))
+
+        self.assertEqual(loaded["data"], self._BACKUP)
+
+    def test_a_dangling_latest_link_falls_back_to_the_newest_real_backup(self):
+        # Regression. The fallback was written and commented, but never fired:
+        # full_config_latest.json matches full_config_*.json, and Path.glob
+        # lists dangling symlinks because it does not stat them. Sorting is
+        # lexicographic and every real backup is full_config_<digit>..., so
+        # 'l' > '2' put the broken link last every time and candidates[-1]
+        # picked it. `restore <dir>` then failed with "No such backup",
+        # naming a link the user can see sitting in a directory full of
+        # perfectly good backups.
+        #
+        # Not hypothetical: full_backup carries its own comment about a link
+        # left pointing at a pruned backup, so the codebase already expects
+        # this state to occur.
+        self._write("full_config_2026_01_01__00_00_00.json", {"proxy_hosts": []})
+        newest = self._write("full_config_2026_08_24__11_20_02.json")
+        (self.workdir / "full_config_latest.json").symlink_to("full_config_gone.json")
+
+        loaded = npm_api.load_backup(str(self.workdir))
+
+        self.assertEqual(loaded["path"], newest)
+        self.assertEqual(loaded["data"], self._BACKUP)
+
+    def test_a_dangling_latest_link_alone_reports_the_directory(self):
+        # Nothing to fall back to. The message has to name the directory that
+        # was searched, not the broken link: "No such backup: .../latest.json"
+        # points at a file the user can see and tells them nothing.
+        (self.workdir / "full_config_latest.json").symlink_to("full_config_gone.json")
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(self.workdir))
+
+        self.assertIn(str(self.workdir), str(caught.exception))
+        self.assertNotIn("full_config_latest.json", str(caught.exception))
+
+    def test_the_latest_link_is_resolved_to_the_file_it_points_at(self):
+        # The path is printed, recorded in the pre-restore snapshot and is what
+        # the user quotes afterwards, so reporting the link would name a file
+        # that means something different a backup later.
+        newest = self._write("full_config_2026_08_24__11_20_02.json")
+        (self.workdir / "full_config_latest.json").symlink_to(newest.name)
+
+        loaded = npm_api.load_backup(str(self.workdir))
+
+        self.assertEqual(loaded["path"], newest)
+        self.assertFalse(loaded["path"].is_symlink())
+
+    def test_a_directory_with_no_latest_link_takes_the_newest_by_name(self):
+        # full_backup stamps files YYYY_MM_DD__HH_MM_SS, which sorts
+        # lexicographically in chronological order, so the name is a usable
+        # stand-in for the mtime and survives a copy that did not preserve it.
+        self._write("full_config_2026_01_01__00_00_00.json", {"proxy_hosts": []})
+        newest = self._write("full_config_2026_08_24__11_20_02.json")
+
+        self.assertEqual(npm_api.load_backup(str(self.workdir))["path"], newest)
+
+    def test_a_directory_holding_no_backup_names_the_directory(self):
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(self.workdir))
+
+        self.assertIn(str(self.workdir), str(caught.exception))
+        self.assertIn("full_config", str(caught.exception))
+
+    def test_a_directory_of_unrelated_files_is_still_no_backup(self):
+        (self.workdir / "notes.txt").write_text("hello")
+        (self.workdir / "hosts_2026_08_24.json").write_text("{}")
+
+        with self.assertRaises(npm_api.NPMError):
+            npm_api.load_backup(str(self.workdir))
+
+    def test_a_nonexistent_path_names_the_path(self):
+        missing = self.workdir / "nowhere" / "full_config_2026.json"
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(missing))
+
+        self.assertIn(str(missing), str(caught.exception))
+
+    def test_invalid_json_names_the_file_rather_than_raising_jsondecodeerror(self):
+        path = self.workdir / "full_config_2026_08_24__11_20_02.json"
+        # A backup truncated by a full disk or an interrupted copy is the
+        # realistic way to get here.
+        path.write_text('{"proxy_hosts": [{"id": 1}')
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(path))
+
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_an_empty_file_is_not_valid_json(self):
+        path = self.workdir / "full_config_2026_08_24__11_20_02.json"
+        path.write_text("")
+
+        with self.assertRaises(npm_api.NPMError):
+            npm_api.load_backup(str(path))
+
+    def test_a_json_list_is_not_a_backup_object(self):
+        # Well-formed JSON of the wrong shape: `data.get(...)` would raise
+        # AttributeError several screens later, inside the restore loop.
+        path = self._write("full_config_2026_08_24__11_20_02.json",
+                           [{"id": 1}, {"id": 2}])
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(path))
+
+        self.assertIn(str(path), str(caught.exception))
+        self.assertIn("backup object", str(caught.exception))
+
+    def test_an_object_holding_none_of_the_backup_sections_is_refused(self):
+        # Pointing restore at some other JSON file is an easy mistake, and the
+        # command would otherwise read it as an empty backup.
+        path = self._write("full_config_2026_08_24__11_20_02.json",
+                           {"nginx": "config", "version": 3})
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.load_backup(str(path))
+
+        self.assertIn(str(path), str(caught.exception))
+        for section in npm_api.BACKUP_SECTIONS:
+            self.assertIn(section, str(caught.exception))
+
+    def test_an_empty_object_is_refused(self):
+        path = self._write("full_config_2026_08_24__11_20_02.json", {})
+
+        with self.assertRaises(npm_api.NPMError):
+            npm_api.load_backup(str(path))
+
+    def test_any_one_known_section_is_enough_to_read_it(self):
+        # A backup whose other sections failed is still worth loading; restore
+        # decides for itself whether what survived is anything it can use.
+        for section in npm_api.BACKUP_SECTIONS:
+            with self.subTest(section=section):
+                path = self._write(f"full_config_{section}.json", {section: []})
+                self.assertEqual(npm_api.load_backup(str(path))["data"], {section: []})
+
+
+# =============================================================================
+# cert_match_key
+# =============================================================================
+
+class TestCertMatchKey(unittest.TestCase):
+    """A certificate's domain list reduced to something comparable.
+
+    None rather than an empty frozenset when nothing usable is there: an empty
+    frozenset equals every other empty frozenset, so two certificates with junk
+    metadata would match each other and, worse, a lookup for one would happily
+    return the other.
+    """
+
+    def test_lowercases_and_strips(self):
+        self.assertEqual(npm_api.cert_match_key({"domain_names": ["  App.Example.COM "]}),
+                         frozenset({"app.example.com"}))
+
+    def test_order_does_not_matter(self):
+        first = npm_api.cert_match_key(
+            {"domain_names": ["a.example.com", "b.example.com"]})
+        second = npm_api.cert_match_key(
+            {"domain_names": ["b.example.com", "a.example.com"]})
+        self.assertEqual(first, second)
+
+    def test_repeats_collapse(self):
+        self.assertEqual(
+            npm_api.cert_match_key({"domain_names": ["a.example.com", "A.EXAMPLE.COM"]}),
+            frozenset({"a.example.com"}))
+
+    def test_an_empty_list_has_no_key(self):
+        self.assertIsNone(npm_api.cert_match_key({"domain_names": []}))
+
+    def test_a_missing_list_has_no_key(self):
+        self.assertIsNone(npm_api.cert_match_key({}))
+
+    def test_an_explicit_null_list_has_no_key(self):
+        # NPM sends domain_names as a literal null on some uploaded
+        # certificates, and dict.get returns that null rather than the default.
+        self.assertIsNone(npm_api.cert_match_key({"domain_names": None}))
+
+    def test_whitespace_only_entries_have_no_key(self):
+        self.assertIsNone(npm_api.cert_match_key({"domain_names": ["", "   ", "\n"]}))
+
+    def test_a_usable_entry_beside_junk_still_yields_a_key(self):
+        self.assertEqual(
+            npm_api.cert_match_key({"domain_names": ["  ", "app.example.com"]}),
+            frozenset({"app.example.com"}))
+
+    def test_no_key_is_none_not_an_empty_frozenset(self):
+        # The distinction callers rely on: `if key is not None` has to be able
+        # to tell "nothing recorded" from "recorded nothing".
+        self.assertIsNot(npm_api.cert_match_key({"domain_names": []}), frozenset())
+
+
+# =============================================================================
+# map_certificates
+# =============================================================================
+
+class TestMapCertificates(unittest.TestCase):
+    """Backup certificate IDs onto the target's, or onto nothing.
+
+    Certificates are never restored — uploading them would mean POSTing private
+    keys to an endpoint that is plain HTTP by default — so every host in the
+    backup has to be re-pointed at a certificate that is already here.
+    """
+
+    def test_a_backup_id_is_never_carried_through(self):
+        # The single most important property in restore. NPM assigns
+        # certificate IDs on create, so a backup's 7 means nothing in another
+        # instance: writing it back unchecked points the host at whatever
+        # happens to be numbered 7 here, or at nothing at all, and NPM renders
+        # a host with a dead certificate ID as having no TLS listener rather
+        # than failing.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["app.example.com"])],
+            [_backup_cert(3, ["app.example.com"])])
+
+        self.assertEqual(mapping, {7: 3})
+        self.assertNotEqual(mapping[7], 7)
+
+    def test_matching_is_order_and_case_insensitive(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["B.example.com", "a.example.com"])],
+            [_backup_cert(3, ["a.EXAMPLE.com", "b.example.com"])])
+
+        self.assertEqual(mapping, {7: 3})
+
+    def test_a_certificate_with_no_counterpart_maps_to_none(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["gone.example.com"])],
+            [_backup_cert(3, ["app.example.com"])])
+
+        self.assertEqual(mapping, {7: None})
+
+    def test_no_certificates_here_maps_everything_to_none(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["app.example.com"]), _backup_cert(8, ["api.example.com"])],
+            [])
+
+        self.assertEqual(mapping, {7: None, 8: None})
+
+    def test_every_backup_certificate_gets_an_entry(self):
+        # restore_host_overrides looks each one up by ID; a missing key would
+        # read as None anyway, but only by accident.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["app.example.com"]), _backup_cert(8, ["api.example.com"])],
+            [_backup_cert(3, ["app.example.com"])])
+
+        self.assertEqual(set(mapping), {7, 8})
+
+    def test_an_empty_backup_maps_nothing(self):
+        self.assertEqual(
+            npm_api.map_certificates([], [_backup_cert(3, ["app.example.com"])]), {})
+
+    def test_a_backup_certificate_with_unusable_metadata_falls_back_to_its_name(self):
+        # Uploaded certificates routinely come back with no domain list at all,
+        # and the name is then the only thing left to match on.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, [], nice_name="Internal Wildcard")],
+            [_backup_cert(3, ["*.internal.lan"], nice_name="Internal Wildcard")])
+
+        self.assertEqual(mapping, {7: 3})
+
+    def test_a_target_certificate_with_unusable_metadata_is_reachable_by_name(self):
+        # The same gap on the other side: the backup knows the domains, the
+        # certificate installed here does not record them.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["*.internal.lan"], nice_name="Internal Wildcard")],
+            [_backup_cert(3, [], nice_name="Internal Wildcard")])
+
+        self.assertEqual(mapping, {7: 3})
+
+    def test_the_name_match_is_case_and_whitespace_insensitive(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, [], nice_name="  Internal Wildcard  ")],
+            [_backup_cert(3, [], nice_name="internal wildcard")])
+
+        self.assertEqual(mapping, {7: 3})
+
+    def test_the_domain_set_wins_over_the_name(self):
+        # nice_name is free text a user can edit at any time; the domain set is
+        # what actually decides whether a certificate can serve a host, so a
+        # name collision must not override a real domain match.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["app.example.com"], nice_name="shared")],
+            [_backup_cert(3, ["other.example.com"], nice_name="shared"),
+             _backup_cert(4, ["app.example.com"], nice_name="something else")])
+
+        self.assertEqual(mapping, {7: 4})
+
+    def test_a_nameless_certificate_with_no_domains_matches_nothing(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, [], nice_name="")],
+            [_backup_cert(3, [], nice_name="")])
+
+        self.assertEqual(mapping, {7: None})
+
+    def test_two_here_with_the_same_domains_resolve_to_the_first(self):
+        # A renewed certificate uploaded beside the one it replaces is the
+        # ordinary way to end up with two. Either would serve, so the choice
+        # only has to be deterministic — an arbitrary one would make a restore
+        # unreproducible.
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, ["app.example.com"])],
+            [_backup_cert(3, ["app.example.com"]),
+             _backup_cert(4, ["app.example.com"])])
+
+        self.assertEqual(mapping, {7: 3})
+
+    def test_two_here_with_the_same_name_resolve_to_the_first(self):
+        mapping = npm_api.map_certificates(
+            [_backup_cert(7, [], nice_name="wildcard")],
+            [_backup_cert(3, [], nice_name="wildcard"),
+             _backup_cert(4, [], nice_name="wildcard")])
+
+        self.assertEqual(mapping, {7: 3})
+
+
+# =============================================================================
+# restore_host_overrides
+# =============================================================================
+
+class TestRestoreHostOverrides(unittest.TestCase):
+    """Rewriting a backed-up host's ID references for this instance.
+
+    Anything that cannot be resolved is cleared rather than carried over, and
+    says so: a host pointing at an ID this NPM does not have is the exact
+    failure the whole command exists to avoid.
+    """
+
+    def _overrides(self, host, cert_map=None, acl_map=None):
+        return npm_api.restore_host_overrides(host, cert_map or {}, acl_map or {})
+
+    def test_a_resolvable_certificate_is_remapped(self):
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7), cert_map={7: 3})
+
+        self.assertEqual(overrides["certificate_id"], 3)
+        self.assertEqual(notes, [])
+
+    def test_a_resolvable_certificate_leaves_the_ssl_flags_alone(self):
+        # The host keeps serving HTTPS, so ssl_forced and hsts_enabled stay out
+        # of the overrides entirely and create_host_from carries the backup's
+        # own values through.
+        overrides, _ = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7, ssl_forced=True,
+                        hsts_enabled=True), cert_map={7: 3})
+
+        self.assertNotIn("ssl_forced", overrides)
+        self.assertNotIn("hsts_enabled", overrides)
+
+    def test_an_unresolvable_certificate_clears_all_three_and_says_so(self):
+        # Forcing SSL with no certificate is strictly worse than plain HTTP:
+        # NPM renders the redirect to https:// but omits the whole
+        # `listen 443 ssl` block, so every request bounces to a closed port.
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7, ssl_forced=True,
+                        hsts_enabled=True), cert_map={7: None})
+
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertIs(overrides["ssl_forced"], False)
+        self.assertIs(overrides["hsts_enabled"], False)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("certificate 7", notes[0])
+        self.assertIn("HTTP-only", notes[0])
+
+    def test_a_certificate_absent_from_the_map_is_also_unresolvable(self):
+        # A host referencing a certificate the backup itself never recorded.
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7), cert_map={})
+
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertEqual(len(notes), 1)
+
+    def test_a_host_with_no_certificate_says_nothing(self):
+        # Plain HTTP in the backup, plain HTTP here. Noting it would bury the
+        # hosts that really did lose something.
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=None))
+
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertEqual(notes, [])
+
+    def test_certificate_id_zero_is_no_certificate_not_certificate_zero(self):
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=0), cert_map={0: 3})
+
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertEqual(notes, [])
+
+    def test_a_resolvable_access_list_is_remapped(self):
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], access_list_id=4), acl_map={4: 501})
+
+        self.assertEqual(overrides["access_list_id"], 501)
+        self.assertEqual(notes, [])
+
+    def test_an_unresolvable_access_list_becomes_zero_and_says_so(self):
+        # 0 rather than None: that is NPM's own spelling of "nothing linked",
+        # and it is a real loss of access control, so it is named.
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], access_list_id=4), acl_map={4: None})
+
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("access list 4", notes[0])
+        self.assertIn("access control dropped", notes[0])
+
+    def test_access_list_zero_stays_zero_without_a_note(self):
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], access_list_id=0))
+
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertEqual(notes, [])
+
+    def test_a_null_access_list_stays_zero_without_a_note(self):
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], access_list_id=None))
+
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertEqual(notes, [])
+
+    def test_both_losses_are_reported_together(self):
+        # One host can lose both, and the preview prints the notes joined, so
+        # neither may swallow the other.
+        overrides, notes = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7, access_list_id=4),
+            cert_map={7: None}, acl_map={4: None})
+
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertEqual(len(notes), 2)
+
+    def test_the_backed_up_host_is_not_modified(self):
+        # It is read again for the preview and once more when the host is
+        # created, so the overrides have to stay a separate dict.
+        host = _merge_host(1, ["app.example.com"], certificate_id=7, access_list_id=4)
+
+        self._overrides(host, cert_map={7: None}, acl_map={4: None})
+
+        self.assertEqual(host["certificate_id"], 7)
+        self.assertEqual(host["access_list_id"], 4)
+
+    def test_only_the_reference_fields_are_overridden(self):
+        # Everything else about the host comes back exactly as backed up, so
+        # the overrides must not quietly grow a third key.
+        overrides, _ = self._overrides(
+            _merge_host(1, ["app.example.com"], certificate_id=7), cert_map={7: 3})
+
+        self.assertEqual(set(overrides), {"certificate_id", "access_list_id"})
+
+
+# =============================================================================
+# restore_acl_payload
+# =============================================================================
+
+class TestRestoreAclPayload(unittest.TestCase):
+    """A backed-up access list reduced to create_access_list's arguments."""
+
+    def test_the_name_is_carried_through(self):
+        payload, _ = npm_api.restore_acl_payload(_backup_acl(4, "internal"))
+        self.assertEqual(payload["name"], "internal")
+
+    def test_item_rows_are_rebuilt_without_the_backups_ids(self):
+        # `id` and `access_list_id` belong to the instance the backup came from.
+        # Echoing them back sends NPM a row claiming to already exist somewhere.
+        payload, _ = npm_api.restore_acl_payload(_backup_acl(4, "internal"))
+
+        self.assertEqual(payload["items"],
+                         [{"username": "ops", "password": "s3cret"}])
+
+    def test_client_rows_are_rebuilt_without_the_backups_ids(self):
+        payload, _ = npm_api.restore_acl_payload(_backup_acl(4, "internal"))
+
+        self.assertEqual(payload["clients"],
+                         [{"address": "10.0.0.0/8", "directive": "allow"}])
+
+    def test_a_password_that_is_not_in_the_backup_is_noted(self):
+        # NPM's API returns access list items without their password, so this is
+        # the ordinary case rather than a corrupt backup: the list comes back
+        # with its structure intact and its credentials empty, and saying so is
+        # the only way the operator learns to set them again.
+        for password in ("", None):
+            with self.subTest(password=password):
+                acl = _backup_acl(4, "internal",
+                                  items=[{"username": "ops", "password": password}])
+
+                payload, notes = npm_api.restore_acl_payload(acl)
+
+                self.assertEqual(payload["items"], [{"username": "ops", "password": ""}])
+                self.assertEqual(len(notes), 1)
+                self.assertIn("ops", notes[0])
+
+    def test_a_missing_password_key_is_noted_too(self):
+        acl = _backup_acl(4, "internal", items=[{"username": "ops"}])
+
+        payload, notes = npm_api.restore_acl_payload(acl)
+
+        self.assertEqual(payload["items"], [{"username": "ops", "password": ""}])
+        self.assertEqual(len(notes), 1)
+
+    def test_a_password_that_is_there_is_carried_and_not_noted(self):
+        payload, notes = npm_api.restore_acl_payload(_backup_acl(4, "internal"))
+
+        self.assertEqual(payload["items"][0]["password"], "s3cret")
+        self.assertEqual(notes, [])
+
+    def test_one_note_per_credentialless_user(self):
+        acl = _backup_acl(4, "internal", items=[{"username": "ops"},
+                                                {"username": "ci", "password": "x"},
+                                                {"username": "audit", "password": ""}])
+
+        _, notes = npm_api.restore_acl_payload(acl)
+
+        self.assertEqual(len(notes), 2)
+        self.assertIn("ops", notes[0])
+        self.assertIn("audit", notes[1])
+
+    def test_directive_defaults_to_allow(self):
+        # An empty directive would render as a bare address in the nginx
+        # snippet, which is a config error rather than a permissive default.
+        for given in (None, "", "missing"):
+            with self.subTest(directive=given):
+                client = {"address": "10.0.0.0/8"}
+                if given != "missing":
+                    client["directive"] = given
+                acl = _backup_acl(4, "internal", clients=[client])
+
+                payload, _ = npm_api.restore_acl_payload(acl)
+
+                self.assertEqual(payload["clients"][0]["directive"], "allow")
+
+    def test_an_explicit_deny_is_kept(self):
+        acl = _backup_acl(4, "internal",
+                          clients=[{"address": "10.0.0.0/8", "directive": "deny"}])
+
+        payload, _ = npm_api.restore_acl_payload(acl)
+
+        self.assertEqual(payload["clients"][0]["directive"], "deny")
+
+    def test_satisfy_any_and_pass_auth_become_real_booleans(self):
+        # NPM stores them as 0/1 in some releases and true/false in others, and
+        # the create endpoint rejects the integers.
+        for given, expected in ((1, True), (0, False), (True, True), (False, False),
+                                (None, False)):
+            with self.subTest(given=given):
+                acl = _backup_acl(4, "internal", satisfy_any=given, pass_auth=given)
+
+                payload, _ = npm_api.restore_acl_payload(acl)
+
+                self.assertIs(payload["satisfy_any"], expected)
+                self.assertIs(payload["pass_auth"], expected)
+
+    def test_missing_flags_are_false(self):
+        acl = _backup_acl(4, "internal")
+        del acl["satisfy_any"]
+        del acl["pass_auth"]
+
+        payload, _ = npm_api.restore_acl_payload(acl)
+
+        self.assertIs(payload["satisfy_any"], False)
+        self.assertIs(payload["pass_auth"], False)
+
+    def test_no_items_or_clients_yields_empty_lists(self):
+        for value in ([], None, "missing"):
+            with self.subTest(value=value):
+                acl = _backup_acl(4, "internal")
+                if value == "missing":
+                    del acl["items"]
+                    del acl["clients"]
+                else:
+                    acl["items"] = acl["clients"] = value
+
+                payload, notes = npm_api.restore_acl_payload(acl)
+
+                self.assertEqual(payload["items"], [])
+                self.assertEqual(payload["clients"], [])
+                self.assertEqual(notes, [])
+
+    def test_the_payload_holds_exactly_what_create_access_list_takes(self):
+        # It is splatted straight in as **kwargs, so an extra key is a
+        # TypeError at apply time, after the target has already been emptied.
+        payload, _ = npm_api.restore_acl_payload(_backup_acl(4, "internal"))
+
+        self.assertEqual(set(payload),
+                         {"name", "satisfy_any", "pass_auth", "items", "clients"})
+
+
+# =============================================================================
+# restore
+# =============================================================================
+
+class _RestoreCommandTestCase(_WorkdirTestCase, _ConsoleTestCase):
+    """Runs the restore command against a stub, off a real backup file on disk.
+
+    The backup is written for real rather than load_backup being patched out:
+    the file is the command's whole input, and reading it is the one step no
+    stub should stand in for.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.backup_dir = self.workdir / "backup"
+        self.state_dir = self.workdir / "state"
+        self.backup_dir.mkdir()
+
+    def _backup_file(self, **sections):
+        path = self.backup_dir / "full_config_2026_08_24__11_20_02.json"
+        path.write_text(json.dumps(sections, indent=2))
+        return path
+
+    def _client(self, **kwargs):
+        return _RestoreCommandClient(self.state_dir, **kwargs)
+
+    def _restore(self, client, source, **overrides):
+        options = dict(source=str(source), preview=False, yes=True)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.restore(**options)
+
+    def _restore_expecting_exit(self, client, source, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._restore(client, source, **overrides)
+        return caught.exception
+
+
+class TestRestoreOrdering(_RestoreCommandTestCase):
+    """What has to happen before what.
+
+    NPM will not drop an access list a host still references, and a host cannot
+    be created pointing at an access list that does not exist yet, so the four
+    phases only work in one order.
+    """
+
+    def test_a_fresh_target_deletes_nothing(self):
+        # Restoring into a new NPM is the intended use, and it must not look
+        # like a destructive operation when there is nothing there to destroy.
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")],
+                                   proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client()
+
+        self._restore(client, source)
+
+        self.assertEqual(client.deleted_host_ids, [])
+        self.assertEqual(client.deleted_acl_ids, [])
+        self.assertEqual(client.kinds, ["create_acl", "create_host"])
+
+    def test_access_lists_are_created_before_any_host(self):
+        source = self._backup_file(
+            access_lists=[_backup_acl(4, "internal"), _backup_acl(5, "ops")],
+            proxy_hosts=[_merge_host(1, ["app.example.com"]),
+                         _merge_host(2, ["api.example.com"])])
+        client = self._client()
+
+        self._restore(client, source)
+
+        self.assertEqual(client.kinds,
+                         ["create_acl", "create_acl", "create_host", "create_host"])
+
+    def test_existing_hosts_are_removed_before_existing_access_lists(self):
+        # The other way round, NPM refuses the access list delete while a host
+        # still references it, and the restore stalls with the target
+        # half-emptied.
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")],
+                                   proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}, {"id": 62}], acls=[{"id": 71}])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.kinds, ["delete_host", "delete_host", "delete_acl",
+                                        "create_acl", "create_host"])
+        self.assertEqual(client.deleted_host_ids, [61, 62])
+        self.assertEqual(client.deleted_acl_ids, [71])
+
+    def test_nothing_is_created_until_the_target_is_emptied(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        self._restore(client, source)
+
+        creates = [i for i, kind in enumerate(client.kinds) if kind.startswith("create")]
+        deletes = [i for i, kind in enumerate(client.kinds) if kind.startswith("delete")]
+        self.assertLess(max(deletes), min(creates))
+
+    def test_settings_are_written_last(self):
+        # After the hosts, because default-site decides what nginx answers for
+        # an unrecognised Host header and the answer is more useful once the
+        # recognised ones are back.
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])],
+                                   settings=[_backup_setting("default-site")])
+        client = self._client(settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.kinds, ["create_host", "setting"])
+
+    def test_the_snapshot_is_written_before_the_first_delete(self):
+        # The snapshot is the only record of the configuration about to be
+        # replaced, and the deletes are irreversible, so the ordering is the
+        # guarantee.
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        with mock.patch.object(npm_api, "write_state_snapshot",
+                               side_effect=OSError("Read-only file system")):
+            exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Read-only file system")
+        self.assertPrinted("Refusing to delete configuration")
+
+    def test_the_snapshot_records_the_configuration_being_replaced(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}],
+                              settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source)
+
+        written = list(self.state_dir.glob("pre_restore_*.json"))
+        self.assertEqual(len(written), 1, written)
+        self.assertEqual(_mode(written[0]), 0o600)
+        recorded = json.loads(written[0].read_text())
+        self.assertEqual(recorded["proxy_hosts"], [{"id": 61}])
+        self.assertEqual(recorded["access_lists"], [{"id": 71}])
+        self.assertEqual(recorded["restored_from"], str(source))
+
+
+class TestRestoreRemapping(_RestoreCommandTestCase):
+    """Every ID in a backup is meaningless here, and has to be looked up again."""
+
+    def test_a_hosts_access_list_id_comes_from_the_create_response(self):
+        # NPM assigns the ID on create and offers no way to ask for a
+        # particular one, so the backup's 4 cannot be reused even when nothing
+        # else in the target is using it.
+        source = self._backup_file(
+            access_lists=[_backup_acl(4, "internal")],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], access_list_id=4)])
+        client = self._client()
+
+        self._restore(client, source)
+
+        created_acl_id = client._next_acl_id
+        _, overrides = client.created_hosts[0]
+        self.assertEqual(overrides["access_list_id"], created_acl_id)
+        self.assertNotEqual(overrides["access_list_id"], 4)
+
+    def test_a_backup_certificate_id_is_never_written_to_a_host(self):
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["app.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7)])
+        client = self._client(certs=[_backup_cert(3, ["app.example.com"])])
+
+        self._restore(client, source)
+
+        _, overrides = client.created_hosts[0]
+        self.assertEqual(overrides["certificate_id"], 3)
+
+    def test_a_host_whose_certificate_has_no_match_comes_back_http_only(self):
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["gone.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7,
+                                     ssl_forced=True, hsts_enabled=True)])
+        client = self._client(certs=[_backup_cert(3, ["other.example.com"])])
+
+        self._restore(client, source)
+
+        _, overrides = client.created_hosts[0]
+        self.assertIsNone(overrides["certificate_id"])
+        self.assertIs(overrides["ssl_forced"], False)
+        self.assertIs(overrides["hsts_enabled"], False)
+        self.assertPrinted("HTTP-only")
+
+    def test_the_hosts_that_lost_something_are_named_at_the_end(self):
+        # The run finishes successfully, so without a closing summary the
+        # per-host warnings scroll away and the operator never repoints them.
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["gone.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7)])
+        client = self._client()
+
+        self._restore(client, source)
+
+        self.assertPrinted("host bulk-update certificate_id")
+
+    def test_a_host_referencing_an_access_list_the_backup_lacks_loses_it(self):
+        source = self._backup_file(
+            access_lists=[],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], access_list_id=4)])
+        client = self._client()
+
+        self._restore(client, source)
+
+        _, overrides = client.created_hosts[0]
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertPrinted("access control dropped")
+
+    def test_the_access_list_payload_reaches_create_access_list_rebuilt(self):
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")])
+        client = self._client()
+
+        self._restore(client, source)
+
+        self.assertEqual(client.created_acls[0]["name"], "internal")
+        self.assertEqual(client.created_acls[0]["items"],
+                         [{"username": "ops", "password": "s3cret"}])
+
+
+class TestRestoreScope(_RestoreCommandTestCase):
+    """What restore refuses to touch, whatever the backup holds."""
+
+    def test_users_are_never_created(self):
+        # NPM's API never exports password material, so a restored user could
+        # only be created with an invented password — an account nobody can log
+        # into and nobody knows is there.
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"])],
+            users=[{"id": 1, "name": "Admin", "email": "admin@example.com"},
+                   {"id": 2, "name": "Ops", "email": "ops@example.com"}])
+        client = self._client()
+
+        self._restore(client, source)
+
+        self.assertEqual(client.forbidden_calls, [])
+
+    def test_certificates_are_never_created_deleted_or_uploaded(self):
+        # Uploading one would mean POSTing a private key to an endpoint that is
+        # plain HTTP by default. They are read for matching and nothing else.
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["app.example.com"]),
+                          _backup_cert(8, ["gone.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7)])
+        client = self._client(certs=[_backup_cert(3, ["app.example.com"])])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.forbidden_calls, [])
+
+    def test_certificates_already_here_are_left_alone_even_with_no_match(self):
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["gone.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7)])
+        client = self._client(certs=[_backup_cert(3, ["unrelated.example.com"])])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.forbidden_calls, [])
+
+    def test_only_settings_this_npm_already_defines_are_written(self):
+        # A backup from a later NPM must not introduce a setting this instance
+        # has never had; NPM's PUT would create it and nothing here understands
+        # what it does.
+        source = self._backup_file(
+            settings=[_backup_setting("default-site", "congratulations"),
+                      _backup_setting("some-future-setting", "on")])
+        client = self._client(settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source)
+
+        self.assertEqual([setting_id for setting_id, _ in client.written_settings],
+                         ["default-site"])
+
+    def test_a_skipped_setting_is_reported_in_the_preview(self):
+        source = self._backup_file(
+            settings=[_backup_setting("default-site"),
+                      _backup_setting("some-future-setting", "on")])
+        client = self._client(settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source, preview=True)
+
+        self.assertPrinted("some-future-setting")
+        self.assertPrinted("not defined on this NPM")
+
+    def test_a_setting_is_written_as_value_and_meta(self):
+        source = self._backup_file(
+            settings=[{"id": "default-site", "value": "html", "meta": {"html": "<p>hi"}}])
+        client = self._client(settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.written_settings,
+                         [("default-site", {"value": "html", "meta": {"html": "<p>hi"}})])
+
+    def test_a_setting_with_no_meta_is_written_with_an_empty_one(self):
+        source = self._backup_file(settings=[{"id": "default-site", "value": "404"}])
+        client = self._client(settings=[_backup_setting("default-site")])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.written_settings[0][1]["meta"], {})
+
+
+class TestRestoreRefusals(_RestoreCommandTestCase):
+    """When restore stops before writing anything."""
+
+    def test_a_backup_holding_none_of_the_restored_sections_exits_1(self):
+        # Certificates and users are the two sections restore reads but never
+        # writes, so a backup of only those is a valid backup and still nothing
+        # this command can do.
+        source = self._backup_file(certificates=[_backup_cert(7, ["app.example.com"])],
+                                   users=[{"id": 1, "email": "admin@example.com"}])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("holds nothing this command restores")
+
+    def test_that_refusal_happens_before_the_target_is_even_read(self):
+        # It has to come first: reading the target is harmless, but the message
+        # would then arrive after a screen of preview about a restore that is
+        # not going to happen.
+        source = self._backup_file(users=[{"id": 1}])
+
+        self._restore_expecting_exit(self._client(hosts=[{"id": 61}]), source)
+
+        self.assertNotPrinted("Restore Preview")
+
+    def test_an_unreadable_backup_raises_npmerror_before_anything_is_read(self):
+        # NPMError rather than typer.Exit: main() renders it as one line, and
+        # the command has done nothing that needs unwinding.
+        missing = self.backup_dir / "full_config_nope.json"
+        client = self._client(hosts=[{"id": 61}])
+
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            with self.assertRaises(npm_api.NPMError):
+                npm_api.restore(source=str(missing), preview=False, yes=True)
+
+        self.assertEqual(client.calls, [])
+
+    def test_declining_the_confirmation_writes_nothing(self):
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")],
+                                   proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        with mock.patch.object(npm_api.typer, "confirm", return_value=False):
+            exit_exc = self._restore_expecting_exit(client, source, yes=False)
+
+        # 0, not 1: the user got what they asked for.
+        self.assertEqual(exit_exc.exit_code, 0)
+        self.assertEqual(client.calls, [])
+        self.assertFalse(list(self.state_dir.glob("*"))
+                         if self.state_dir.exists() else [])
+
+    def test_a_non_empty_target_is_warned_about_before_the_confirmation(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}, {"id": 62}], acls=[{"id": 71}])
+
+        with mock.patch.object(npm_api.typer, "confirm", return_value=False) as confirm:
+            self._restore_expecting_exit(client, source, yes=False)
+
+        self.assertPrinted("This NPM is not empty")
+        self.assertPrinted("2 proxy host(s) and 1 access list(s) will be DELETED")
+        self.assertPrinted("cancel and run `npm-api backup` first")
+        confirm.assert_called_once()
+
+
+class TestRestoreFailures(_RestoreCommandTestCase):
+    """One object failing must not abandon the rest, and must not exit 0."""
+
+    def test_a_failed_host_create_does_not_stop_the_others(self):
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["a.example.com"]),
+                         _merge_host(2, ["b.example.com"]),
+                         _merge_host(3, ["c.example.com"])])
+        client = self._client(host_create_failures={2})
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual([host_id for host_id, _ in client.created_hosts], [1, 2, 3])
+        self.assertPrinted("Successful: 2")
+        self.assertPrinted("Failed: 1")
+
+    def test_a_failed_access_list_create_still_lets_the_hosts_through(self):
+        # The hosts that referenced it lose their access control and are told
+        # so, but a host that never used it has no reason to be held back.
+        source = self._backup_file(
+            access_lists=[_backup_acl(4, "internal")],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], access_list_id=4)])
+        client = self._client(acl_create_failures={"internal"})
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        _, overrides = client.created_hosts[0]
+        self.assertEqual(overrides["access_list_id"], 0)
+        self.assertPrinted("access control dropped")
+
+    def test_a_failed_delete_is_counted_and_the_restore_continues(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}, {"id": 62}],
+                              delete_host_error_ids={61})
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.deleted_host_ids, [61, 62])
+        self.assertEqual([host_id for host_id, _ in client.created_hosts], [1])
+
+    def test_a_refused_delete_counts_as_a_failure(self):
+        # delete_host reports a refusal by returning False rather than raising,
+        # so a caller testing only for exceptions would report a clean run over
+        # a host that is still there and still holding its domains.
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], delete_host_refuse_ids={61})
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertPrinted("Could not remove host 61")
+
+    def test_a_failed_setting_is_counted_without_stopping_the_rest(self):
+        source = self._backup_file(settings=[_backup_setting("default-site"),
+                                             _backup_setting("other")])
+        client = self._client(settings=[_backup_setting("default-site"),
+                                        _backup_setting("other")],
+                              setting_failures={"default-site"})
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual([setting_id for setting_id, _ in client.written_settings],
+                         ["default-site", "other"])
+
+    def test_an_npm_error_is_caught_like_an_http_error(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"]),
+                                                _merge_host(2, ["b.example.com"])])
+        client = self._client(host_create_failures={1},
+                              error=npm_api.NPMError("NPM is unreachable"))
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertPrinted("NPM is unreachable")
+        self.assertEqual([host_id for host_id, _ in client.created_hosts], [1, 2])
+
+
+class TestRestoreCleanRun(_RestoreCommandTestCase):
+    """The ordinary path: a backup, a fresh NPM, exit 0."""
+
+    def test_a_clean_run_returns_normally(self):
+        source = self._backup_file(
+            access_lists=[_backup_acl(4, "internal")],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], access_list_id=4)],
+            settings=[_backup_setting("default-site")])
+        client = self._client(settings=[_backup_setting("default-site", "404")])
+
+        self._restore(client, source)
+
+        self.assertPrinted("Successful: 3")
+        self.assertNotPrinted("Failed:")
+
+    def test_a_quiet_restore_says_nothing_about_dropped_references(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+
+        self._restore(self._client(), source)
+
+        self.assertNotPrinted("HTTP-only")
+        self.assertNotPrinted("access control dropped")
+
+    def test_the_preview_names_the_backup_it_read(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+
+        self._restore(self._client(), source, preview=True)
+
+        self.assertPrinted("Restore Preview")
+        self.assertPrinted(str(source))
+
+    def test_the_preview_reports_certificate_matching_before_anything_is_written(self):
+        # The one part of a restore the operator cannot fix afterwards without
+        # knowing which hosts are affected, so it has to be visible up front.
+        source = self._backup_file(
+            certificates=[_backup_cert(7, ["gone.example.com"])],
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=7)])
+        client = self._client()
+
+        self._restore(client, source, preview=True)
+
+        self.assertPrinted("come back with something dropped")
+        self.assertPrinted("app.example.com")
 
 
 if __name__ == "__main__":

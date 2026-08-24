@@ -41,6 +41,19 @@ When you do pass `--include-keys`:
 
 `npm-api cert download` always writes key material — that is its purpose — and prints the same warning.
 
+`npm-api restore` never writes key material and never sends it anywhere. Restoring certificates would mean reading private keys off disk and POSTing them to an endpoint that is plain HTTP by default, so the tool does not do it: backed-up certificates are only *matched* against ones already installed in the target, and a host whose certificate has no match comes back HTTP-only rather than pointing at something that is not there. Install certificates in NPM yourself, then repoint the hosts with `host bulk-update certificate_id`.
+
+## State Snapshots
+
+`host merge` and `restore` are the two commands that delete objects NPM cannot bring back. Before either deletes anything it writes the current configuration of everything it will touch to the backup directory at mode 600 — `pre_merge_<id>_<timestamp>.json` and `pre_restore_<timestamp>.json`. A command that cannot write its snapshot refuses to run.
+
+These files hold whatever the affected objects hold, which can include:
+
+- `advanced_config` blocks, which routinely carry internal hostnames and auth headers
+- access list entries, including any basic-auth passwords NPM returns
+
+They are **not encrypted**, on the same reasoning as backups. Treat them like backups: keep them off shared storage, and delete them once the change has been verified. `.gitignore` excludes `backups/`, but that only protects a clone of this repo.
+
 ## Network Security
 
 ⚠️ **Important**: This tool uses HTTP by default to communicate with Nginx Proxy Manager's API (typically on port 81). This is consistent with NPM's default configuration.
@@ -62,12 +75,14 @@ If you discover a security vulnerability, please:
 - ✅ No hardcoded credentials (defaults are rejected)
 - ✅ Token and private key files created at mode 600, with the mode applied at creation rather than afterwards
 - ✅ Private keys are opt-in for backups, never written by default
+- ✅ `restore` never reads or transmits private key material
+- ✅ Destructive commands snapshot what they are about to delete, at mode 600, and refuse to run if they cannot
 - ✅ Path traversal protection on file operations
 - ✅ Zip slip attack prevention
 
 Not claimed:
 
-- ❌ Backups and downloaded keys are **not** encrypted at rest
+- ❌ Backups, snapshots and downloaded keys are **not** encrypted at rest
 - ❌ HTTP, not HTTPS, to the NPM API by default (see Network Security above)
 - ✅ No command injection vectors (no shell execution)
 - ✅ No eval() or exec() usage

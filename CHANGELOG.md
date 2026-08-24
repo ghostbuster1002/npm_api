@@ -46,6 +46,38 @@ relevant section below.
     the two never hold the same domain simultaneously (NPM rejects duplicates).
     A failed create rolls the source back; a failed rollback prints the
     original domain list so it can be restored by hand.
+- `restore <backup>` — rebuild proxy hosts, access lists and settings from a
+  backup. Takes either the `full_config_*.json` file or a directory holding
+  one, following `full_config_latest.json` and falling back to the newest file
+  if that symlink is stale. Built for a freshly set up NPM; pointed at a
+  populated one it deletes the existing hosts and access lists first, says how
+  many, and names the backup to take before doing so.
+  - **Certificates are matched, never written.** Restoring them would mean
+    reading private keys off disk and POSTing them to an endpoint that is plain
+    HTTP by default. Each backed-up certificate is matched against one already
+    installed in the target, on its *set of domain names* rather than on
+    `nice_name`, which is free text. The name is the fallback whenever the
+    domain match finds nothing on either side — most often an uploaded
+    certificate in the target whose `domain_names` NPM never recorded.
+  - IDs are never carried across — NPM assigns them on create, so a backup's
+    `certificate_id` means nothing elsewhere. A host whose certificate has no
+    match comes back with `certificate_id`, `ssl_forced` and `hsts_enabled` all
+    cleared, and is named in both the preview and the closing summary.
+  - Access lists are recreated before hosts, since hosts carry
+    `access_list_id`; an access list that fails to create leaves the hosts
+    referencing it with access control dropped rather than pointing at nothing.
+    An entry whose password is absent from the backup is named so it can be set
+    again by hand.
+  - **Users are not restored.** NPM's API never exports password material, so
+    they could only be recreated with invented passwords.
+  - Settings are written only for IDs the target already defines, so a backup
+    from a later NPM release cannot introduce settings the instance has never
+    had. Skipped ones are named. In NPM 2.x this is `default-site` alone.
+  - Existing hosts are deleted before existing access lists — NPM will not drop
+    an access list a host still references.
+  - Before the first delete, the target's current hosts, access lists and
+    settings are written to `pre_restore_<timestamp>.json` in the backup
+    directory at mode `0600`. A restore that cannot write it refuses to run.
 - `host merge --into <id>` — the inverse of `host split`. Folds several hosts
   into one and deletes the sources. The `--into` host is kept whole and
   supplies every setting; the others contribute only their domain names. Takes

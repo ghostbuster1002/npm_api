@@ -455,6 +455,23 @@ def write_secret(path: Path, content: str) -> Path:
     return path
 
 
+def write_state_snapshot(config: Config, label: str, payload: Dict) -> Path:
+    """Record live configuration to disk before a command destroys it.
+
+    Used by merge and restore, the two commands that delete objects NPM cannot
+    bring back. Both roll back in the ordinary case, but neither can if the
+    process is killed partway through, and anything recreated comes back under
+    a new ID. This file is the floor under both.
+    """
+    directory = Path(config.backup_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
+    path = directory / f"{label}_{stamp}.json"
+    # 0600 like everything else this tool writes: advanced_config can carry auth
+    # headers and internal hostnames, and access lists carry credentials.
+    return write_secret(path, json.dumps(dict(payload, created=stamp), indent=2))
+
+
 # =============================================================================
 # Host & certificate helpers
 # =============================================================================
@@ -470,6 +487,13 @@ HOST_READONLY_FIELDS = {
 
 # Runtime status NPM writes into meta, not part of a host's configuration
 HOST_META_RUNTIME_KEYS = {"nginx_online", "nginx_err"}
+
+# What full_backup writes and load_backup looks for. Shared so the two cannot
+# drift, and because the link matches the glob and has to be excluded from it —
+# Path.glob lists dangling symlinks, so a stale link would otherwise sort last
+# and be picked as the newest backup.
+BACKUP_GLOB = "full_config_*.json"
+LATEST_BACKUP_LINK = "full_config_latest.json"
 
 # Host fields whose values are lists rather than scalars
 HOST_LIST_FIELDS = {"domain_names", "locations"}
@@ -1093,7 +1117,29 @@ class NPMClient:
         """Delete an access list"""
         response = self.delete(f"/nginx/access-lists/{list_id}")
         return response.status_code == 200
-    
+
+    # =========================================================================
+    # Settings Methods
+    # =========================================================================
+
+    def list_settings(self) -> List[Dict]:
+        """List NPM's settings.
+
+        In NPM 2.x this is effectively a single entry, `default-site`, which
+        decides what nginx serves for an unrecognised Host header. Returned as
+        a list all the same, because that is the shape the API uses and a later
+        release may add to it.
+        """
+        response = self.get("/settings")
+        response.raise_for_status()
+        return response.json()
+
+    def update_setting(self, setting_id: str, payload: Dict) -> Dict:
+        """Write one setting by ID"""
+        response = self.put(f"/settings/{setting_id}", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     # =========================================================================
     # Dashboard / Stats Methods
     # =========================================================================
@@ -1240,8 +1286,7 @@ class NPMClient:
         
         # Backup settings
         try:
-            response = self.get("/settings")
-            settings = response.json()
+            settings = self.list_settings()
             full_config["settings"] = settings
             (backup_path / ".settings" / f"settings_{timestamp}.json").write_text(
                 json.dumps(settings, indent=2)
@@ -1361,7 +1406,7 @@ class NPMClient:
         # Create latest symlink. exists() follows the link, so a symlink left
         # pointing at a pruned backup reads as absent and symlink_to() then
         # fails with FileExistsError; is_symlink() catches that case.
-        latest_path = backup_path / "full_config_latest.json"
+        latest_path = backup_path / LATEST_BACKUP_LINK
         if latest_path.is_symlink() or latest_path.exists():
             latest_path.unlink()
         latest_path.symlink_to(full_config_path.name)
@@ -1627,6 +1672,415 @@ def backup(
 
     if not result.complete:
         raise typer.Exit(1)
+
+
+# Sections full_backup writes into full_config_<timestamp>.json. Restore reads
+# three of them. `users` is skipped because NPM's API never exports password
+# material, so they could only be recreated with invented passwords;
+# `certificates` is read but never written, because uploading key material
+# would mean POSTing private keys over what is plain HTTP by default.
+BACKUP_SECTIONS = ("proxy_hosts", "access_lists", "certificates", "settings", "users")
+RESTORED_SECTIONS = ("access_lists", "proxy_hosts", "settings")
+
+
+def load_backup(source: str) -> Dict:
+    """Read a full_config backup, given either the file or its directory.
+
+    Returns {"path": Path, "data": dict}. Raises NPMError with something the
+    user can act on rather than letting a JSONDecodeError or a KeyError reach
+    the terminal.
+    """
+    path = Path(source).expanduser()
+
+    if path.is_dir():
+        directory = path
+        latest = directory / LATEST_BACKUP_LINK
+        # exists() follows the symlink, so a link left pointing at a pruned
+        # backup reads as absent here and falls through to the glob.
+        if latest.exists():
+            path = latest.resolve()
+        else:
+            # The link itself has to come out of the candidates. It matches the
+            # glob, Path.glob lists dangling symlinks because it never stats
+            # them, and every real backup is named full_config_<digit>... —
+            # so lexicographic sorting put the broken link last and [-1]
+            # picked it every time, turning a directory full of good backups
+            # into "No such backup".
+            candidates = sorted(c for c in directory.glob(BACKUP_GLOB)
+                                if c.name != LATEST_BACKUP_LINK)
+            if not candidates:
+                raise NPMError(f"No {BACKUP_GLOB} backup found in {directory}")
+            path = candidates[-1]
+
+    if not path.exists():
+        raise NPMError(f"No such backup: {path}")
+
+    try:
+        data = json.loads(path.read_text())
+    except ValueError as exc:
+        raise NPMError(f"{path} is not valid JSON: {exc}") from exc
+    except OSError as exc:
+        raise NPMError(f"Could not read {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise NPMError(f"{path} does not hold a backup object")
+    if not any(key in data for key in BACKUP_SECTIONS):
+        raise NPMError(f"{path} holds none of the sections a backup should "
+                       f"({', '.join(BACKUP_SECTIONS)})")
+
+    return {"path": path, "data": data}
+
+
+def cert_match_key(cert: Dict) -> Optional[frozenset]:
+    """A certificate's domain list as an order-insensitive key, or None.
+
+    None means the metadata holds nothing usable, which NPM does emit for some
+    uploaded certificates — callers fall back to the name rather than treating
+    every such certificate as identical to every other.
+    """
+    names = {str(d).strip().lower() for d in (cert.get("domain_names") or [])
+             if str(d).strip()}
+    return frozenset(names) or None
+
+
+def map_certificates(backup_certs: List[Dict],
+                     target_certs: List[Dict]) -> Dict[int, Optional[int]]:
+    """Map each backed-up certificate ID onto one in the target, or to None.
+
+    Matched on the set of domain names, not on nice_name: the name is free text
+    a user can edit at any time, while the domain set is what decides whether a
+    certificate can serve a given host.
+
+    nice_name is the fallback whenever the domain lookup finds nothing, on
+    either side. That breadth is deliberate — the common case is not a backup
+    with poor metadata but an *uploaded* certificate installed here whose
+    domain_names NPM never filled in, which the backup does record. Narrowing
+    the fallback to "the backup's own key was unusable" would miss it.
+
+    IDs are never carried across. NPM assigns them on create, so a backup's
+    certificate_id means nothing in a different instance — writing one back
+    unchecked is how a host ends up pointing at a certificate that is not there.
+    """
+    by_domains: Dict[frozenset, int] = {}
+    by_name: Dict[str, int] = {}
+    for cert in target_certs:
+        key = cert_match_key(cert)
+        if key is not None:
+            by_domains.setdefault(key, cert.get("id"))
+        name = str(cert.get("nice_name") or "").strip().lower()
+        if name:
+            by_name.setdefault(name, cert.get("id"))
+
+    mapping: Dict[int, Optional[int]] = {}
+    for cert in backup_certs:
+        key = cert_match_key(cert)
+        found = by_domains.get(key) if key is not None else None
+        if found is None:
+            name = str(cert.get("nice_name") or "").strip().lower()
+            found = by_name.get(name) if name else None
+        mapping[cert.get("id")] = found
+    return mapping
+
+
+def restore_host_overrides(host: Dict, cert_map: Dict[int, Optional[int]],
+                           acl_map: Dict[int, Optional[int]]) -> tuple:
+    """Rewrite a backed-up host's ID references for the target.
+
+    Returns (overrides, notes). Anything that cannot be resolved is cleared
+    rather than carried over: a host pointing at an ID the target does not have
+    is the failure this whole tool exists to catch.
+    """
+    notes: List[str] = []
+    overrides: Dict[str, Any] = {}
+
+    old_cert = host.get("certificate_id") or None
+    new_cert = cert_map.get(old_cert) if old_cert else None
+    overrides["certificate_id"] = new_cert
+    if old_cert and new_cert is None:
+        notes.append(f"certificate {old_cert} has no match here — HTTP-only")
+        # Forcing SSL with no certificate redirects to an HTTPS listener NPM
+        # never renders, which is strictly worse than plain HTTP.
+        overrides["ssl_forced"] = False
+        overrides["hsts_enabled"] = False
+
+    old_acl = host.get("access_list_id") or None
+    new_acl = acl_map.get(old_acl) if old_acl else None
+    # 0, not None: NPM's own way of saying "no access list linked".
+    overrides["access_list_id"] = new_acl or 0
+    if old_acl and new_acl is None:
+        notes.append(f"access list {old_acl} was not restored — access control dropped")
+
+    return overrides, notes
+
+
+def restore_acl_payload(acl: Dict) -> tuple:
+    """Reduce a backed-up access list to create_access_list's arguments.
+
+    Returns (kwargs, notes). Item and client rows are rebuilt field by field
+    because the backup carries their `id` and `access_list_id`, which belong to
+    the instance the backup came from.
+    """
+    notes: List[str] = []
+    items = []
+    for item in acl.get("items") or []:
+        username = item.get("username")
+        password = item.get("password")
+        if not password:
+            notes.append(f"user '{username}' has no password in the backup")
+        items.append({"username": username, "password": password or ""})
+
+    clients = [{"address": client.get("address"),
+                "directive": client.get("directive") or "allow"}
+               for client in acl.get("clients") or []]
+
+    return {
+        "name": acl.get("name"),
+        "satisfy_any": bool(acl.get("satisfy_any")),
+        "pass_auth": bool(acl.get("pass_auth")),
+        "items": items,
+        "clients": clients,
+    }, notes
+
+
+@app.command()
+def restore(
+    source: str = typer.Argument(..., help="Backup file, or a directory holding one"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+):
+    """
+    Rebuild proxy hosts, access lists and settings from a backup.
+
+    Intended for a freshly set up NPM. Restoring into one that already holds
+    hosts deletes them first — this replaces configuration, it does not
+    reconcile it.
+
+    Three things are deliberately not restored. Users, because NPM's API never
+    exports password material. Certificates, because uploading them would mean
+    sending private keys to an endpoint that is plain HTTP by default; instead
+    each host is matched to a certificate already present here, and any host
+    whose certificate has no match comes back HTTP-only and is named so you can
+    repoint it. Settings the target does not already define, so a backup from a
+    later NPM cannot introduce ones this instance has never had.
+
+    Examples:
+        restore ~/.npm-api/backups
+        restore ~/.npm-api/backups/full_config_2026_08_24__11_20_02.json
+    """
+    client = get_client()
+    backup = load_backup(source)
+    data = backup["data"]
+
+    backup_acls = data.get("access_lists") or []
+    backup_hosts = data.get("proxy_hosts") or []
+    backup_certs = data.get("certificates") or []
+    backup_settings = data.get("settings") or []
+
+    if not any((backup_acls, backup_hosts, backup_settings)):
+        console.print(f"[yellow]{backup['path']} holds nothing this command "
+                      f"restores ({', '.join(RESTORED_SECTIONS)})[/yellow]")
+        raise typer.Exit(1)
+
+    target_hosts = client.list_hosts()
+    target_acls = client.list_access_lists()
+    target_certs = client.list_certificates()
+
+    # Not fatal. Settings is the least of the three sections, and NPM answers
+    # /settings with 403 for a non-admin token — no reason that should stop the
+    # hosts being restored.
+    try:
+        target_settings = client.list_settings()
+    except (requests.HTTPError, NPMError) as exc:
+        console.print(f"[yellow]⚠️  Could not read this NPM's settings "
+                      f"({format_http_error(exc)}) — the settings section will be "
+                      f"skipped[/yellow]")
+        target_settings = []
+    target_setting_ids = {s.get("id") for s in target_settings}
+
+    cert_map = map_certificates(backup_certs, target_certs)
+    # For the preview, assume every access list in the backup will be created.
+    # A host referencing one the backup does not contain is a real gap and has
+    # to show up here rather than only at apply time.
+    preview_acl_map = {acl.get("id"): acl.get("id") for acl in backup_acls}
+
+    predicted_notes = []
+    for host in backup_hosts:
+        _, notes = restore_host_overrides(host, cert_map, preview_acl_map)
+        if notes:
+            predicted_notes.append((host, notes))
+
+    skipped_settings = [s.get("id") for s in backup_settings
+                        if s.get("id") not in target_setting_ids]
+
+    if preview:
+        console.print(f"\n[cyan]📋 Restore Preview[/cyan]")
+        console.print(f"[cyan]   From: [yellow]{backup['path']}[/yellow][/cyan]\n")
+
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Section", style="white")
+        table.add_column("In backup", style="green", justify="right")
+        table.add_column("Here now", style="yellow", justify="right")
+        table.add_column("Action", style="magenta")
+        table.add_row("Access lists", str(len(backup_acls)), str(len(target_acls)),
+                      "replaced")
+        table.add_row("Proxy hosts", str(len(backup_hosts)), str(len(target_hosts)),
+                      "replaced")
+        table.add_row("Settings", str(len(backup_settings)), str(len(target_settings)),
+                      "written where already defined")
+        table.add_row("Certificates", str(len(backup_certs)), str(len(target_certs)),
+                      "left alone; matched only")
+        table.add_row("Users", str(len(data.get("users") or [])), "—", "not restored")
+        console.print(table)
+
+        if backup_certs:
+            cert_table = Table(show_header=True, header_style="bold cyan",
+                               title="Certificate matching")
+            cert_table.add_column("In backup", style="white")
+            cert_table.add_column("Matches here", style="green")
+            for cert in backup_certs:
+                matched = cert_map.get(cert.get("id"))
+                label = ", ".join(cert.get("domain_names") or []) or \
+                    str(cert.get("nice_name") or "unnamed")
+                cert_table.add_row(
+                    f"{cert.get('id')}: {label}",
+                    f"certificate {matched}" if matched else "[red]no match[/red]")
+            console.print(cert_table)
+
+        if predicted_notes:
+            console.print(f"\n[yellow]⚠️  {len(predicted_notes)} host(s) come back with "
+                          f"something dropped:[/yellow]")
+            for host, notes in predicted_notes:
+                domains = ", ".join(host.get("domain_names") or []) or "(no domains)"
+                console.print(f"   [yellow]{domains}: {'; '.join(notes)}[/yellow]")
+            console.print(f"   [dim]repoint them afterwards with "
+                          f"`host bulk-update certificate_id <id> --ids ...`[/dim]")
+
+        for setting_id in skipped_settings:
+            console.print(f"[dim]Setting '{setting_id}' is not defined on this NPM "
+                          f"— skipped[/dim]")
+
+    if target_hosts or target_acls:
+        console.print(f"\n[red]⚠️  This NPM is not empty. "
+                      f"{len(target_hosts)} proxy host(s) and {len(target_acls)} access "
+                      f"list(s) will be DELETED and replaced by the backup.[/red]")
+        console.print("[red]   Nothing is reconciled or merged. Certificates and users "
+                      "here are left alone.[/red]")
+        console.print("[yellow]   If you have not already, cancel and run "
+                      "`npm-api backup` first.[/yellow]")
+
+    confirm_bulk(yes, "Restore over the current configuration?")
+
+    try:
+        snapshot = write_state_snapshot(
+            client.config, "pre_restore",
+            {"proxy_hosts": target_hosts, "access_lists": target_acls,
+             "settings": target_settings, "restored_from": str(backup["path"])})
+    except OSError as exc:
+        console.print(f"[red]❌ Could not write the pre-restore snapshot: {exc}[/red]")
+        console.print("[red]   Refusing to delete configuration that was not recorded "
+                      "first[/red]")
+        raise typer.Exit(1)
+    console.print(f"[dim]Pre-restore snapshot: {snapshot}[/dim]")
+
+    success_count = 0
+    error_count = 0
+
+    with console.status("[bold green]Restoring...") as status:
+        # Hosts before access lists: NPM will not drop an access list a host
+        # still references.
+        for host in target_hosts:
+            host_id = host.get("id")
+            status.update(f"[bold green]Removing host {host_id}...")
+            try:
+                if not client.delete_host(host_id):
+                    raise NPMError("NPM refused the delete")
+                console.print(f"  [dim]− removed host {host_id}[/dim]")
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Could not remove host {host_id} — "
+                              f"{format_http_error(exc)}[/red]")
+                error_count += 1
+
+        for acl in target_acls:
+            acl_id = acl.get("id")
+            status.update(f"[bold green]Removing access list {acl_id}...")
+            try:
+                if not client.delete_access_list(acl_id):
+                    raise NPMError("NPM refused the delete")
+                console.print(f"  [dim]− removed access list {acl_id}[/dim]")
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Could not remove access list {acl_id} — "
+                              f"{format_http_error(exc)}[/red]")
+                error_count += 1
+
+        # Access lists first: a host carries access_list_id, so the new IDs have
+        # to exist before any host is written.
+        acl_map: Dict[int, Optional[int]] = {}
+        for acl in backup_acls:
+            old_id = acl.get("id")
+            kwargs, notes = restore_acl_payload(acl)
+            status.update(f"[bold green]Creating access list {kwargs['name']}...")
+            try:
+                created = client.create_access_list(**kwargs)
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Access list '{kwargs['name']}' — "
+                              f"{format_http_error(exc)}[/red]")
+                acl_map[old_id] = None
+                error_count += 1
+                continue
+            acl_map[old_id] = created.get("id")
+            console.print(f"  [green]✅ Access list '{kwargs['name']}' → "
+                          f"{created.get('id')}[/green]")
+            for note in notes:
+                console.print(f"     [yellow]⚠️  {note} — set it again in NPM[/yellow]")
+            success_count += 1
+
+        # Counted from what actually happened, not from the preview: an access
+        # list that failed to create above leaves more hosts degraded than the
+        # preview predicted, and the closing advice has to reflect that.
+        degraded = 0
+        for host in backup_hosts:
+            domains = ", ".join(host.get("domain_names") or []) or "(no domains)"
+            overrides, notes = restore_host_overrides(host, cert_map, acl_map)
+            status.update(f"[bold green]Creating {domains}...")
+            try:
+                created = client.create_host_from(host, overrides)
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ {domains} — {format_http_error(exc)}[/red]")
+                error_count += 1
+                continue
+            console.print(f"  [green]✅ {domains} → host {created.get('id')}[/green]")
+            for note in notes:
+                console.print(f"     [yellow]⚠️  {note}[/yellow]")
+            if notes:
+                degraded += 1
+            success_count += 1
+
+        for setting in backup_settings:
+            setting_id = setting.get("id")
+            if setting_id not in target_setting_ids:
+                continue
+            status.update(f"[bold green]Writing setting {setting_id}...")
+            try:
+                client.update_setting(setting_id, {"value": setting.get("value"),
+                                                   "meta": setting.get("meta") or {}})
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Setting '{setting_id}' — "
+                              f"{format_http_error(exc)}[/red]")
+                error_count += 1
+                continue
+            console.print(f"  [green]✅ Setting '{setting_id}'[/green]")
+            success_count += 1
+
+    if degraded:
+        console.print(f"\n[yellow]{degraded} host(s) came back without the "
+                      f"certificate or access list they had. Install the certificates "
+                      f"in NPM, then repoint them:[/yellow]")
+        console.print("   [dim]npm-api cert list[/dim]")
+        console.print("   [dim]npm-api host bulk-update certificate_id <id> "
+                      "--pattern <domain>[/dim]")
+
+    print_bulk_summary(success_count, error_count)
 
 
 @app.command()
@@ -2454,25 +2908,6 @@ def describe_host_differences(target: Dict, source: Dict) -> List[str]:
     return differences
 
 
-def write_merge_snapshot(config: Config, target: Dict, sources: List[Dict]) -> Path:
-    """Record every host a merge touches, before the first delete.
-
-    A merge deletes hosts and NPM has no undo. The rollback below can only
-    recreate a source under a *new* ID, and cannot run at all if the process is
-    killed partway through. This file is the floor under both: whatever
-    happens, the original configuration is still on disk.
-    """
-    directory = Path(config.backup_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
-    path = directory / f"pre_merge_{target.get('id')}_{stamp}.json"
-    payload = {"created": stamp, "target": target, "sources": sources}
-    # 0600 like the rest of what this tool writes: advanced_config can carry
-    # auth headers and internal hostnames, and this holds them for every host
-    # involved.
-    return write_secret(path, json.dumps(payload, indent=2))
-
-
 def _restore_merge_source(client: NPMClient, source: Dict, snapshot: Path) -> None:
     """Recreate a source host whose domains the target then refused.
 
@@ -2633,7 +3068,8 @@ def host_merge(
     confirm_bulk(yes, f"Merge {len(sources)} host(s) into host {into} and delete them?")
 
     try:
-        snapshot = write_merge_snapshot(client.config, target, sources)
+        snapshot = write_state_snapshot(client.config, f"pre_merge_{into}",
+                                        {"target": target, "sources": sources})
     except OSError as exc:
         console.print(f"[red]❌ Could not write the pre-merge snapshot: {exc}[/red]")
         console.print("[red]   Refusing to delete hosts whose configuration was not "
