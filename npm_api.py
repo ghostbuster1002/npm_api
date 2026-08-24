@@ -1099,57 +1099,77 @@ class NPMClient:
     # =========================================================================
     
     def get_dashboard_stats(self) -> Dict:
-        """Get dashboard statistics"""
-        stats = {
-            "proxy_hosts": {"total": 0, "enabled": 0, "disabled": 0},
-            "certificates": {"total": 0, "valid": 0, "expired": 0},
-            "redirections": 0,
-            "streams": 0,
-            "users": 0,
-            "access_lists": 0
+        """Collect the dashboard counts, distinguishing zero from unknown.
+
+        A section that could not be read reports None instead of 0, and the
+        reason lands in "failures". Defaulting to 0 made a sick NPM render
+        identically to an empty one — "0 proxy hosts" read as a fact when it
+        actually meant the request had failed.
+        """
+        stats: Dict[str, Any] = {
+            "proxy_hosts": {"total": None, "enabled": None, "disabled": None},
+            "certificates": {"total": None, "valid": None, "expired": None},
+            "redirections": None,
+            "streams": None,
+            "users": None,
+            "access_lists": None,
+            "failures": [],
         }
-        
+
+        # HTTPError and JSONDecodeError subclass these two, so between them the
+        # tuple covers a rejected request and an unparseable body alike
+        expected = (requests.RequestException, ValueError, KeyError, NPMError)
+
+        def record(section: str, exc: Exception) -> None:
+            stats["failures"].append(f"{section}: {format_http_error(exc)}")
+
+        def count_endpoint(section: str, endpoint: str) -> Optional[int]:
+            try:
+                response = self.get(endpoint)
+                response.raise_for_status()
+                return len(response.json())
+            except expected as exc:
+                record(section, exc)
+                return None
+
         try:
             hosts = self.list_hosts()
-            stats["proxy_hosts"]["total"] = len(hosts)
-            stats["proxy_hosts"]["enabled"] = sum(1 for h in hosts if h.get("enabled"))
-            stats["proxy_hosts"]["disabled"] = stats["proxy_hosts"]["total"] - stats["proxy_hosts"]["enabled"]
-        except Exception:
-            pass
-        
+            enabled = sum(1 for h in hosts if h.get("enabled"))
+            stats["proxy_hosts"] = {
+                "total": len(hosts),
+                "enabled": enabled,
+                "disabled": len(hosts) - enabled,
+            }
+        except expected as exc:
+            record("proxy hosts", exc)
+
         try:
             certs = self.list_certificates()
-            stats["certificates"]["total"] = len(certs)
-            stats["certificates"]["expired"] = sum(
+            expired = sum(
                 1 for c in certs
                 if (days := cert_days_remaining(c)) is not None and days < 0
             )
-            stats["certificates"]["valid"] = stats["certificates"]["total"] - stats["certificates"]["expired"]
-        except Exception:
-            pass
-        
-        try:
-            response = self.get("/nginx/redirection-hosts")
-            stats["redirections"] = len(response.json())
-        except Exception:
-            pass
-        
-        try:
-            response = self.get("/nginx/streams")
-            stats["streams"] = len(response.json())
-        except Exception:
-            pass
-        
+            stats["certificates"] = {
+                "total": len(certs),
+                "valid": len(certs) - expired,
+                "expired": expired,
+            }
+        except expected as exc:
+            record("certificates", exc)
+
+        stats["redirections"] = count_endpoint("redirections", "/nginx/redirection-hosts")
+        stats["streams"] = count_endpoint("streams", "/nginx/streams")
+
         try:
             stats["users"] = len(self.list_users())
-        except Exception:
-            pass
-        
+        except expected as exc:
+            record("users", exc)
+
         try:
             stats["access_lists"] = len(self.list_access_lists())
-        except Exception:
-            pass
-        
+        except expected as exc:
+            record("access lists", exc)
+
         return stats
     
     # =========================================================================
@@ -1479,6 +1499,7 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
             raise typer.Exit(1)
         # The API user is included but no token or password: this output is
         # meant to be pipeable and pasteable into an issue
+        stats = client.get_dashboard_stats()
         print_json({
             "version": VERSION,
             "config_source": config.get_config_info(),
@@ -1486,8 +1507,12 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
             "nginx_ip": config.nginx_ip,
             "api_user": config.api_user,
             "data_dir": config.data_dir_id,
-            "stats": client.get_dashboard_stats(),
+            "stats": stats,
         })
+        # Counts a section could not supply are null, never 0. Exit non-zero to
+        # match, so `jq` sees the whole document but the shell still sees failure
+        if stats["failures"]:
+            raise typer.Exit(1)
         return
 
     out_console.print(f"\n[yellow]Script Info: [green]{VERSION}[/green][/yellow]")
@@ -1505,25 +1530,40 @@ def info(as_json: bool = typer.Option(False, "--json", help="Emit raw JSON on st
         raise typer.Exit(1)
 
     stats = client.get_dashboard_stats()
-    
+
+    def count(value: Any, colour: str = "") -> str:
+        """Render a count, or '?' where the section could not be read."""
+        if value is None:
+            return "[dim]?[/dim]"
+        return f"[{colour}]{value}[/{colour}]" if colour else str(value)
+
     out_console.print("\n[cyan]📊 NGINX Proxy Manager Dashboard 🔧[/cyan]")
-    
+
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Component", style="white")
     table.add_column("Status", justify="right")
-    
-    table.add_row("🌐 Proxy Hosts", f"[yellow]{stats['proxy_hosts']['total']}[/yellow]")
-    table.add_row("├─ Enabled", f"[green]{stats['proxy_hosts']['enabled']}[/green]")
-    table.add_row("└─ Disabled", f"[red]{stats['proxy_hosts']['disabled']}[/red]")
-    table.add_row("🔒 Certificates", f"[yellow]{stats['certificates']['total']}[/yellow]")
-    table.add_row("├─ Valid", f"[green]{stats['certificates']['valid']}[/green]")
-    table.add_row("└─ Expired", f"[red]{stats['certificates']['expired']}[/red]")
-    table.add_row("🔄 Redirections", str(stats['redirections']))
-    table.add_row("🔌 Stream Hosts", str(stats['streams']))
-    table.add_row("🔒 Access Lists", str(stats['access_lists']))
-    table.add_row("👥 Users", str(stats['users']))
-    
+
+    table.add_row("🌐 Proxy Hosts", count(stats['proxy_hosts']['total'], "yellow"))
+    table.add_row("├─ Enabled", count(stats['proxy_hosts']['enabled'], "green"))
+    table.add_row("└─ Disabled", count(stats['proxy_hosts']['disabled'], "red"))
+    table.add_row("🔒 Certificates", count(stats['certificates']['total'], "yellow"))
+    table.add_row("├─ Valid", count(stats['certificates']['valid'], "green"))
+    table.add_row("└─ Expired", count(stats['certificates']['expired'], "red"))
+    table.add_row("🔄 Redirections", count(stats['redirections']))
+    table.add_row("🔌 Stream Hosts", count(stats['streams']))
+    table.add_row("🔒 Access Lists", count(stats['access_lists']))
+    table.add_row("👥 Users", count(stats['users']))
+
     out_console.print(table)
+
+    if stats["failures"]:
+        # Exit non-zero so a health check cannot read '?' as a clean run
+        console.print(f"\n[red]❌ {len(stats['failures'])} section(s) could not "
+                      f"be read — the counts above are incomplete:[/red]")
+        for failure in stats["failures"]:
+            console.print(f"[red]   • {failure}[/red]")
+        raise typer.Exit(1)
+
     out_console.print("\n[yellow]💡 Use --help to see available commands[/yellow]")
 
 

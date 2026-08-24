@@ -171,6 +171,10 @@ relevant section below.
 - `host show` omitted `trust_forwarded_proto`.
 - `info` and `check-token` exited 0 when authentication failed, so a scheduled
   health check could not tell a working NPM from an unreachable one.
+- `info` reported 0 for any dashboard section whose request failed, making a
+  sick NPM render identically to an empty one. Unreadable sections now show `?`
+  (`null` under `--json`), the reasons are listed, and the command exits
+  non-zero — so a count of 0 now only ever means zero.
 - **Certificate backups failed silently.** `download_certificate` wrapped both
   of its download routes in `except Exception: pass` and returned `False`,
   which `full_backup` ignored — so `backup` reported "Backed up N certificates"
