@@ -20,6 +20,11 @@ relevant section below.
    a host selector.** They previously fell through to every host.
 3. **`host split`, `host ssl-enable` and `host bulk-update` exit non-zero when
    any host fails.** Scripts that ignored the exit status will now see failures.
+4. **`host clone` and `host split` now refuse a certificate that does not
+   exist** instead of printing the warning and continuing. A script that
+   cloned or split against a deleted certificate used to "succeed" and produce
+   hosts with no TLS listener; it now exits 1. Pass `--cert none` to get the
+   old outcome deliberately.
 
 ### Added
 
@@ -41,6 +46,30 @@ relevant section below.
     the two never hold the same domain simultaneously (NPM rejects duplicates).
     A failed create rolls the source back; a failed rollback prints the
     original domain list so it can be restored by hand.
+- `host merge --into <id>` — the inverse of `host split`. Folds several hosts
+  into one and deletes the sources. The `--into` host is kept whole and
+  supplies every setting; the others contribute only their domain names. Takes
+  `--ids` / `--pattern` / `--interactive`, `--cert`,
+  `--allow-different-targets`, `--preview/--no-preview` and `-y`.
+  - Merging is structurally how a host ends up answering to names its single
+    certificate does not cover, so the resulting domain list is validated
+    against that certificate and every uncovered name is reported. A
+    certificate that does not exist stops the merge.
+  - The `--into` host is never deleted, even when `--pattern` matches it too.
+  - A source forwarding to a different scheme, host or port stops the merge:
+    its domains would silently start reaching another backend.
+    `--allow-different-targets` overrides.
+  - The preview names, per source, which settings differ from the target and
+    will therefore change behaviour for the domains moving across.
+  - `--cert none` also clears `ssl_forced` and `hsts_enabled`, since forcing
+    SSL without a certificate redirects to a listener NPM never renders.
+  - Before the first delete, every host involved is written to
+    `pre_merge_<id>_<timestamp>.json` in the backup directory at mode `0600`.
+    A merge that cannot write that file refuses to run.
+  - Sources are deleted one at a time, each followed immediately by adding its
+    domains to the target — NPM will not let two hosts hold the same domain, so
+    the delete has to come first. A rejected update recreates the source, under
+    a new ID; a failed recreate prints the snapshot path.
 - `host clone <id> --domain <d> [--domain <d> ...]` — copy a host to new
   domains, leaving the source untouched. `--domain` is required and repeatable
   because NPM requires unique domain names. `--cert` is optional and inherits
@@ -152,6 +181,15 @@ relevant section below.
 
 ### Fixed
 
+- `host clone` and `host split` called `validate_certificate_assignment` but
+  ignored its return value, so the one case it treats as fatal — a certificate
+  ID that no longer exists — printed a red refusal and then went ahead anyway.
+  Both now exit 1. This is the failure mode the tool was written to catch: NPM
+  wraps the entire `listen 443 ssl` block in a conditional on the linked
+  certificate, so a host pointed at a deleted ID is rendered with no TLS
+  listener and reports no error. Found while adding `host merge`, which
+  inherited the same omission and would have deleted the source hosts before
+  producing the broken survivor.
 - Certificate expiry status was read from a `cert["expired"]` field that NPM's
   API does not return, so every certificate always displayed as VALID. Status
   is now derived from `expires_on`, with a 30-day warning tier. Affected

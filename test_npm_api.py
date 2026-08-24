@@ -1845,5 +1845,916 @@ class TestValidateCertificateAssignment(_ConsoleTestCase):
         self.assertPrinted("empty")
 
 
+# =============================================================================
+# host merge: shared doubles
+# =============================================================================
+
+def _merge_host(host_id, domains, **overrides):
+    """A proxy host as NPM returns it, carrying every field merge inspects.
+
+    Spelled out in full rather than built per test so that a test overriding
+    one field is testing that field alone: an absent key reads as None, which
+    _comparable folds to 0, so a partial fixture quietly agrees with a zero on
+    the other side and the difference under test never appears.
+    """
+    host = {
+        "id": host_id,
+        "domain_names": list(domains),
+        "forward_scheme": "http",
+        "forward_host": "10.0.0.5",
+        "forward_port": 8080,
+        "certificate_id": None,
+        "ssl_forced": False,
+        "hsts_enabled": False,
+        "http2_support": False,
+        "allow_websocket_upgrade": True,
+        "block_exploits": True,
+        "caching_enabled": False,
+        "access_list_id": 0,
+        "advanced_config": "",
+        "locations": [],
+        "enabled": True,
+        "meta": {"letsencrypt_agree": True},
+    }
+    host.update(overrides)
+    return host
+
+
+def _npm_http_error(status=400, message="Domain already in use"):
+    """An HTTPError carrying a body in NPM's shape, for format_http_error."""
+    return requests.HTTPError(
+        f"{status} Error",
+        response=_FakeResponse(status, json_body={"error": {"message": message}}))
+
+
+class _MergeConfig:
+    """The one Config attribute write_merge_snapshot reads.
+
+    Config.backup_dir is a read-only property derived from data_dir and the
+    server address, so pointing a real Config at a temp directory would mean
+    reproducing that whole layout to exercise one mkdir and one filename.
+    """
+
+    def __init__(self, backup_dir):
+        self.backup_dir = str(backup_dir)
+
+
+class _MergeClient(_StubClient):
+    """Every write merge makes, on one list, in the order it made them.
+
+    Merge's central safety property is an ordering rather than an argument:
+    each source is deleted before the target claims its names, because NPM
+    refuses to let two hosts hold the same domain. Recording deletes, updates
+    and re-creates separately would lose exactly the fact under test, so they
+    share a list and the assertions read the interleaving off it.
+    """
+
+    def __init__(self, target, sources, backup_dir, *, delete_error_ids=(),
+                 delete_refuse_ids=(), update_fail_calls=(), error=None,
+                 restore_error=None, certificate=None):
+        self.config = _MergeConfig(backup_dir)
+        self.hosts = [target] + list(sources)
+        self.calls = []
+        self.cert_lookups = []
+        self._delete_error_ids = set(delete_error_ids)
+        self._delete_refuse_ids = set(delete_refuse_ids)
+        # Keyed by call number, not host ID: every update in a merge is aimed
+        # at the same --into host, so the ID cannot distinguish them.
+        self._update_fail_calls = set(update_fail_calls)
+        self._error = error or _npm_http_error()
+        self._restore_error = restore_error
+        self._certificate = certificate
+        self._update_count = 0
+        self._next_new_id = 100
+
+    # --- reads -------------------------------------------------------------
+
+    def list_hosts(self):
+        return self.hosts
+
+    def get_host(self, host_id):
+        for host in self.hosts:
+            if host.get("id") == host_id:
+                return host
+        raise requests.HTTPError("404 Not Found", response=_FakeResponse(404))
+
+    def get_certificate(self, cert_id):
+        self.cert_lookups.append(cert_id)
+        if self._certificate is None:
+            raise requests.HTTPError("404 Not Found", response=_FakeResponse(404))
+        return self._certificate
+
+    # --- writes ------------------------------------------------------------
+
+    def delete_host(self, host_id):
+        self.calls.append(("delete", host_id))
+        if host_id in self._delete_error_ids:
+            raise self._error
+        # The real delete_host reports a refusal by returning False rather than
+        # raising: it checks the status code itself and never calls
+        # raise_for_status.
+        return host_id not in self._delete_refuse_ids
+
+    def update_host(self, host_id, updates):
+        self._update_count += 1
+        self.calls.append(("update", host_id, updates))
+        if self._update_count in self._update_fail_calls:
+            raise self._error
+        return {"id": host_id, **updates}
+
+    def create_host_from(self, source, overrides):
+        self.calls.append(("create", source.get("id")))
+        if self._restore_error is not None:
+            raise self._restore_error
+        # NPM assigns the ID on create; the old one cannot be asked for.
+        self._next_new_id += 1
+        return dict(source, id=self._next_new_id)
+
+    # --- views the assertions read -----------------------------------------
+
+    @property
+    def kinds(self):
+        return [call[0] for call in self.calls]
+
+    @property
+    def deleted_ids(self):
+        return [call[1] for call in self.calls if call[0] == "delete"]
+
+    @property
+    def updates(self):
+        return [(call[1], call[2]) for call in self.calls if call[0] == "update"]
+
+    @property
+    def recreated_ids(self):
+        return [call[1] for call in self.calls if call[0] == "create"]
+
+
+# =============================================================================
+# _comparable
+# =============================================================================
+
+class TestComparable(unittest.TestCase):
+    """NPM spells the same flag as a boolean on one host and an integer on the
+    next, and uses both 0 and null for "nothing linked", so a plain != between
+    two hosts reports differences that are not there."""
+
+    def test_absent_and_off_all_fold_to_zero(self):
+        for given in (False, 0, None):
+            with self.subTest(given=given):
+                self.assertEqual(npm_api._comparable(given), 0)
+
+    def test_true_folds_to_one(self):
+        self.assertEqual(npm_api._comparable(True), 1)
+
+    def test_a_boolean_matches_its_integer_spelling(self):
+        self.assertEqual(npm_api._comparable(True), npm_api._comparable(1))
+        self.assertEqual(npm_api._comparable(False), npm_api._comparable(0))
+
+    def test_other_values_pass_through_unchanged(self):
+        for given in (5, 8080, "http", "10.0.0.5", "", [], {"a": 1}):
+            with self.subTest(given=given):
+                self.assertEqual(npm_api._comparable(given), given)
+
+    def test_an_empty_string_is_not_folded_into_absent(self):
+        # Only advanced_config mixes "" with null, and describe_host_differences
+        # handles that field separately. Folding "" here would make an empty
+        # forward_host look like a missing one.
+        self.assertNotEqual(npm_api._comparable(""), npm_api._comparable(None))
+
+
+# =============================================================================
+# _forward_label
+# =============================================================================
+
+class TestForwardLabel(unittest.TestCase):
+    """Where a host's traffic ends up, as one printable string."""
+
+    def test_renders_scheme_host_and_port(self):
+        self.assertEqual(
+            npm_api._forward_label(_merge_host(12, ["app.example.com"])),
+            "http://10.0.0.5:8080",
+        )
+
+    def test_https_upstream(self):
+        host = _merge_host(12, ["app.example.com"], forward_scheme="https",
+                           forward_host="backend.internal.lan", forward_port=443)
+        self.assertEqual(npm_api._forward_label(host),
+                         "https://backend.internal.lan:443")
+
+    def test_absent_fields_degrade_rather_than_raise(self):
+        # It only ever appears inside a message that is already reporting an
+        # oddity, so a host missing forward_scheme should print "None" and let
+        # the operator see that, not abort the refusal that was being explained.
+        self.assertEqual(npm_api._forward_label({}), "None://None:None")
+
+
+# =============================================================================
+# describe_host_differences
+# =============================================================================
+
+class TestDescribeHostDifferences(unittest.TestCase):
+    """What a source's domains lose by moving onto the target.
+
+    Advisory only — merge never refuses over any of it, because adopting the
+    target's configuration is precisely what --into asks for. The property that
+    matters is that it neither invents differences nor hides real ones.
+    """
+
+    # One differing pair per notable field, so each label can be provoked on
+    # its own.
+    _DIFFERING = {
+        "enabled": (True, False),
+        "certificate_id": (4, 5),
+        "ssl_forced": (True, False),
+        "hsts_enabled": (True, False),
+        "http2_support": (True, False),
+        "allow_websocket_upgrade": (True, False),
+        "block_exploits": (True, False),
+        "caching_enabled": (True, False),
+        "access_list_id": (2, 3),
+        "advanced_config": ("add_header X-A a;", "add_header X-B b;"),
+        "locations": ([], [{"path": "/api"}]),
+    }
+
+    def _pair(self, **overrides):
+        target_overrides = {k: v[0] for k, v in overrides.items()}
+        source_overrides = {k: v[1] for k, v in overrides.items()}
+        return (_merge_host(12, ["app.example.com"], **target_overrides),
+                _merge_host(13, ["old.example.com"], **source_overrides))
+
+    def test_identical_hosts_differ_in_nothing(self):
+        target, source = self._pair()
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_differing_domain_names_are_not_a_difference(self):
+        # The domains are the whole point of the merge, not something lost by it.
+        target = _merge_host(12, ["app.example.com"])
+        source = _merge_host(13, ["old.example.com", "legacy.example.com"])
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_every_notable_field_is_detected_on_its_own(self):
+        labels = dict(npm_api.MERGE_NOTABLE_FIELDS)
+        # Fails when a field is added to MERGE_NOTABLE_FIELDS without a case
+        # here, rather than letting the new field go quietly untested.
+        self.assertEqual(set(self._DIFFERING), set(labels))
+
+        for key, values in self._DIFFERING.items():
+            with self.subTest(field=key):
+                target, source = self._pair(**{key: values})
+                self.assertEqual(npm_api.describe_host_differences(target, source),
+                                 [labels[key]])
+
+    def test_differences_are_reported_in_field_order(self):
+        target, source = self._pair(ssl_forced=(True, False),
+                                    caching_enabled=(True, False),
+                                    enabled=(True, False))
+        self.assertEqual(npm_api.describe_host_differences(target, source),
+                         ["enabled", "force SSL", "caching"])
+
+    def test_locations_are_compared_by_count_not_by_content(self):
+        # Deliberately shallow. A custom location is a nested object with its
+        # own forward target and nginx snippet; diffing it properly would be a
+        # feature of its own, and the preview only needs to say "this host has
+        # custom locations and the target's will be used instead". Two
+        # different single-location lists therefore read as the same.
+        target, source = self._pair(
+            locations=([{"path": "/api", "forward_host": "10.0.0.5"}],
+                       [{"path": "/admin", "forward_host": "10.9.9.9"}]))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_a_differing_number_of_locations_is_reported(self):
+        target, source = self._pair(locations=([], [{"path": "/api"}]))
+        self.assertEqual(npm_api.describe_host_differences(target, source),
+                         ["custom locations"])
+
+    def test_null_and_empty_locations_are_the_same(self):
+        target, source = self._pair(locations=(None, []))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_advanced_config_unset_in_either_spelling_is_the_same(self):
+        # NPM returns null for a host that never had one and "" for a host whose
+        # config was cleared, and the UI leaves a stray newline behind.
+        for left, right in ((None, ""), ("", "  "), (None, "\n"), (None, None)):
+            with self.subTest(left=left, right=right):
+                target, source = self._pair(advanced_config=(left, right))
+                self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_advanced_config_ignores_surrounding_whitespace(self):
+        target, source = self._pair(
+            advanced_config=("add_header X-A a;", "  add_header X-A a;\n"))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_advanced_config_reports_a_real_text_change(self):
+        target, source = self._pair(advanced_config=("", "add_header X-A a;"))
+        self.assertEqual(npm_api.describe_host_differences(target, source),
+                         ["advanced config"])
+
+    def test_certificate_id_zero_and_null_both_mean_no_certificate(self):
+        target, source = self._pair(certificate_id=(0, None))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_access_list_id_zero_and_null_both_mean_no_access_list(self):
+        target, source = self._pair(access_list_id=(0, None))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_ssl_forced_false_and_zero_are_the_same_setting(self):
+        target, source = self._pair(ssl_forced=(False, 0))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+    def test_ssl_forced_true_and_one_are_the_same_setting(self):
+        target, source = self._pair(ssl_forced=(True, 1))
+        self.assertEqual(npm_api.describe_host_differences(target, source), [])
+
+
+# =============================================================================
+# write_merge_snapshot
+# =============================================================================
+
+class TestWriteMergeSnapshot(_WorkdirTestCase):
+    """The floor under a merge.
+
+    Merge deletes hosts and NPM has no undo. The in-process rollback can only
+    recreate a source under a new ID, and cannot run at all if the process is
+    killed partway through, so this file is the only thing guaranteeing the
+    original configuration still exists somewhere.
+    """
+
+    def _write(self, target, sources, directory=None):
+        config = _MergeConfig(directory or self.workdir)
+        return npm_api.write_merge_snapshot(config, target, sources)
+
+    def test_lands_in_the_backup_directory_named_for_the_target(self):
+        path = self._write(_merge_host(12, ["app.example.com"]),
+                           [_merge_host(13, ["old.example.com"])])
+
+        self.assertEqual(path.parent, self.workdir)
+        self.assertTrue(path.name.startswith("pre_merge_12_"), path.name)
+        self.assertTrue(path.name.endswith(".json"), path.name)
+
+    def test_is_owner_readable_only(self):
+        # advanced_config carries auth headers and internal hostnames, and this
+        # file holds it for every host the merge touches.
+        path = self._write(_merge_host(12, ["app.example.com"]),
+                           [_merge_host(13, ["old.example.com"])])
+        self.assertEqual(_mode(path), 0o600)
+
+    def test_holds_the_target_and_every_source_verbatim(self):
+        target = _merge_host(12, ["app.example.com"], advanced_config="add_header X-A a;")
+        sources = [_merge_host(13, ["old.example.com"], certificate_id=7),
+                   _merge_host(14, ["legacy.example.com"], locations=[{"path": "/api"}])]
+
+        payload = json.loads(self._write(target, sources).read_text())
+
+        self.assertEqual(payload["target"], target)
+        self.assertEqual(payload["sources"], sources)
+        self.assertIn("created", payload)
+
+    def test_creates_the_backup_directory_when_it_does_not_exist(self):
+        # First run on a fresh install reaches here before anything else has
+        # written a backup.
+        directory = self.workdir / "nested" / "backups"
+        path = self._write(_merge_host(12, ["app.example.com"]), [], directory)
+
+        self.assertTrue(path.exists())
+        self.assertEqual(path.parent, directory)
+
+
+# =============================================================================
+# _restore_merge_source
+# =============================================================================
+
+class _RestoreClient(_StubClient):
+    """Recreates a host, or refuses to."""
+
+    def __init__(self, error=None, new_id=101):
+        self.error = error
+        self.new_id = new_id
+        self.calls = []
+
+    def create_host_from(self, source, overrides):
+        self.calls.append((source.get("id"), overrides))
+        if self.error is not None:
+            raise self.error
+        return dict(source, id=self.new_id)
+
+
+class TestRestoreMergeSource(_ConsoleTestCase):
+    """Undoing one deleted source when the target then refused its domains.
+
+    Everything it has to say is said in print(), and each message exists
+    because the operator has to act on it by hand afterwards.
+    """
+
+    _SOURCE = _merge_host(13, ["old.example.com", "legacy.example.com"])
+    _SNAPSHOT = Path("/var/tmp/npm-api/backups/pre_merge_12_2026_08_24__10_00_00.json")
+
+    def test_recreates_the_host_from_its_recorded_configuration(self):
+        client = _RestoreClient()
+
+        npm_api._restore_merge_source(client, self._SOURCE, self._SNAPSHOT)
+
+        self.assertEqual(client.calls, [(13, {})])
+
+    def test_reports_the_new_id_and_that_it_is_a_new_one(self):
+        # The ID changes and nothing can stop it changing, so the message has to
+        # say so: scripts, runbooks and the snapshot itself still name the old
+        # one, and NPM offers no way to ask for a particular ID on create.
+        npm_api._restore_merge_source(_RestoreClient(new_id=101), self._SOURCE,
+                                      self._SNAPSHOT)
+
+        self.assertPrinted("Host 13 recreated as host 101")
+        self.assertPrinted("NPM assigns a new ID")
+
+    def test_a_failed_restore_names_the_domains_and_the_snapshot(self):
+        # The worst outcome merge can reach: a host is gone, its domains answer
+        # nothing, and the only remaining copy of its configuration is on disk.
+        # Printing the path is what makes that copy findable.
+        client = _RestoreClient(error=_npm_http_error(500, "Internal Error"))
+
+        npm_api._restore_merge_source(client, self._SOURCE, self._SNAPSHOT)
+
+        self.assertPrinted("ROLLBACK FAILED")
+        self.assertPrinted("Internal Error")
+        self.assertPrinted("old.example.com, legacy.example.com")
+        self.assertPrinted(str(self._SNAPSHOT))
+
+    def test_an_npm_error_is_handled_like_an_http_error(self):
+        # NPMError is this tool's own operational failure — an unreachable
+        # server, a reply that is not NPM's. Letting it out would abandon the
+        # remaining sources mid-merge with one host already deleted.
+        client = _RestoreClient(error=npm_api.NPMError("NPM is unreachable"))
+
+        npm_api._restore_merge_source(client, self._SOURCE, self._SNAPSHOT)
+
+        self.assertPrinted("ROLLBACK FAILED")
+        self.assertPrinted("NPM is unreachable")
+
+    def test_a_failed_restore_returns_rather_than_raising(self):
+        client = _RestoreClient(error=_npm_http_error(500))
+        self.assertIsNone(
+            npm_api._restore_merge_source(client, self._SOURCE, self._SNAPSHOT))
+
+
+# =============================================================================
+# host merge
+# =============================================================================
+
+class _MergeCommandTestCase(_WorkdirTestCase, _ConsoleTestCase):
+    """Runs host_merge end to end against a stub, on a temp backup directory.
+
+    host_merge is a Typer command and also a plain function, and is called here
+    as the latter. Every argument is passed explicitly: the defaults on the
+    signature are typer.OptionInfo objects rather than the values they
+    describe, so an omitted argument would arrive as an OptionInfo and be
+    truthy.
+    """
+
+    def _client(self, target, sources, **kwargs):
+        return _MergeClient(target, sources, self.workdir, **kwargs)
+
+    def _merge(self, client, **overrides):
+        options = dict(into=12, host_ids=None, pattern=None, cert=None,
+                       allow_different_targets=False, preview=False, yes=True,
+                       interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_merge(**options)
+
+    def _merge_expecting_exit(self, client, **overrides):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._merge(client, **overrides)
+        return caught.exception
+
+
+class TestHostMergeSafety(_MergeCommandTestCase):
+    """What merge must refuse to do.
+
+    It is the only command in the tool that deletes a host the user did not
+    name for deletion, and NPM has no undo, so the interesting assertions are
+    about calls that must not happen.
+    """
+
+    def test_a_pattern_matching_the_target_never_deletes_the_target(self):
+        # --pattern will routinely match the --into host too, since it is being
+        # merged into precisely because it shares a naming scheme with the
+        # others. Deleting the host that was meant to survive is the one outcome
+        # merge must never produce, so the target is dropped from the sources
+        # rather than the run being refused.
+        target = _merge_host(12, ["app.example.com"])
+        source = _merge_host(13, ["old.example.com"])
+        client = self._client(target, [source])
+
+        self._merge(client, pattern="example.com")
+
+        self.assertEqual(client.deleted_ids, [13])
+        self.assertNotIn(12, client.deleted_ids)
+
+    def test_only_the_target_matching_leaves_nothing_to_do(self):
+        target = _merge_host(12, ["app.example.com"])
+        other = _merge_host(13, ["unrelated.internal.lan"])
+        client = self._client(target, [other])
+
+        self._merge(client, pattern="app.example.com")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Nothing left to merge into host 12")
+
+    def test_no_matching_hosts_writes_nothing(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._merge(client, pattern="nothing.example.net")
+
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("No hosts selected")
+
+    def test_a_missing_into_host_exits_1_before_touching_anything(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        exit_exc = self._merge_expecting_exit(client, into=99, host_ids="13")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Host ID 99 not found")
+
+    def test_a_differing_forward_target_refuses_and_changes_nothing(self):
+        # Merging moves the source's domains onto the target's server block, so
+        # a source pointing at another backend would have its traffic silently
+        # repointed. That is a refusal rather than a warning because nothing in
+        # the request says the user meant it.
+        for field, value in (("forward_scheme", "https"),
+                             ("forward_host", "10.9.9.9"),
+                             ("forward_port", 9090)):
+            with self.subTest(field=field):
+                client = self._client(_merge_host(12, ["app.example.com"]),
+                                      [_merge_host(13, ["old.example.com"],
+                                                   **{field: value})])
+
+                exit_exc = self._merge_expecting_exit(client, host_ids="13")
+
+                self.assertEqual(exit_exc.exit_code, 1)
+                self.assertEqual(client.deleted_ids, [])
+                self.assertEqual(client.updates, [])
+
+    def test_the_refusal_names_both_upstreams_and_the_escape_hatch(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"],
+                                           forward_port=9090)])
+
+        self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertPrinted("http://10.0.0.5:9090")
+        self.assertPrinted("http://10.0.0.5:8080")
+        self.assertPrinted("differs on port")
+        self.assertPrinted("--allow-different-targets")
+
+    def test_allow_different_targets_proceeds_with_a_warning(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"],
+                                           forward_scheme="https")])
+
+        self._merge(client, host_ids="13", allow_different_targets=True)
+
+        self.assertEqual(client.deleted_ids, [13])
+        self.assertPrinted("differs on scheme")
+        self.assertNotPrinted("Refusing to merge")
+
+    def test_an_unwritable_snapshot_stops_the_merge_before_the_first_delete(self):
+        # The snapshot is the only record of what the sources looked like, and
+        # the deletes are irreversible, so the ordering is the guarantee: no
+        # host is removed until its configuration is on disk.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        with mock.patch.object(npm_api, "write_merge_snapshot",
+                               side_effect=OSError("Read-only file system")):
+            exit_exc = self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Read-only file system")
+        self.assertPrinted("Refusing to delete hosts")
+
+
+class TestHostMergeOrdering(_MergeCommandTestCase):
+    """Delete first, then extend the target, one source at a time.
+
+    NPM will not let two hosts hold the same domain name, so the name has to be
+    free before the target can claim it. Doing it per source rather than in one
+    pass means a failure strands one host instead of all of them.
+    """
+
+    def test_each_source_is_deleted_before_the_target_takes_its_domains(self):
+        target = _merge_host(12, ["app.example.com"])
+        client = self._client(target, [_merge_host(13, ["a.example.com"]),
+                                       _merge_host(14, ["b.example.com"])])
+
+        self._merge(client, host_ids="13,14")
+
+        self.assertEqual(client.kinds, ["delete", "update", "delete", "update"])
+        self.assertEqual(client.deleted_ids, [13, 14])
+
+    def test_the_target_grows_one_source_at_a_time(self):
+        target = _merge_host(12, ["app.example.com"])
+        client = self._client(target, [_merge_host(13, ["a.example.com"]),
+                                       _merge_host(14, ["b.example.com"])])
+
+        self._merge(client, host_ids="13,14")
+
+        self.assertEqual([payload["domain_names"] for _, payload in client.updates],
+                         [["app.example.com", "a.example.com"],
+                          ["app.example.com", "a.example.com", "b.example.com"]])
+
+    def test_every_update_is_aimed_at_the_into_host(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"]),
+                               _merge_host(14, ["b.example.com"])])
+
+        self._merge(client, host_ids="13,14")
+
+        self.assertEqual([host_id for host_id, _ in client.updates], [12, 12])
+
+    def test_the_union_is_target_first_and_deduped(self):
+        # A domain carried by two sources, and one spelled in another case, both
+        # have to collapse: NPM would otherwise store the same name twice on one
+        # host and nginx would serve whichever server_name it saw first.
+        target = _merge_host(12, ["app.example.com", "www.example.com"])
+        client = self._client(target, [
+            _merge_host(13, ["dup.example.com", "APP.example.com"]),
+            _merge_host(14, ["dup.example.com", "last.example.com"]),
+        ])
+
+        self._merge(client, host_ids="13,14")
+
+        _, final = client.updates[-1]
+        self.assertEqual(final["domain_names"],
+                         ["app.example.com", "www.example.com", "dup.example.com",
+                          "last.example.com"])
+
+
+class TestHostMergeCertificate(_MergeCommandTestCase):
+    """One NPM host is one nginx server block with one certificate, so the
+    merged host's certificate has to cover every domain in the result."""
+
+    _CERT = {"id": 4, "domain_names": ["*.example.com"],
+             "expires_on": _expires_in(timedelta(days=90))}
+
+    def test_omitting_cert_inherits_the_targets_certificate(self):
+        target = _merge_host(12, ["app.example.com"], certificate_id=4)
+        client = self._client(target, [_merge_host(13, ["old.example.com"])],
+                              certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        _, payload = client.updates[0]
+        self.assertEqual(payload["certificate_id"], 4)
+        self.assertEqual(client.cert_lookups, [4])
+
+    def test_omitting_cert_leaves_the_ssl_flags_alone(self):
+        # Nothing about the certificate is changing, so ssl_forced and HSTS are
+        # not in the payload at all and update_host carries the target's current
+        # values through untouched.
+        target = _merge_host(12, ["app.example.com"], certificate_id=4,
+                             ssl_forced=True, hsts_enabled=True)
+        client = self._client(target, [_merge_host(13, ["old.example.com"])],
+                              certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        _, payload = client.updates[0]
+        self.assertNotIn("ssl_forced", payload)
+        self.assertNotIn("hsts_enabled", payload)
+
+    def test_cert_overrides_the_targets_certificate(self):
+        target = _merge_host(12, ["app.example.com"], certificate_id=4)
+        client = self._client(target, [_merge_host(13, ["old.example.com"])],
+                              certificate=dict(self._CERT, id=5))
+
+        self._merge(client, host_ids="13", cert="5")
+
+        _, payload = client.updates[0]
+        self.assertEqual(payload["certificate_id"], 5)
+        self.assertEqual(client.cert_lookups, [5])
+
+    def test_cert_none_also_clears_force_ssl_and_hsts(self):
+        # An SSL-forced host with no certificate is strictly worse than plain
+        # HTTP: NPM renders the redirect to https:// but omits the whole
+        # `listen 443 ssl` block, so every request bounces to a port nothing is
+        # listening on.
+        target = _merge_host(12, ["app.example.com"], certificate_id=4,
+                             ssl_forced=True, hsts_enabled=True)
+        client = self._client(target, [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13", cert="none")
+
+        _, payload = client.updates[0]
+        self.assertIsNone(payload["certificate_id"])
+        self.assertIs(payload["ssl_forced"], False)
+        self.assertIs(payload["hsts_enabled"], False)
+
+    def test_a_certificate_that_does_not_exist_stops_the_merge(self):
+        # The failure mode this whole tool was written to prevent, in its worst
+        # form. NPM wraps the entire `listen 443 ssl` block in a conditional on
+        # the linked certificate, so a host pointed at an ID that is not there
+        # is rendered with no TLS listener at all and reports no error.
+        #
+        # validate_certificate_assignment returns False for exactly this case,
+        # and merge originally ignored the return: it printed the refusal, then
+        # deleted the sources anyway and pointed the survivor at the dead ID.
+        # Irreversible, silent, and reported as a success.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        exit_exception = self._merge_expecting_exit(client, host_ids="13", cert="99")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Certificate 99 does not exist")
+
+    def test_an_inherited_certificate_that_is_gone_also_stops_the_merge(self):
+        # Same refusal when the dead ID came from the --into host rather than
+        # from --cert. Merge is actively reassigning that certificate to a
+        # larger set of domains, so "the target already had it" does not make
+        # writing it again safe.
+        target = _merge_host(12, ["app.example.com"], certificate_id=4)
+        client = self._client(target, [_merge_host(13, ["old.example.com"])])
+
+        exit_exception = self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("--cert none")
+
+    def test_cert_none_needs_no_certificate_lookup(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13", cert="none")
+
+        self.assertEqual(client.cert_lookups, [])
+
+    def test_sources_serving_https_today_are_named_when_the_target_has_none(self):
+        # Their domains silently drop to HTTP-only, which no other message in
+        # the run would mention.
+        target = _merge_host(12, ["app.example.com"], certificate_id=None)
+        client = self._client(target, [_merge_host(13, ["old.example.com"],
+                                                   certificate_id=7)])
+
+        self._merge(client, host_ids="13")
+
+        self.assertPrinted("serve HTTPS today")
+        self.assertPrinted("HTTP-only")
+
+
+class TestHostMergeFailures(_MergeCommandTestCase):
+    """One source failing must not abandon the rest, and must not exit 0."""
+
+    def test_a_refused_delete_leaves_the_target_alone_for_that_source(self):
+        # delete_host reports a refusal by returning False rather than raising,
+        # so a caller testing only for exceptions would go on to hand the
+        # target a domain the source still holds and NPM would reject it.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"]),
+                               _merge_host(14, ["b.example.com"])],
+                              delete_refuse_ids={13})
+
+        exit_exc = self._merge_expecting_exit(client, host_ids="13,14")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.kinds, ["delete", "delete", "update"])
+        _, payload = client.updates[0]
+        self.assertEqual(payload["domain_names"], ["app.example.com", "b.example.com"])
+        self.assertPrinted("NPM refused the delete")
+
+    def test_a_failed_delete_is_not_rolled_back(self):
+        # Nothing was destroyed, so there is nothing to recreate; calling the
+        # rollback here would duplicate a host that still exists.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"])],
+                              delete_error_ids={13})
+
+        exit_exc = self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.kinds, ["delete"])
+        self.assertPrinted("could not delete")
+
+    def test_a_rejected_update_recreates_the_source_and_carries_on(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"]),
+                               _merge_host(14, ["b.example.com"])],
+                              update_fail_calls={1})
+
+        exit_exc = self._merge_expecting_exit(client, host_ids="13,14")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.kinds,
+                         ["delete", "update", "create", "delete", "update"])
+        self.assertEqual(client.recreated_ids, [13])
+
+    def test_a_rolled_back_source_does_not_leak_into_later_updates(self):
+        # Host 13's domains never reached the target, so the second update must
+        # ask for the target's own names plus host 14's and nothing else —
+        # otherwise it would claim a name the recreated host now holds.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"]),
+                               _merge_host(14, ["b.example.com"])],
+                              update_fail_calls={1})
+
+        self._merge_expecting_exit(client, host_ids="13,14")
+
+        _, second = client.updates[1]
+        self.assertEqual(second["domain_names"], ["app.example.com", "b.example.com"])
+
+    def test_an_npm_error_from_the_update_is_caught_like_an_http_error(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"])],
+                              update_fail_calls={1},
+                              error=npm_api.NPMError("NPM is unreachable"))
+
+        exit_exc = self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.recreated_ids, [13])
+        self.assertPrinted("NPM is unreachable")
+
+    def test_a_failed_rollback_names_the_lost_domains_and_the_snapshot(self):
+        # The host is gone, its domains answer nothing, and the snapshot is the
+        # only surviving copy of its configuration. Both facts have to be in the
+        # same message, because that is the one the operator acts on.
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com", "alias.example.com"])],
+                              update_fail_calls={1},
+                              restore_error=_npm_http_error(500, "Internal Error"))
+
+        self._merge_expecting_exit(client, host_ids="13")
+
+        self.assertPrinted("ROLLBACK FAILED")
+        lost = [line for line in self.console.lines if "not being served" in line]
+        self.assertEqual(len(lost), 1, self.console.text)
+        self.assertIn("a.example.com, alias.example.com", lost[0])
+        self.assertIn("pre_merge_12_", lost[0])
+        self.assertIn(str(self.workdir), lost[0])
+
+    def test_partial_failure_exits_1_with_the_other_sources_merged(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["a.example.com"]),
+                               _merge_host(14, ["b.example.com"])],
+                              delete_error_ids={13})
+
+        exit_exc = self._merge_expecting_exit(client, host_ids="13,14")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.updates and client.updates[-1][1]["domain_names"],
+                         ["app.example.com", "b.example.com"])
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+
+class TestHostMergeCleanRun(_MergeCommandTestCase):
+    """The ordinary path: nothing fails, nothing is refused, exit 0."""
+
+    def test_a_clean_run_returns_normally(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13")
+
+        self.assertEqual(client.kinds, ["delete", "update"])
+        self.assertPrinted("Successful: 1")
+        self.assertNotPrinted("Failed:")
+
+    def test_the_resulting_domain_list_is_reported(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13")
+
+        self.assertPrinted("Host 12 now serves: app.example.com, old.example.com")
+
+    def test_the_run_leaves_a_snapshot_on_disk(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13")
+
+        written = list(self.workdir.glob("pre_merge_12_*.json"))
+        self.assertEqual(len(written), 1, written)
+        self.assertEqual(_mode(written[0]), 0o600)
+        self.assertEqual(
+            [source["id"] for source in json.loads(written[0].read_text())["sources"]],
+            [13])
+
+    def test_the_preview_announces_the_deletes_before_they_happen(self):
+        client = self._client(_merge_host(12, ["app.example.com"]),
+                              [_merge_host(13, ["old.example.com"])])
+
+        self._merge(client, host_ids="13", preview=True)
+
+        self.assertPrinted("Merge Preview")
+        self.assertPrinted("Deleting host(s) 13")
+        self.assertPrinted("no way to undo")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 - 👥 User management
 - 🛡️ Access list management
 - 📦 Bulk operations (add/remove/replace domains across multiple hosts)
-- ✂️ Split and clone hosts so each domain can carry its own certificate
+- ✂️ Split, clone and merge hosts so each domain can carry its own certificate
 - 🧾 JSON output (`--json`) for scripting and `jq`
 - 💾 Full backup of hosts, certificates, access lists, users and settings
 - 🔐 Secure credential handling via environment variables or config files
@@ -139,6 +139,7 @@ npm-api acl --help          Access list management
 | `host create <domain> -i <ip> -p <port>` | Create new host |
 | `host clone <id> --domain <domain>` | Copy a host to new domains |
 | `host split <glob> --cert <cert_id>` | Move matching domains onto new hosts |
+| `host merge --into <id>` | Fold hosts into one, deleting the sources |
 | `host delete <id>` | Delete a host |
 | `host enable <id>` | Enable a host |
 | `host disable <id>` | Disable a host |
@@ -159,6 +160,7 @@ Commands that write to more than one host take a selector, and all but
 | Command | Selectors |
 |---------|-----------|
 | `host split` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host merge` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-update` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-add-domain` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
@@ -256,6 +258,67 @@ npm-api host clone 42 --domain plain.example.com --cert none
 clone always needs new ones. `--cert` is optional and inherits the source's
 certificate when omitted. Wildcard domains, and domains already claimed by
 another host, are rejected.
+
+## Merging Hosts
+
+`host merge` is the inverse of `host split`: it folds several hosts into one
+and **deletes the sources**. Useful when a set of names that were separated
+turn out to belong together — same backend, one certificate that covers all of
+them.
+
+```bash
+# 1. Always back up first
+npm-api backup
+
+# 2. Preview: fold hosts 13 and 14 into host 12
+npm-api host merge --into 12 --ids 13,14
+```
+
+The `--into` host is kept whole and supplies **every** setting. The others
+contribute their domain names and nothing else — their certificate, force SSL,
+HSTS, websockets, caching, access list, advanced config and custom locations
+are all discarded in favour of the target's. The preview names, per source,
+exactly which of those settings differ and will therefore change behaviour for
+the domains moving across.
+
+> **Read this before merging.** One NPM host is one nginx `server` block with
+> one `ssl_certificate`. Merging is precisely how a host ends up answering to
+> names its certificate does not cover — the problem `host split` exists to
+> undo. Merge checks the resulting domain list against the certificate and
+> warns about every name it does not cover, but it cannot know what an uploaded
+> certificate really contains, so check the warnings yourself.
+
+```bash
+# Give the merged host a certificate that covers the whole union
+npm-api host merge --into 12 --ids 13,14 --cert 6
+
+# Or merge them as plain HTTP, to fix the certificate afterwards
+npm-api host merge --into 12 --ids 13,14 --cert none
+```
+
+`--cert` is optional and inherits the target's certificate when omitted.
+`--cert none` also clears `ssl_forced` and `hsts_enabled`, because a host that
+forces SSL with no certificate redirects to an HTTPS listener NPM never
+renders — strictly worse than plain HTTP.
+
+**Safety behaviour:**
+
+- The `--into` host is **never** deleted, even when `--pattern` also matches it.
+- A source that forwards somewhere else — different scheme, host or port —
+  **stops the merge**, because its domains would silently start reaching a
+  different backend. Pass `--allow-different-targets` if that is intended.
+- A certificate that no longer exists stops the merge outright rather than
+  producing a survivor with no TLS listener.
+- Before the first delete, the full configuration of every host involved is
+  written to `pre_merge_<id>_<timestamp>.json` in the backup directory, mode
+  `0600`. If the merge cannot write that file, it refuses to run.
+- Sources are deleted **one at a time**, each immediately followed by adding
+  its domains to the target — NPM will not let two hosts hold the same domain,
+  so the name has to be freed first. If the target then rejects the update, the
+  source is recreated; a failed recreate prints the snapshot path.
+- A recreated source comes back under a **new ID**. NPM assigns IDs on create
+  and offers no way to ask for a particular one.
+- The command exits non-zero if any source failed.
 
 ## Bulk Operations
 

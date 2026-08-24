@@ -2194,7 +2194,12 @@ def host_clone(
         table.add_row("Advanced config", "yes" if target.get("advanced_config") else "no")
         console.print(table)
 
-    validate_certificate_assignment(client, cert_id, [{"id": "new", "domain_names": domains}])
+    if not validate_certificate_assignment(
+            client, cert_id, [{"id": "new", "domain_names": domains}]):
+        console.print("[red]   Refusing to clone: the new host would be rendered with no "
+                      "TLS listener. Name an existing certificate with --cert, or "
+                      "--cert none to create it HTTP-only.[/red]")
+        raise typer.Exit(1)
 
     confirm_bulk(yes, "Create this host?")
 
@@ -2315,9 +2320,13 @@ def host_split(
         console.print(table)
         console.print(f"\n[cyan]Total hosts to split: [yellow]{len(plans)}[/yellow][/cyan]")
 
-    validate_certificate_assignment(
-        client, cert_id,
-        [{"id": p["id"], "domain_names": p["moving"]} for p in plans])
+    if not validate_certificate_assignment(
+            client, cert_id,
+            [{"id": p["id"], "domain_names": p["moving"]} for p in plans]):
+        console.print("[red]   Refusing to split: the new hosts would be rendered with no "
+                      "TLS listener. Name an existing certificate with --cert, or "
+                      "--cert none to create them HTTP-only.[/red]")
+        raise typer.Exit(1)
 
     # A split only fixes the half that moves. Warn when the half left behind
     # keeps a certificate that no longer exists, since NPM renders those hosts
@@ -2381,6 +2390,312 @@ def host_split(
             success_count += 1
 
     print_bulk_summary(success_count, error_count, skipped)
+
+
+# Where a merged host's traffic ends up. A source pointing somewhere else would
+# have its domains silently repointed at the target's backend, so a difference
+# here stops the merge rather than merely warning about it.
+MERGE_TARGET_FIELDS = (
+    ("forward_scheme", "scheme"),
+    ("forward_host", "host"),
+    ("forward_port", "port"),
+)
+
+# Settings that belong to a source and are discarded when its domains move onto
+# the target. Each is a real behaviour change for those domains, so the preview
+# names them — but none is refused over, because adopting the target's
+# configuration is precisely what --into asks for.
+MERGE_NOTABLE_FIELDS = (
+    ("enabled", "enabled"),
+    ("certificate_id", "certificate"),
+    ("ssl_forced", "force SSL"),
+    ("hsts_enabled", "HSTS"),
+    ("http2_support", "HTTP/2"),
+    ("allow_websocket_upgrade", "websockets"),
+    ("block_exploits", "block exploits"),
+    ("caching_enabled", "caching"),
+    ("access_list_id", "access list"),
+    ("advanced_config", "advanced config"),
+    ("locations", "custom locations"),
+)
+
+
+def _comparable(value: Any) -> Any:
+    """Fold NPM's mix of 0/1, true/false and null into comparable values.
+
+    The API returns booleans for some flags and integers for others, and uses
+    both 0 and null to mean "nothing linked", so a plain != reports differences
+    that are not really there.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    return 0 if value is None else value
+
+
+def _forward_label(host: Dict) -> str:
+    """Render a host's upstream as scheme://host:port"""
+    return (f"{host.get('forward_scheme')}://{host.get('forward_host')}"
+            f":{host.get('forward_port')}")
+
+
+def describe_host_differences(target: Dict, source: Dict) -> List[str]:
+    """Name the settings a source's domains lose by moving onto the target"""
+    differences = []
+    for key, label in MERGE_NOTABLE_FIELDS:
+        if key == "locations":
+            left, right = len(target.get(key) or []), len(source.get(key) or [])
+        elif key == "advanced_config":
+            left = str(target.get(key) or "").strip()
+            right = str(source.get(key) or "").strip()
+        else:
+            left, right = _comparable(target.get(key)), _comparable(source.get(key))
+        if left != right:
+            differences.append(label)
+    return differences
+
+
+def write_merge_snapshot(config: Config, target: Dict, sources: List[Dict]) -> Path:
+    """Record every host a merge touches, before the first delete.
+
+    A merge deletes hosts and NPM has no undo. The rollback below can only
+    recreate a source under a *new* ID, and cannot run at all if the process is
+    killed partway through. This file is the floor under both: whatever
+    happens, the original configuration is still on disk.
+    """
+    directory = Path(config.backup_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
+    path = directory / f"pre_merge_{target.get('id')}_{stamp}.json"
+    payload = {"created": stamp, "target": target, "sources": sources}
+    # 0600 like the rest of what this tool writes: advanced_config can carry
+    # auth headers and internal hostnames, and this holds them for every host
+    # involved.
+    return write_secret(path, json.dumps(payload, indent=2))
+
+
+def _restore_merge_source(client: NPMClient, source: Dict, snapshot: Path) -> None:
+    """Recreate a source host whose domains the target then refused.
+
+    It comes back under a *new* ID: NPM assigns IDs on create and offers no way
+    to ask for a particular one. Anything referring to the old ID — a script, a
+    note, the snapshot file — needs updating by hand.
+    """
+    source_id = source.get("id")
+    try:
+        restored = client.create_host_from(source, {})
+    except (requests.HTTPError, NPMError) as exc:
+        console.print(f"     [red]‼ ROLLBACK FAILED: {format_http_error(exc)}[/red]")
+        console.print(f"     [red]‼ Host {source_id} is gone and its domains "
+                      f"({', '.join(str(d) for d in source.get('domain_names', []))}) "
+                      f"are not being served. Its full configuration is in "
+                      f"{snapshot}[/red]")
+        return
+    console.print(f"     [green]↩ Host {source_id} recreated as host "
+                  f"{restored.get('id')} — NPM assigns a new ID on create[/green]")
+
+
+@host_app.command("merge")
+def host_merge(
+    into: int = typer.Option(..., "--into",
+                             help="Host ID to keep; it supplies every setting"),
+    host_ids: str = typer.Option(None, "--ids", "-i",
+                                 help="Comma-separated IDs of hosts to merge in and delete"),
+    pattern: str = typer.Option(None, "--pattern", "-p",
+                                help="Merge in every host matching this domain pattern"),
+    cert: Optional[str] = typer.Option(None, "--cert",
+                                       help="Certificate for the merged host, or 'none'. "
+                                            "Defaults to the --into host's"),
+    allow_different_targets: bool = typer.Option(
+        False, "--allow-different-targets",
+        help="Merge even when a source forwards somewhere else"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    interactive: bool = typer.Option(False, "--interactive", "-I",
+                                     help="Interactively select hosts"),
+):
+    """
+    Fold several proxy hosts into one, deleting the sources.
+
+    The --into host is kept whole and supplies every setting; the others
+    contribute their domain names and nothing else. This is the inverse of
+    split, and it carries the opposite risk: one NPM host is one nginx server
+    block with one certificate, so every domain in the result has to be covered
+    by that single certificate or it will not serve over HTTPS.
+
+    Examples:
+        host merge --into 12 --ids 13,14
+        host merge --into 12 --pattern old.example.com
+    """
+    client = get_client()
+
+    try:
+        target = client.get_host(into)
+    except requests.HTTPError:
+        console.print(f"[red]❌ Host ID {into} not found[/red]")
+        raise typer.Exit(1)
+
+    sources = select_hosts(client, host_ids, pattern, interactive)
+    if not sources:
+        console.print("[yellow]No hosts selected for processing[/yellow]")
+        return
+
+    # Dropped rather than refused: --pattern will routinely match the target as
+    # well, and deleting the host that was meant to survive is the one outcome
+    # merge must never produce.
+    if any(h.get("id") == into for h in sources):
+        console.print(f"[dim]Host {into} is the merge target; not merging it "
+                      f"into itself[/dim]")
+        sources = [h for h in sources if h.get("id") != into]
+
+    if not sources:
+        console.print(f"[yellow]Nothing left to merge into host {into}[/yellow]")
+        return
+
+    mismatched = [(s, [label for key, label in MERGE_TARGET_FIELDS
+                       if _comparable(target.get(key)) != _comparable(s.get(key))])
+                  for s in sources]
+    mismatched = [(s, d) for s, d in mismatched if d]
+
+    if mismatched:
+        colour = "yellow" if allow_different_targets else "red"
+        mark = "⚠️ " if allow_different_targets else "❌"
+        for source, differing in mismatched:
+            console.print(f"[{colour}]{mark} Host {source.get('id')} forwards to "
+                          f"{_forward_label(source)}, host {into} forwards to "
+                          f"{_forward_label(target)} — differs on "
+                          f"{', '.join(differing)}[/{colour}]")
+        if not allow_different_targets:
+            console.print("[red]Refusing to merge: those domains would start reaching a "
+                          "different backend. Pass --allow-different-targets if that is "
+                          "what you want.[/red]")
+            raise typer.Exit(1)
+
+    merged_domains = dedupe_domains(
+        [str(d) for d in target.get("domain_names", [])]
+        + [str(d) for source in sources for d in source.get("domain_names", [])])
+
+    if cert is None:
+        cert_id = target.get("certificate_id") or None
+        cert_note = f"{cert_id or 'none'} (inherited from host {into})"
+    else:
+        cert_id = _parse_cert_option(cert)
+        cert_note = str(cert_id or "none")
+
+    if preview:
+        console.print(f"\n[cyan]📋 Merge Preview[/cyan]")
+        console.print(f"[cyan]   Keeping [yellow]host {into}[/yellow] "
+                      f"({', '.join(target.get('domain_names', []))}) → "
+                      f"{_forward_label(target)}[/cyan]\n")
+
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Merging in", style="yellow", justify="right")
+        table.add_column("Domains", style="green")
+        table.add_column("Forwards to", style="white")
+        table.add_column("Settings discarded", style="magenta")
+
+        for source in sources:
+            table.add_row(
+                str(source.get("id")),
+                ", ".join(source.get("domain_names", [])) or "(none)",
+                _forward_label(source),
+                ", ".join(describe_host_differences(target, source)) or "—",
+            )
+        console.print(table)
+
+        console.print(f"\n[cyan]   Resulting domains on host {into} "
+                      f"([yellow]{len(merged_domains)}[/yellow]): "
+                      f"{', '.join(merged_domains)}[/cyan]")
+        console.print(f"[cyan]   Certificate: [yellow]{cert_note}[/yellow][/cyan]")
+        console.print(f"\n[red]   Deleting host(s) "
+                      f"{', '.join(str(s.get('id')) for s in sources)} — NPM offers no "
+                      f"way to undo that[/red]")
+
+    # Checked, not just reported. Merge is the only command here that deletes a
+    # host, so pointing the survivor at a certificate NPM no longer has would
+    # take the sources' domains off the air with nothing left to restore them
+    # from but the snapshot file.
+    if not validate_certificate_assignment(
+            client, cert_id, [{"id": into, "domain_names": merged_domains}]):
+        console.print(f"[red]   Refusing to merge: host {into} would be left serving "
+                      f"{len(merged_domains)} domain(s) with no TLS listener. Name an "
+                      f"existing certificate with --cert, or --cert none to merge them "
+                      f"HTTP-only.[/red]")
+        raise typer.Exit(1)
+
+    if cert_id is None:
+        losing_tls = [str(s.get("id")) for s in sources if s.get("certificate_id")]
+        if losing_tls:
+            console.print(f"[yellow]⚠️  Host(s) {', '.join(losing_tls)} serve HTTPS today; "
+                          f"host {into} has no certificate, so their domains become "
+                          f"HTTP-only[/yellow]")
+
+    confirm_bulk(yes, f"Merge {len(sources)} host(s) into host {into} and delete them?")
+
+    try:
+        snapshot = write_merge_snapshot(client.config, target, sources)
+    except OSError as exc:
+        console.print(f"[red]❌ Could not write the pre-merge snapshot: {exc}[/red]")
+        console.print("[red]   Refusing to delete hosts whose configuration was not "
+                      "recorded first[/red]")
+        raise typer.Exit(1)
+    console.print(f"[dim]Pre-merge snapshot: {snapshot}[/dim]")
+
+    updates: Dict[str, Any] = {"certificate_id": cert_id}
+    if cert_id is None:
+        # An SSL-forced host with no certificate redirects to an HTTPS listener
+        # that NPM never renders — strictly worse than plain HTTP.
+        updates["ssl_forced"] = False
+        updates["hsts_enabled"] = False
+
+    applied = [str(d) for d in target.get("domain_names", [])]
+    success_count = 0
+    error_count = 0
+
+    with console.status("[bold green]Merging hosts...") as status:
+        for source in sources:
+            source_id = source.get("id")
+            incoming = [str(d) for d in source.get("domain_names", [])]
+            status.update(f"[bold green]Merging host {source_id}...")
+
+            # Delete before extending the target, not after: NPM will not let
+            # two hosts hold the same domain, so the name has to be free before
+            # the target can claim it. One source at a time, so a failure
+            # strands a single host rather than all of them.
+            try:
+                deleted = client.delete_host(source_id)
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Host {source_id}: could not delete — "
+                              f"{format_http_error(exc)}[/red]")
+                error_count += 1
+                continue
+            if not deleted:
+                console.print(f"  [red]❌ Host {source_id}: NPM refused the delete[/red]")
+                error_count += 1
+                continue
+
+            candidate = dedupe_domains(applied + incoming)
+            try:
+                client.update_host(into, dict(updates, domain_names=candidate))
+            except (requests.HTTPError, NPMError) as exc:
+                console.print(f"  [red]❌ Host {source_id}: deleted, but host {into} would "
+                              f"not take its domains — {format_http_error(exc)}[/red]")
+                _restore_merge_source(client, source, snapshot)
+                error_count += 1
+                continue
+
+            applied = candidate
+            console.print(f"  [green]✅ Host {source_id} merged into {into} "
+                          f"({', '.join(incoming)})[/green]")
+            success_count += 1
+
+    if success_count:
+        console.print(f"\n[green]Host {into} now serves: {', '.join(applied)}[/green]")
+        if cert_id:
+            console.print(f"[dim]All of them via certificate {cert_id} alone; any domain "
+                          f"it does not cover will fail TLS.[/dim]")
+
+    print_bulk_summary(success_count, error_count)
 
 
 @host_app.command("ssl-enable")
