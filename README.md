@@ -287,9 +287,34 @@ the domains moving across.
 > **Read this before merging.** One NPM host is one nginx `server` block with
 > one `ssl_certificate`. Merging is precisely how a host ends up answering to
 > names its certificate does not cover — the problem `host split` exists to
-> undo. Merge checks the resulting domain list against the certificate and
-> warns about every name it does not cover, but it cannot know what an uploaded
-> certificate really contains, so check the warnings yourself.
+> undo.
+
+Merge checks the result two ways, because the first one goes quiet exactly
+where it matters most:
+
+- Against the **certificate's** recorded domains, naming every host name it
+  does not cover. NPM keeps that list as free-form metadata it never consults
+  when serving, so for uploaded certificates it is routinely unusable and the
+  check can only report "coverage not verified".
+- Against the **domain names themselves**, warning when the merged host would
+  answer to more than one base domain. This needs no certificate metadata at
+  all, so it still fires on uploaded certificates:
+
+```
+⚠️  Host 12 will answer to 2 unrelated base domains: example.com, internal.lan
+   One NPM host is one nginx server block with one certificate, so a single
+   certificate has to cover every one of them.
+```
+
+Both are advisory — a multi-SAN certificate covering several bases is perfectly
+valid, and the tool cannot tell that apart from a mistake. Neither blocks the
+merge; the confirmation prompt is where you decide.
+
+**Sources are deleted, not disabled.** NPM enforces domain uniqueness at the
+API layer and does not care whether a host is enabled — adding a name another
+host holds returns `HTTP 400: <domain> is already in use`. So a source's names
+have to be freed before the target can claim them, and disabling would not free
+them. The `pre_merge_*.json` snapshot exists because of this.
 
 ```bash
 # Give the merged host a certificate that covers the whole union

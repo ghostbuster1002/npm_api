@@ -213,6 +213,27 @@ relevant section below.
 
 ### Fixed
 
+- `host merge` and `host clone` now also warn when the resulting host would
+  answer to more than one base domain, checked against the domain names
+  themselves rather than against the certificate's metadata. The existing
+  coverage check consults `domain_names` on the certificate, which NPM keeps as
+  free-form metadata it never uses when serving — for uploaded certificates it
+  is routinely unusable, so the check degraded to a dim "coverage not verified"
+  note printed directly beneath a green `VALID`. That is precisely the case
+  where merging recreates the dual-domain fault `host split` exists to undo, so
+  the reassuring output appeared exactly when the warning was most needed. The
+  new check needs no certificate metadata and is advisory: a multi-SAN
+  certificate spanning several bases is legitimate.
+- The certificate status line now reads `expiry: ✅ VALID` rather than a bare
+  `✅ VALID`, which sat immediately above the coverage warnings and read as an
+  endorsement of the whole assignment rather than a statement about the date.
+- `warn_on_mixed_bases` folded no case, so one base domain spelled two ways —
+  `App.Example.com` and `api.example.com` — was reported as *"2 unrelated base
+  domains: Example.com, example.com"*. DNS is case-insensitive and NPM stores
+  whatever was typed, and `dedupe_domains` keeps the first spelling rather than
+  a normalised one, so mixed spellings of one base are routine. Case is now
+  folded at the comparison, as it already was everywhere else in the tool; the
+  false alarm mattered because the warning's value depends on firing rarely.
 - `host clone` and `host split` called `validate_certificate_assignment` but
   ignored its return value, so the one case it treats as fatal — a certificate
   ID that no longer exists — printed a red refusal and then went ahead anyway.

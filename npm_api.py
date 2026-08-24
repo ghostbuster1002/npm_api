@@ -2444,6 +2444,58 @@ def domain_prefix(domain: str) -> Optional[str]:
     return ".".join(parts[:-2])
 
 
+def domain_base(domain: str) -> Optional[str]:
+    """The registrable base of a domain name — its last two labels.
+
+    "ex.example.com" -> "example.com", "example.com" -> "example.com",
+    "localhost" -> None.
+
+    The complement of domain_prefix, and assumes the same two-label base, so a
+    multi-part suffix such as .co.uk reads as "co.uk". Enough to notice that a
+    host answers to two unrelated names; not a public-suffix list.
+    """
+    parts = [p for p in domain.strip().strip(".").split(".") if p]
+    if len(parts) < 2:
+        return None
+    return ".".join(parts[-2:])
+
+
+def warn_on_mixed_bases(domains: List[str], subject: str) -> List[str]:
+    """Warn when one host would answer to more than one base domain.
+
+    Returns the bases found. One NPM host renders one nginx `server` block with
+    one `ssl_certificate`, so every name on it must be covered by that single
+    certificate. Two unrelated bases means either a multi-SAN certificate or a
+    name that will fail TLS — and the second is the exact fault `host split`
+    exists to undo.
+
+    Deliberately checked against the names themselves rather than against the
+    certificate's metadata. NPM keeps domain_names on a certificate as
+    free-form metadata it never consults when serving, so for uploaded
+    certificates it is routinely unusable and cert_covers_domain returns "cannot
+    tell" — which is precisely the case where this warning is worth the most.
+    """
+    # Folded here rather than inside domain_base, which stays a plain "last two
+    # labels" like domain_prefix. DNS is case-insensitive and NPM stores
+    # whatever was typed, so one base routinely arrives spelled several ways —
+    # dedupe_domains keeps the first spelling it sees, not a normalised one.
+    # Comparing raw made "App.Example.com" and "api.example.com" two "unrelated
+    # base domains", a false alarm on a warning whose whole value is that it
+    # fires rarely. Every other domain comparison in this tool folds case too.
+    bases = sorted({b for b in (domain_base(d.lower()) for d in domains) if b})
+    if len(bases) < 2:
+        return bases
+
+    console.print(f"\n[yellow]⚠️  {subject} will answer to {len(bases)} unrelated base "
+                  f"domains: {', '.join(bases)}[/yellow]")
+    console.print(f"[yellow]   One NPM host is one nginx server block with one "
+                  f"certificate, so a single certificate has to cover every one of "
+                  f"them. Verify that it does — a host answering to a name its "
+                  f"certificate omits is the dual-domain fault `host split` "
+                  f"undoes.[/yellow]")
+    return bases
+
+
 def dedupe_domains(domains: List[str]) -> List[str]:
     """Drop repeats case-insensitively, keeping first occurrence and order.
 
@@ -2520,8 +2572,11 @@ def validate_certificate_assignment(client: NPMClient, cert_id: Optional[int],
     # key is absent. Joining None raised here, inside the guard meant to stop a
     # host being pointed at a certificate that cannot serve it.
     recorded = ", ".join(cert.get("domain_names") or []) or "empty"
+    # "expiry:" because the label only ever describes the expiry date. Printed
+    # bare, a green "✅ VALID" sits directly above the coverage warnings and
+    # reads as an endorsement of the whole assignment.
     console.print(f"\n[cyan]🔒 Certificate {cert_id}[/cyan] ({recorded}) "
-                  f"— {cert_status_label(cert)}")
+                  f"— expiry: {cert_status_label(cert)}")
 
     unknown = False
     for host in hosts:
@@ -2654,6 +2709,9 @@ def host_clone(
                       "TLS listener. Name an existing certificate with --cert, or "
                       "--cert none to create it HTTP-only.[/red]")
         raise typer.Exit(1)
+
+    if cert_id:
+        warn_on_mixed_bases(domains, "The new host")
 
     confirm_bulk(yes, "Create this host?")
 
@@ -3058,6 +3116,9 @@ def host_merge(
                       f"HTTP-only.[/red]")
         raise typer.Exit(1)
 
+    if cert_id:
+        warn_on_mixed_bases(merged_domains, f"Host {into}")
+
     if cert_id is None:
         losing_tls = [str(s.get("id")) for s in sources if s.get("certificate_id")]
         if losing_tls:
@@ -3130,6 +3191,12 @@ def host_merge(
         if cert_id:
             console.print(f"[dim]All of them via certificate {cert_id} alone; any domain "
                           f"it does not cover will fail TLS.[/dim]")
+        # Repeated here, not only before the apply. NPM enforces domain
+        # uniqueness at the API layer regardless of whether a host is enabled
+        # ("<domain> is already in use", HTTP 400), so a source has to be
+        # deleted rather than disabled and this file is the only way back.
+        console.print(f"[dim]Deleted host(s) are in {snapshot} — recreate one with "
+                      f"`host create` if you need it back.[/dim]")
 
     print_bulk_summary(success_count, error_count)
 

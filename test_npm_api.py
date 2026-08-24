@@ -4053,5 +4053,377 @@ class TestRestoreCleanRun(_RestoreCommandTestCase):
         self.assertPrinted("app.example.com")
 
 
+# =============================================================================
+# domain_base
+# =============================================================================
+
+class TestDomainBase(unittest.TestCase):
+    """The registrable base of a name — the complement of domain_prefix.
+
+    Used to notice that one host would answer to two unrelated names, which is
+    a question about the names themselves and never about what a certificate
+    claims to cover.
+    """
+
+    def test_case_is_preserved(self):
+        # Pinned deliberately, to say where case folding lives. domain_base is
+        # a plain "last two labels" function and keeps whatever NPM stored,
+        # exactly as domain_prefix does; callers that compare bases fold case
+        # themselves, which is the convention every other domain comparison in
+        # the tool follows (dedupe_domains, cert_match_key, _domain_conflicts).
+        self.assertEqual(npm_api.domain_base("App.Example.COM"), "Example.COM")
+
+    def test_a_subdomain_reduces_to_its_base(self):
+        self.assertEqual(npm_api.domain_base("ex.example.com"), "example.com")
+
+    def test_an_apex_is_its_own_base(self):
+        self.assertEqual(npm_api.domain_base("example.com"), "example.com")
+
+    def test_a_deep_subdomain_still_reduces_to_two_labels(self):
+        self.assertEqual(npm_api.domain_base("a.b.c.example.com"), "example.com")
+
+    def test_a_single_label_has_no_base(self):
+        # "localhost" or a short internal name: there is no base to compare it
+        # against, and inventing one would put it beside real domains.
+        self.assertIsNone(npm_api.domain_base("localhost"))
+
+    def test_an_empty_string_has_no_base(self):
+        self.assertIsNone(npm_api.domain_base(""))
+
+    def test_dots_and_space_alone_have_no_base(self):
+        for given in (".", "...", "   ", " . "):
+            with self.subTest(given=given):
+                self.assertIsNone(npm_api.domain_base(given))
+
+    def test_trailing_dot_and_surrounding_space_ignored(self):
+        self.assertEqual(npm_api.domain_base("  ex.example.com.  "), "example.com")
+
+    def test_a_wildcard_label_does_not_change_the_base(self):
+        # A certificate's *.example.com and a host's app.example.com belong to
+        # the same base, which is the whole point of grouping by it.
+        self.assertEqual(npm_api.domain_base("*.example.com"), "example.com")
+
+    def test_empty_labels_are_ignored(self):
+        # A doubled dot is a typo NPM will happily store. Counting the empty
+        # label would make the base of "example..com" come back as ".com", and
+        # every differently mistyped name would then group under that same
+        # bogus base instead of being reported as the odd one out.
+        for given in ("a..b.example.com", "example..com", "a.example..com"):
+            with self.subTest(given=given):
+                self.assertEqual(npm_api.domain_base(given), "example.com")
+
+    def test_a_multipart_suffix_reads_as_the_suffix(self):
+        # Documented limitation, not a bug, and deliberately the same one
+        # domain_prefix carries: the registrable base is assumed to be two
+        # labels. Getting .co.uk right needs public-suffix data that neither
+        # this tool nor NPM has. Two hosts under .co.uk therefore look like one
+        # base to the mixed-base warning, which under-warns rather than
+        # over-warns — the safe direction for an advisory message.
+        self.assertEqual(npm_api.domain_base("ex.example.co.uk"), "co.uk")
+
+    def test_prefix_and_base_reassemble_the_original(self):
+        # The two functions split one name between them, so anything they
+        # disagree about is a name one of them is mis-reading.
+        for domain in ("ex.example.com", "sub.ex.example.com", "a.b.c.example.com",
+                       "*.example.com", "ex.example.co.uk"):
+            with self.subTest(domain=domain):
+                prefix = npm_api.domain_prefix(domain)
+                base = npm_api.domain_base(domain)
+                self.assertEqual(f"{prefix}.{base}", domain)
+
+    def test_an_apex_is_all_base_and_no_prefix(self):
+        self.assertIsNone(npm_api.domain_prefix("example.com"))
+        self.assertEqual(npm_api.domain_base("example.com"), "example.com")
+
+    def test_both_agree_a_single_label_has_neither(self):
+        self.assertIsNone(npm_api.domain_prefix("localhost"))
+        self.assertIsNone(npm_api.domain_base("localhost"))
+
+
+# =============================================================================
+# warn_on_mixed_bases
+# =============================================================================
+
+class TestWarnOnMixedBases(_ConsoleTestCase):
+    """Advisory only, and checked against the names rather than the certificate.
+
+    One NPM host is one nginx server block with one ssl_certificate, so every
+    name on it has to be covered by that one certificate. NPM keeps a
+    certificate's domain_names as free-form metadata it never consults when
+    serving, so for uploaded certificates it is routinely unusable and
+    cert_covers_domain answers "cannot tell" — which is exactly when this
+    warning earns its place, so it must not depend on that metadata.
+    """
+
+    def test_one_base_is_returned_quietly(self):
+        self.assertEqual(
+            npm_api.warn_on_mixed_bases(["app.example.com"], "Host 12"),
+            ["example.com"])
+        self.assertEqual(self.console.text, "")
+
+    def test_many_domains_on_one_base_stay_quiet(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["app.example.com", "api.example.com", "www.example.com", "example.com"],
+            "Host 12")
+
+        self.assertEqual(bases, ["example.com"])
+        self.assertEqual(self.console.text, "")
+
+    def test_one_base_spelled_two_ways_is_still_one_base(self):
+        # Regression. domain_base keeps NPM's spelling, and the set was built
+        # from its raw output, so "App.Example.com" and "api.example.com" came
+        # out as two entries and the warning fired on a perfectly good merge —
+        # reading "2 unrelated base domains: Example.com, example.com".
+        #
+        # Not contrived: DNS is case-insensitive and NPM stores whatever was
+        # typed, dedupe_domains keeps the *first* spelling it sees, and every
+        # other domain comparison here already folds case. A warning whose
+        # whole value is that it fires rarely cannot afford a false alarm.
+        bases = npm_api.warn_on_mixed_bases(
+            ["App.Example.com", "api.example.com", "WWW.EXAMPLE.COM"], "Host 12")
+
+        self.assertEqual(bases, ["example.com"])
+        self.assertEqual(self.console.text, "")
+
+    def test_case_folding_does_not_hide_a_genuine_second_base(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["App.Example.com", "nas.HOME.lan"], "Host 12")
+
+        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertPrinted("2 unrelated base domains")
+
+    def test_two_bases_are_both_returned_and_named(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["app.example.com", "nas.home.lan"], "Host 12")
+
+        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertPrinted("2 unrelated base domains")
+        self.assertPrinted("example.com, home.lan")
+
+    def test_the_warning_names_its_subject(self):
+        # Called from merge and from clone, which are talking about different
+        # things — the surviving host in one case, a host that does not exist
+        # yet in the other.
+        npm_api.warn_on_mixed_bases(["app.example.com", "nas.home.lan"], "The new host")
+        self.assertPrinted("The new host will answer to")
+
+    def test_the_warning_explains_the_single_certificate_constraint(self):
+        # The count alone is not actionable. What makes it act-on-able is that
+        # a host answering to a name its one certificate omits is precisely the
+        # fault `host split` exists to undo.
+        npm_api.warn_on_mixed_bases(["app.example.com", "nas.home.lan"], "Host 12")
+
+        self.assertPrinted("one nginx server block with one certificate")
+        self.assertPrinted("host split")
+
+    def test_the_bases_come_back_sorted(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["nas.home.lan", "app.example.com", "shop.internal.lan"], "Host 12")
+
+        self.assertEqual(bases, ["example.com", "home.lan", "internal.lan"])
+
+    def test_every_base_is_named_not_just_the_first_two(self):
+        npm_api.warn_on_mixed_bases(
+            ["nas.home.lan", "app.example.com", "shop.internal.lan"], "Host 12")
+
+        self.assertPrinted("3 unrelated base domains")
+        self.assertPrinted("example.com, home.lan, internal.lan")
+
+    def test_repeated_bases_collapse_to_one(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["app.example.com", "api.example.com", "example.com"], "Host 12")
+
+        self.assertEqual(bases, ["example.com"])
+
+    def test_domains_with_no_usable_base_are_dropped(self):
+        # A bare label has no base to compare, and counting it as one of its
+        # own would fire the warning on every host that happens to carry an
+        # internal short name.
+        bases = npm_api.warn_on_mixed_bases(
+            ["localhost", "app.example.com", "api.example.com"], "Host 12")
+
+        self.assertEqual(bases, ["example.com"])
+        self.assertEqual(self.console.text, "")
+
+    def test_an_unusable_domain_beside_two_real_bases_is_not_named(self):
+        bases = npm_api.warn_on_mixed_bases(
+            ["localhost", "app.example.com", "nas.home.lan"], "Host 12")
+
+        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertPrinted("2 unrelated base domains")
+        self.assertNotPrinted("localhost")
+
+    def test_only_unusable_domains_return_nothing_quietly(self):
+        self.assertEqual(
+            npm_api.warn_on_mixed_bases(["localhost", "intranet"], "Host 12"), [])
+        self.assertEqual(self.console.text, "")
+
+    def test_an_empty_list_returns_empty_and_says_nothing(self):
+        self.assertEqual(npm_api.warn_on_mixed_bases([], "Host 12"), [])
+        self.assertEqual(self.console.text, "")
+
+
+# =============================================================================
+# warn_on_mixed_bases: the merge and clone call sites
+# =============================================================================
+
+class _MixedBaseTestCase(_MergeCommandTestCase):
+    """Drives merge and clone far enough to see whether the warning fires.
+
+    Both call it only when a certificate is actually being assigned, so each
+    case has to be run with a real certificate behind the stub — otherwise the
+    absence of a warning proves nothing.
+    """
+
+    # Covers both bases used below, so the only warning a mixed-base test can
+    # produce is the one under test rather than a coverage complaint.
+    _CERT = {"id": 4, "domain_names": ["*.example.com", "*.home.lan"],
+             "expires_on": _expires_in(timedelta(days=90))}
+
+    _WARNING = "unrelated base domains"
+
+    def _clone(self, client, domains, **overrides):
+        options = dict(host_id=12, domains=list(domains), cert=None,
+                       forward_host=None, forward_port=None, preview=False, yes=True)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_clone(**options)
+
+
+class TestHostMergeMixedBases(_MixedBaseTestCase):
+    """Merge is where this was found: a host of *.home.lan names folded into one
+    of *.example.com names, under a single uploaded certificate whose metadata
+    was unusable enough that the coverage check could only shrug."""
+
+    def _hosts(self, source_domains):
+        return (_merge_host(12, ["app.example.com"], certificate_id=4),
+                [_merge_host(13, source_domains)])
+
+    def test_a_union_spanning_two_bases_warns_and_names_both(self):
+        target, sources = self._hosts(["nas.home.lan"])
+        client = self._client(target, sources, certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertPrinted(self._WARNING)
+        self.assertPrinted("example.com, home.lan")
+
+    def test_the_warning_is_about_the_whole_union_not_one_host(self):
+        # Neither host on its own spans two bases; only the result does, which
+        # is why the check runs on the merged list rather than per source.
+        target, sources = self._hosts(["nas.home.lan", "printer.home.lan"])
+        client = self._client(target, sources, certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertPrinted("2 unrelated base domains")
+
+    def test_a_union_on_one_base_does_not_warn(self):
+        target, sources = self._hosts(["old.example.com"])
+        client = self._client(target, sources, certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertNotPrinted(self._WARNING)
+
+    def test_the_warning_does_not_block_the_merge(self):
+        # Advisory, not a refusal: a multi-SAN certificate covering both bases
+        # is a legitimate setup, and only the operator can tell.
+        target, sources = self._hosts(["nas.home.lan"])
+        client = self._client(target, sources, certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertEqual(client.kinds, ["delete", "update"])
+        self.assertPrinted("Successful: 1")
+        self.assertNotPrinted("Failed:")
+
+    def test_cert_none_never_raises_the_question(self):
+        # No certificate is being assigned, so there is no single certificate
+        # for the names to have to fit inside and nothing to warn about.
+        target, sources = self._hosts(["nas.home.lan"])
+        client = self._client(target, sources)
+
+        self._merge(client, host_ids="13", cert="none")
+
+        self.assertNotPrinted(self._WARNING)
+        self.assertEqual(client.kinds, ["delete", "update"])
+
+
+class TestHostCloneMixedBases(_MixedBaseTestCase):
+    """The same question asked of a host that does not exist yet."""
+
+    def _source(self):
+        return _merge_host(12, ["app.example.com"], certificate_id=4)
+
+    def test_new_domains_spanning_two_bases_warn(self):
+        client = self._client(self._source(), [], certificate=self._CERT)
+
+        self._clone(client, ["shop.example.com", "nas.home.lan"])
+
+        self.assertPrinted(self._WARNING)
+        self.assertPrinted("example.com, home.lan")
+        self.assertPrinted("The new host")
+
+    def test_new_domains_on_one_base_do_not_warn(self):
+        client = self._client(self._source(), [], certificate=self._CERT)
+
+        self._clone(client, ["shop.example.com", "api.example.com"])
+
+        self.assertNotPrinted(self._WARNING)
+
+    def test_the_warning_is_about_the_new_domains_not_the_sources(self):
+        # The clone gets its own server block, so what the host it was copied
+        # from answers to has no bearing on whether the new one is coherent.
+        client = self._client(_merge_host(12, ["nas.home.lan"], certificate_id=4),
+                              [], certificate=self._CERT)
+
+        self._clone(client, ["shop.example.com", "api.example.com"])
+
+        self.assertNotPrinted(self._WARNING)
+
+    def test_the_warning_does_not_block_the_clone(self):
+        client = self._client(self._source(), [], certificate=self._CERT)
+
+        self._clone(client, ["shop.example.com", "nas.home.lan"])
+
+        self.assertPrinted(self._WARNING)
+        self.assertEqual(client.recreated_ids, [12])
+        self.assertPrinted("Created host")
+
+    def test_cert_none_never_raises_the_question(self):
+        client = self._client(self._source(), [])
+
+        self._clone(client, ["shop.example.com", "nas.home.lan"], cert="none")
+
+        self.assertNotPrinted(self._WARNING)
+        self.assertEqual(client.recreated_ids, [12])
+
+
+# =============================================================================
+# validate_certificate_assignment: labelling
+# =============================================================================
+
+class TestCertificateStatusLabelling(_ConsoleTestCase):
+    """What the status word is claiming to be about."""
+
+    def test_the_status_label_is_scoped_to_the_expiry(self):
+        # A bare green "✅ VALID" sits directly above the coverage warnings and
+        # reads as an endorsement of the whole assignment, when all it means is
+        # that the certificate has not expired. It said nothing about whether
+        # the certificate covers the domains it is being pointed at.
+        client = _CertLookupClient({"id": 4, "domain_names": ["*.example.com"],
+                                    "expires_on": _expires_in(timedelta(days=90))})
+
+        npm_api.validate_certificate_assignment(
+            client, 4, [{"id": 12, "domain_names": ["nas.home.lan"]}])
+
+        # The markup is kept rather than rendered here, so the assertion pins
+        # the two as adjacent: the word has to qualify the label, not sit
+        # somewhere else on the line.
+        self.assertPrinted("expiry: [green]✅ VALID[/green]")
+        self.assertPrinted("not covered")
+
+
 if __name__ == "__main__":
     unittest.main()
