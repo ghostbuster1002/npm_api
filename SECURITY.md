@@ -29,6 +29,24 @@ The `.gitignore` excludes all `.conf` files to prevent accidental commits.
 
 API tokens are stored in the data directory, created at mode 600 (owner read/write only). Tokens are automatically refreshed when they expire.
 
+### File permissions are POSIX-only
+
+Every claim in this file about mode 600 — API tokens, private keys saved by
+`backup --include-keys`, and the pre-merge and pre-restore state snapshots —
+holds on Linux and macOS and **does not hold on Windows**.
+
+Windows has no POSIX permission bits. CPython honours only the write bit
+there, so a file this tool creates with mode `0600` ends up readable by every
+account on the machine. The tool does not fail or warn; the request is simply
+not something the platform implements.
+
+This matters most for `backup --include-keys`, which writes unencrypted
+private keys. On Windows, restrict the directory yourself with NTFS ACLs
+(`icacls`) before running it, or run the backup on a Linux host.
+
+The tests that assert mode 600 skip on Windows rather than passing, so this
+gap stays visible in a test run instead of being quietly asserted away.
+
 ## Certificate Private Keys
 
 `npm-api backup` does **not** capture certificate private keys unless you pass `--include-keys`. A default backup therefore holds configuration and certificate metadata only — enough to rebuild proxy hosts, not enough to serve TLS.

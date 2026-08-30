@@ -26,6 +26,7 @@ or run this file directly:
 
 import io
 import json
+import os
 import re
 import stat
 import sys
@@ -193,6 +194,27 @@ class _ConsoleTestCase(unittest.TestCase):
 
 def _mode(path):
     return stat.S_IMODE(Path(path).stat().st_mode)
+
+
+def assert_owner_only(case, path):
+    """Assert mode 0600, or skip where the platform cannot express it.
+
+    Windows has no POSIX permission bits. CPython's os.open honours only the
+    write bit there, so a file created with 0o600 reads back as 0o666 and
+    every other account on the machine can read it — which for the private
+    keys and pre-merge snapshots these tests cover is the whole point of the
+    assertion.
+
+    Skipped rather than relaxed, and skipped rather than the suite quietly
+    dropping the check: this is not a flaky test or a Windows quirk to work
+    around, it is a guarantee the tool genuinely does not provide there.
+    SECURITY.md says so. Anything the test asserted before this point has
+    already run, so the non-permission coverage still applies.
+    """
+    if os.name == "nt":
+        case.skipTest("POSIX permission bits are not implemented on Windows; "
+                      "see SECURITY.md")
+    case.assertEqual(_mode(path), 0o600)
 
 
 def _expires_in(delta):
@@ -802,7 +824,7 @@ class TestWriteSecret(_WorkdirTestCase):
     def test_creates_owner_only_file_with_the_content(self):
         path = npm_api.write_secret(self.workdir / "token.txt", "s3cret-token")
         self.assertEqual(path.read_text(), "s3cret-token")
-        self.assertEqual(_mode(path), 0o600)
+        assert_owner_only(self, path)
 
     def test_overwriting_a_world_readable_file_tightens_the_mode(self):
         # O_CREAT leaves an existing file's mode alone, so write_secret has to
@@ -815,7 +837,7 @@ class TestWriteSecret(_WorkdirTestCase):
         npm_api.write_secret(path, "new")
 
         self.assertEqual(path.read_text(), "new")
-        self.assertEqual(_mode(path), 0o600)
+        assert_owner_only(self, path)
 
     def test_replaces_a_symlink_instead_of_writing_through_it(self):
         # Writing through the link would spray the secret into whatever the
@@ -830,7 +852,7 @@ class TestWriteSecret(_WorkdirTestCase):
         self.assertEqual(target.read_text(), "untouched")
         self.assertFalse(link.is_symlink())
         self.assertEqual(link.read_text(), "s3cret-token")
-        self.assertEqual(_mode(link), 0o600)
+        assert_owner_only(self, link)
 
 
 # =============================================================================
@@ -886,7 +908,7 @@ class TestDownloadCertificate(_WorkdirTestCase):
         names = {p.name for p in written}
         self.assertEqual(names, {"example.com.key", "example.com.crt",
                                  "example.com.chain.crt", "example.com_metadata.json"})
-        self.assertEqual(_mode(self.workdir / "example.com.key"), 0o600)
+        assert_owner_only(self, self.workdir / "example.com.key")
 
     def test_json_route_with_empty_key_material_is_a_failure(self):
         # NPM answers 200 with empty bodies for certs whose key it does not
@@ -946,7 +968,7 @@ class TestDownloadCertificate(_WorkdirTestCase):
 
         client.download_certificate(1, str(self.workdir), "example.com")
 
-        self.assertEqual(_mode(self.workdir / "privkey.pem"), 0o600)
+        assert_owner_only(self, self.workdir / "privkey.pem")
 
     def test_both_routes_failing_names_each_attempt(self):
         client = _ZipRouteClient(b"")
@@ -1196,7 +1218,7 @@ class TestFullBackup(_WorkdirTestCase):
 
         keys = list(self.workdir.rglob("*.key"))
         self.assertEqual(len(keys), 1)
-        self.assertEqual(_mode(keys[0]), 0o600)
+        assert_owner_only(self, keys[0])
 
     def test_an_unexportable_certificate_is_not_a_backup_failure(self):
         # Uploaded certificates fail here on every single run; treating that as
@@ -2853,7 +2875,7 @@ class TestWriteStateSnapshot(_WorkdirTestCase):
         # file holds it for every host the merge touches.
         path = self._write(_merge_host(12, ["app.example.com"]),
                            [_merge_host(13, ["old.example.com"])])
-        self.assertEqual(_mode(path), 0o600)
+        assert_owner_only(self, path)
 
     def test_holds_the_target_and_every_source_verbatim(self):
         target = _merge_host(12, ["app.example.com"], advanced_config="add_header X-A a;")
@@ -3402,7 +3424,7 @@ class TestHostMergeCleanRun(_MergeCommandTestCase):
 
         written = list(self.workdir.glob("pre_merge_12_*.json"))
         self.assertEqual(len(written), 1, written)
-        self.assertEqual(_mode(written[0]), 0o600)
+        assert_owner_only(self, written[0])
         self.assertEqual(
             [source["id"] for source in json.loads(written[0].read_text())["sources"]],
             [13])
@@ -4665,7 +4687,7 @@ class TestRestoreOrdering(_RestoreCommandTestCase):
 
         written = list(self.state_dir.glob("pre_restore_*.json"))
         self.assertEqual(len(written), 1, written)
-        self.assertEqual(_mode(written[0]), 0o600)
+        assert_owner_only(self, written[0])
         recorded = json.loads(written[0].read_text())
         self.assertEqual(recorded["proxy_hosts"], [{"id": 61}])
         self.assertEqual(recorded["access_lists"], [{"id": 71}])
@@ -6769,7 +6791,7 @@ class TestHostSplitSnapshot(_SplitCommandTestCase):
         self._split(client, "*.internal.lan", host_ids="12")
 
         (written,) = self.workdir.glob("pre_split_*.json")
-        self.assertEqual(_mode(written), 0o600)
+        assert_owner_only(self, written)
 
     def test_it_holds_every_source_whole_not_just_its_names(self):
         # Enough to rebuild each source from the file alone: a list of domains
@@ -8178,6 +8200,48 @@ class TestHostUpdate(_MergeCommandTestCase):
         self._update(client, 12, "advanced_config=")
 
         self.assertEqual(client.updates, [(12, {"advanced_config": ""})])
+
+
+# =============================================================================
+# the permission assertion's own escape hatch
+# =============================================================================
+
+class TestAssertOwnerOnly(_WorkdirTestCase):
+    """The helper must skip on Windows and assert everywhere else.
+
+    Worth its own tests because the failure mode is silence: a version that
+    returned early on every platform, or that compared against whatever mode
+    it found, would leave ten call sites green while checking nothing. The
+    permission on a private key is the thing those ten sites exist to prove.
+    """
+
+    def _owner_only_file(self, mode=0o600):
+        path = self.workdir / "secret"
+        if path.exists():
+            path.unlink()
+        os.close(os.open(path, os.O_WRONLY | os.O_CREAT, mode))
+        return path
+
+    def test_a_correctly_moded_file_passes(self):
+        assert_owner_only(self, self._owner_only_file())
+
+    def test_a_world_readable_file_fails(self):
+        with self.assertRaises(AssertionError):
+            assert_owner_only(self, self._owner_only_file(0o644))
+
+    def test_windows_skips_rather_than_passing(self):
+        # The distinction that matters: not asserted, and *known* not to be
+        # asserted. A silent pass would report coverage that does not exist.
+        path = self._owner_only_file(0o644)
+        with mock.patch.object(os, "name", "nt"):
+            with self.assertRaises(unittest.SkipTest):
+                assert_owner_only(self, path)
+
+    def test_the_skip_names_where_the_caveat_is_written_down(self):
+        with mock.patch.object(os, "name", "nt"):
+            with self.assertRaises(unittest.SkipTest) as caught:
+                assert_owner_only(self, self._owner_only_file())
+        self.assertIn("SECURITY.md", str(caught.exception))
 
 
 # =============================================================================
