@@ -121,6 +121,13 @@ jobs:
         shell: bash
         run: mv "dist/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
+      # v5 is current and still emits the Node 20 deprecation warning — the
+      # artifact actions had not shipped a Node 24 build as of 2026-08-31,
+      # unlike checkout and setup-python whose next majors did carry one.
+      # Nothing here can clear that warning; it needs a release from the
+      # action's maintainers. Do not bump again expecting it to go away —
+      # verified on a dispatch run, not assumed. GitHub force-runs them on
+      # Node 24 meanwhile and all four platforms build.
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.asset }}
@@ -145,6 +152,7 @@ jobs:
       contents: write
 
     steps:
+      # Same Node 20 situation as upload-artifact above; see the note there.
       - uses: actions/download-artifact@v5
         with:
           path: dist
