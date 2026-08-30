@@ -1792,6 +1792,46 @@ class TestSelectorMatchedNothing(_ConsoleTestCase):
         self.assertEqual(len(selected), 3)
 
 
+class TestMalformedPatterns(_ConsoleTestCase):
+    """--pattern is handed to fnmatch, whose brackets compile to a regex.
+
+    An unbalanced bracket is a plausible typo — a half-finished character
+    class, or a shell that ate a quote — and fnmatch.translate builds a real
+    regular expression out of whatever it is given. The property worth pinning
+    is that such a pattern comes out as the ordinary "matched nothing"
+    refusal, and never as an re.error escaping a command that has not written
+    anything yet.
+    """
+
+    MALFORMED = ("[a", "[!", "a]b", "[", "]", "?", "[]", "*[a-")
+
+    def test_a_malformed_glob_is_refused_rather_than_raised(self):
+        # The exit code is pinned to 1 rather than merely asserting that
+        # something was raised: an fnmatch traceback is also "something
+        # raised", and the whole point here is telling those two apart.
+        for pattern in self.MALFORMED:
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    npm_api.select_hosts(_HostsClient(), None, pattern, False)
+                self.assertEqual(caught.exception.exit_code, 1)
+
+    def test_the_refusal_is_the_ordinary_matched_nothing_one(self):
+        # Not a special case for bad syntax. A malformed glob matches no name,
+        # which is a selector that found nothing like any other.
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.select_hosts(_HostsClient(), None, "[a", False)
+
+        self.assertPrinted("matched no hosts")
+
+    def test_a_valid_glob_matching_everything_is_not_refused(self):
+        # "**" is well-formed and matches every name. It has to come through
+        # the guard above untouched, or the refusal is catching valid patterns
+        # along with the broken ones.
+        selected = npm_api.select_hosts(_HostsClient(), None, "**", False)
+
+        self.assertEqual([h["id"] for h in selected], [12, 13, 14])
+
+
 class TestEmptySelectionReachesEveryBulkCommand(_ConsoleTestCase):
     """The refusal lives in select_hosts, so every caller inherits it.
 
