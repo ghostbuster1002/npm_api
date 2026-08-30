@@ -2479,6 +2479,8 @@ def host_update(
         console.print(f"[red]❌ {exc}[/red]")
         raise typer.Exit(1)
 
+    require_nonempty_domain_names(field_name, value)
+
     try:
         result = client.update_host(host_id, {field_name: value})
         console.print(f"[green]✅ Host {host_id} updated successfully![/green]")
@@ -2652,6 +2654,49 @@ def dedupe_domains(domains: List[str]) -> List[str]:
             seen.add(key)
             unique.append(domain)
     return unique
+
+
+def require_domain_argument(value: str, label: str) -> None:
+    """Refuse a blank domain argument before it reaches the string surgery.
+
+    `bulk-replace-domain "$OLD" "$NEW"` with OLD unset is one keystroke away
+    from every scripted invocation, and "" is not a value these commands can
+    do anything sensible with: it is a substring of every name, and
+    str.replace("", new) inserts the replacement between every character, so
+    app.example.com becomes example.netaexample.netp… on every selected host —
+    written, reported as a success, and exited 0. An empty base is as bad the
+    other way round, turning bulk-add-domain's f"{prefix}.{base}" into "ex.".
+
+    Blankness only. Whether a non-blank argument is a well-formed domain is a
+    separate question these commands deliberately do not ask, since NPM itself
+    accepts names this tool has no business second-guessing.
+    """
+    if not value or not value.strip():
+        console.print(f"[red]❌ {label} is blank — refusing to rewrite domain "
+                      f"names from an empty value[/red]")
+        raise typer.Exit(1)
+
+
+def require_nonempty_domain_names(field: str, value: Any) -> None:
+    """Refuse a write that would leave a host answering to nothing.
+
+    coerce_field_value folds "", " ", ",", " , " and "[]" alike into [], so
+    every one of them reaches update_host as a domain_names of zero names —
+    an nginx server block with no server_name, which NPM keeps and nothing can
+    reach. split skips a host it would empty and bulk-remove-domain skips one
+    too; update and bulk-update write the field straight through and were the
+    hole in that rule.
+
+    Refused rather than skipped, unlike those two: they are removing names and
+    can sensibly leave a host alone, whereas naming domain_names explicitly and
+    giving it nothing has no reading under which the write was wanted.
+    """
+    if field != "domain_names":
+        return
+    if value is None or (isinstance(value, list) and not value):
+        console.print("[red]❌ domain_names is empty — refusing to leave a host "
+                      "with no domain names at all[/red]")
+        raise typer.Exit(1)
 
 
 def apply_domain_changes(client: NPMClient, changes: List[Dict],
@@ -3003,6 +3048,21 @@ def host_split(
                       f"--ids {','.join(affected)}[/dim]")
 
     confirm_bulk(yes)
+
+    # One snapshot for the whole run, before the first trim rather than one per
+    # host: split frees the moving domains off a source before the new host
+    # exists to take them, so a process killed in between leaves the original
+    # domain list nowhere but the operator's scrollback. Whole source records,
+    # not just their names, so every one of them can be rebuilt from the file.
+    try:
+        snapshot = write_state_snapshot(client.config, "pre_split",
+                                        {"sources": [p["source"] for p in plans]})
+    except OSError as exc:
+        console.print(f"[red]❌ Could not write the pre-split snapshot: {exc}[/red]")
+        console.print("[red]   Refusing to trim hosts whose configuration was not "
+                      "recorded first[/red]")
+        raise typer.Exit(1)
+    console.print(f"[dim]Pre-split snapshot: {snapshot}[/dim]")
 
     success_count = 0
     error_count = 0
@@ -3784,6 +3844,8 @@ def host_bulk_add_domain(
     with the new base domain. Hosts whose only names are apex domains are
     skipped, since they carry no prefix to reuse.
     """
+    require_domain_argument(new_domain, "The new base domain")
+
     client = get_client()
 
     hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
@@ -3947,6 +4009,9 @@ def host_bulk_replace_domain(
     required; the command no longer defaults to every host carrying the old
     domain, since a short argument like 'com' would match the whole estate.
     """
+    require_domain_argument(old_domain, "The old base domain")
+    require_domain_argument(new_domain, "The new base domain")
+
     client = get_client()
 
     hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
@@ -4078,7 +4143,9 @@ def host_bulk_update(
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(hosts_to_process)}[/yellow][/cyan]")
 
     # Field-aware validation. Pointing a host at a deleted certificate makes
-    # NPM render it with no TLS listener at all rather than failing loudly.
+    # NPM render it with no TLS listener at all rather than failing loudly, and
+    # an empty domain_names takes every selected host off the air at once.
+    require_nonempty_domain_names(field, typed_value)
     if field == "certificate_id":
         if not validate_certificate_assignment(client, typed_value, hosts_to_process):
             raise typer.Exit(1)

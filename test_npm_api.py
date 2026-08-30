@@ -267,6 +267,106 @@ class TestDedupeDomains(unittest.TestCase):
 
 
 # =============================================================================
+# require_domain_argument
+# =============================================================================
+
+class TestRequireDomainArgument(_ConsoleTestCase):
+    """The gate in front of the bulk rewriters' string surgery.
+
+    `bulk-replace-domain "$OLD" "$NEW"` with OLD unset is one keystroke away
+    from every scripted invocation, and "" is the one value that turns those
+    commands into a shredder rather than a rename.
+    """
+
+    def test_a_real_domain_passes_silently(self):
+        self.assertIsNone(npm_api.require_domain_argument("example.com", "The old base domain"))
+        self.assertEqual(self.console.lines, [])
+
+    def test_an_empty_string_is_refused(self):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            npm_api.require_domain_argument("", "The old base domain")
+        self.assertEqual(caught.exception.exit_code, 1)
+
+    def test_whitespace_only_is_refused_too(self):
+        # A shell that expanded to a bare space is the same accident as one
+        # that expanded to nothing, and strip() is what the rewriters would
+        # have applied anyway.
+        for given in (" ", "\t", "\n", "   "):
+            with self.subTest(given=given):
+                with self.assertRaises(npm_api.typer.Exit):
+                    npm_api.require_domain_argument(given, "The new base domain")
+
+    def test_the_message_names_which_argument_was_blank(self):
+        # bulk-replace-domain takes two of them, so "a domain was empty" would
+        # leave the operator guessing which half of the command to fix.
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.require_domain_argument("", "The old base domain")
+        self.assertPrinted("The old base domain is blank")
+
+    def test_a_domain_that_only_looks_odd_is_left_alone(self):
+        # Blankness only. Whether a name is well formed is a separate question
+        # this helper deliberately does not answer, or a legitimate host NPM
+        # already accepts would stop being editable.
+        for given in ("localhost", "com", ".", "*", "ex."):
+            with self.subTest(given=given):
+                npm_api.require_domain_argument(given, "The new base domain")
+
+
+# =============================================================================
+# require_nonempty_domain_names
+# =============================================================================
+
+class TestRequireNonemptyDomainNames(_ConsoleTestCase):
+    """No write may leave a host answering to nothing.
+
+    split skips a host it would empty and bulk-remove-domain skips one too;
+    update and bulk-update write domain_names straight through, and
+    coerce_field_value folds every spelling of "nothing" into [], so they were
+    the hole in that rule.
+    """
+
+    def test_a_populated_list_passes(self):
+        npm_api.require_nonempty_domain_names("domain_names", ["app.example.com"])
+        self.assertEqual(self.console.lines, [])
+
+    def test_an_empty_list_is_refused(self):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            npm_api.require_nonempty_domain_names("domain_names", [])
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("domain_names is empty")
+
+    def test_a_null_is_refused_as_well(self):
+        # `domain_names=null` coerces to None rather than [], and reaches
+        # update_host just as readily.
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.require_nonempty_domain_names("domain_names", None)
+
+    def test_every_spelling_coerce_field_value_folds_into_nothing_is_caught(self):
+        # Stated through coerce_field_value rather than against a literal [],
+        # so a change to how the field is parsed cannot open the hole again.
+        for raw in ("", " ", ",", " , ", "[]", "null"):
+            with self.subTest(raw=raw):
+                value = npm_api.coerce_field_value("domain_names", raw)
+                with self.assertRaises(npm_api.typer.Exit):
+                    npm_api.require_nonempty_domain_names("domain_names", value)
+
+    def test_another_field_going_empty_is_none_of_its_business(self):
+        # Emptying advanced_config or locations is a legitimate edit; only
+        # domain_names leaves a server block with no server_name.
+        for field, value in (("locations", []), ("advanced_config", None),
+                             ("forward_host", "")):
+            with self.subTest(field=field):
+                npm_api.require_nonempty_domain_names(field, value)
+        self.assertEqual(self.console.lines, [])
+
+    def test_a_falsy_value_that_is_not_a_list_is_not_mistaken_for_empty(self):
+        # coerce_field_value returns 0 for "0", and 0 is falsy — but it is a
+        # value that was typed, not an absent one, so it is NPM's to reject.
+        npm_api.require_nonempty_domain_names("domain_names", 0)
+        self.assertEqual(self.console.lines, [])
+
+
+# =============================================================================
 # coerce_field_value
 # =============================================================================
 
@@ -5026,9 +5126,9 @@ class TestHostSplitRollback(_SplitCommandTestCase):
     Split frees the moving domains off the source before creating the host that
     is to take them, because NPM refuses to let two hosts hold the same name.
     That leaves a window in which those domains belong to nobody, and a failed
-    create has to close it by writing the original list back. Unlike merge,
-    split writes no snapshot first — the only record of the original list is
-    the one held in memory for the duration of the run.
+    create has to close it by writing the original list back. The pre-split
+    snapshot (TestHostSplitSnapshot) is the floor under a rollback that cannot
+    run at all; this is the ordinary case, where it can.
     """
 
     def _source(self):
@@ -5130,10 +5230,10 @@ class TestHostSplitRollback(_SplitCommandTestCase):
 
         self._split_expecting_exit(client, "*.internal.lan", host_ids="12")
 
-        # It has to be printed in full because at this point it exists nowhere
-        # else. Split takes no snapshot, and NPM has already been told the host
-        # holds the shorter list, so the terminal is the only place left to
-        # read the original from when repairing this by hand.
+        # It has to be printed in full because NPM has already been told the
+        # host holds the shorter list. The pre-split snapshot has the same
+        # record, but an operator repairing this by hand is looking at the
+        # terminal, not hunting for a file.
         self.assertPrinted(f"it originally held {self._ORIGINAL}")
 
     def test_a_failed_rollback_also_prints_what_the_host_holds_now(self):
@@ -5375,6 +5475,143 @@ class TestHostSplitCleanRun(_SplitCommandTestCase):
 
         self.assertPrinted("Host Split Preview")
         self.assertPrinted("Total hosts to split")
+
+
+# =============================================================================
+# host split: the snapshot under the trim
+# =============================================================================
+
+class TestHostSplitSnapshot(_SplitCommandTestCase):
+    """The same floor merge and restore stand on.
+
+    Split's first write frees the moving domains off the source before the host
+    that is to take them exists. The in-process rollback closes that window in
+    the ordinary case, but it cannot run at all if the process is killed
+    between the two calls — and then the original domain list survives nowhere
+    but the operator's scrollback. One file, written once for the whole run,
+    before the first trim.
+    """
+
+    def _source(self, host_id=12, **overrides):
+        return _merge_host(host_id, [f"app{host_id}.example.com",
+                                     f"api{host_id}.internal.lan"], **overrides)
+
+    def test_a_run_leaves_a_snapshot_on_disk(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        written = list(self.workdir.glob("pre_split_*.json"))
+        self.assertEqual(len(written), 1, written)
+
+    def test_the_snapshot_is_owner_readable_only(self):
+        # It holds whole host records, and advanced_config routinely carries
+        # auth headers and internal hostnames.
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        (written,) = self.workdir.glob("pre_split_*.json")
+        self.assertEqual(_mode(written), 0o600)
+
+    def test_it_holds_every_source_whole_not_just_its_names(self):
+        # Enough to rebuild each source from the file alone: a list of domains
+        # would not say where they forwarded or what certificate they carried.
+        source = self._source(certificate_id=7, advanced_config="add_header X-A a;")
+        client = self._client(source, [], certificate=_live_cert())
+
+        self._split(client, "*.internal.lan", cert="7", host_ids="12")
+
+        (written,) = self.workdir.glob("pre_split_*.json")
+        self.assertEqual(json.loads(written.read_text())["sources"], [source])
+
+    def test_one_snapshot_covers_a_whole_batch(self):
+        # Not one per host: the point is a single record of the estate as it
+        # stood before the run, and twenty files named a second apart would
+        # make reconstructing it harder rather than easier.
+        client = self._client(self._source(12), [self._source(13), self._source(14)])
+
+        self._split(client, "*.internal.lan", host_ids="12,13,14")
+
+        (written,) = self.workdir.glob("pre_split_*.json")
+        self.assertEqual([s["id"] for s in json.loads(written.read_text())["sources"]],
+                         [12, 13, 14])
+
+    def test_it_records_only_the_hosts_the_run_will_touch(self):
+        # A host skipped for having nothing to move is not being modified, so
+        # putting it in the file would misreport what the run was about to do.
+        client = self._client(self._source(12), [_merge_host(13, ["shop.example.com",
+                                                                  "www.example.com"])])
+
+        self._split(client, "*.internal.lan", host_ids="12,13")
+
+        (written,) = self.workdir.glob("pre_split_*.json")
+        self.assertEqual([s["id"] for s in json.loads(written.read_text())["sources"]],
+                         [12])
+
+    def test_it_is_written_before_the_first_trim(self):
+        # The ordering is the whole guarantee: a snapshot taken after the trim
+        # would record the damage rather than the thing being damaged.
+        client = self._client(self._source(), [])
+        order = []
+
+        def record(config, label, payload):
+            order.append(("snapshot", label))
+            return Path("/tmp/unused.json")
+
+        with mock.patch.object(npm_api, "write_state_snapshot", side_effect=record):
+            with mock.patch.object(client, "update_host",
+                                   side_effect=lambda h, u: order.append(("update", h))):
+                self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(order[0], ("snapshot", "pre_split"))
+        self.assertIn(("update", 12), order)
+
+    def test_nothing_is_written_when_the_snapshot_cannot_be(self):
+        # Merge's exact behaviour: no host is trimmed until its configuration
+        # is on disk, so a read-only backup directory stops the run rather than
+        # quietly removing the safety net.
+        client = self._client(self._source(), [])
+
+        with mock.patch.object(npm_api, "write_state_snapshot",
+                               side_effect=OSError("Read-only file system")):
+            exit_exception = self._split_expecting_exit(client, "*.internal.lan",
+                                                        host_ids="12")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+        self.assertPrinted("Read-only file system")
+        self.assertPrinted("Refusing to trim hosts")
+
+    def test_the_path_is_printed_so_the_operator_can_find_it(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        (written,) = self.workdir.glob("pre_split_*.json")
+        self.assertPrinted(f"Pre-split snapshot: {written}")
+
+    def test_a_run_with_nothing_to_split_writes_no_snapshot(self):
+        # Nothing is about to be destroyed, so there is nothing to record — and
+        # a file per no-op run would bury the ones that matter.
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.nothing.lan", host_ids="12")
+
+        self.assertEqual(list(self.workdir.glob("pre_split_*.json")), [])
+
+    def test_the_snapshot_is_taken_after_the_confirmation_not_before(self):
+        # A cancelled run must leave no trace: confirm_bulk raises Exit(0), and
+        # anything written ahead of it would accumulate on every abandoned
+        # attempt.
+        client = self._client(self._source(), [])
+
+        with mock.patch.object(npm_api.typer, "confirm", return_value=False):
+            with self.assertRaises(npm_api.typer.Exit):
+                self._split(client, "*.internal.lan", host_ids="12", yes=False)
+
+        self.assertEqual(list(self.workdir.glob("pre_split_*.json")), [])
+        self.assertEqual(client.calls, [])
 
 
 # =============================================================================
@@ -6407,6 +6644,188 @@ class TestHostBulkUpdate(_MergeCommandTestCase):
 
         self.assertPrinted("Bulk Update Preview")
         self.assertPrinted("Total hosts to update")
+
+    def test_an_empty_domain_names_refuses_and_writes_nothing(self):
+        # coerce_field_value folds every one of these into [], and a host whose
+        # domain_names is [] is an nginx server block with no server_name: NPM
+        # keeps it and nothing can reach it. A batch selected by --pattern would
+        # take that many hosts off the air in one command, reported as success.
+        for value in ("", " ", ",", " , ", "[]", "null"):
+            with self.subTest(value=value):
+                client = self._client_with_two_hosts()
+
+                exit_exception = self._bulk_update_expecting_exit(
+                    client, "domain_names", value, host_ids="12,13")
+
+                self.assertEqual(exit_exception.exit_code, 1)
+                self.assertEqual(client.calls, [])
+                self.assertPrinted("domain_names is empty")
+
+    def test_a_domain_names_with_one_name_left_is_still_written(self):
+        # The refusal is about emptiness, not about shrinking: cutting a host
+        # down to a single name is a legitimate edit.
+        client = self._client_with_two_hosts()
+
+        self._bulk_update(client, "domain_names", "only.example.com", host_ids="12")
+
+        self.assertEqual(client.updates, [(12, {"domain_names": ["only.example.com"]})])
+
+
+# =============================================================================
+# host update
+# =============================================================================
+
+class TestHostUpdate(_MergeCommandTestCase):
+    """The single-host spelling of bulk-update, and the same emptiness rule.
+
+    Reuses the merge double for the same reason bulk-update's tests do: it
+    records every update in order, which is the only place the outcome shows.
+    """
+
+    def _update(self, client, host_id, field_value):
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_update(host_id=host_id, field_value=field_value)
+
+    def _update_expecting_exit(self, client, host_id, field_value):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._update(client, host_id, field_value)
+        return caught.exception
+
+    def test_a_field_is_coerced_and_written(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._update(client, 12, "forward_port=8080")
+
+        self.assertEqual(client.updates, [(12, {"forward_port": 8080})])
+
+    def test_an_empty_domain_names_refuses_and_writes_nothing(self):
+        # `host update 12 domain_names=` is what a script produces when the
+        # variable holding the list came back empty.
+        for spelling in ("domain_names=", "domain_names= ", "domain_names=,",
+                         "domain_names=[]", "domain_names=null"):
+            with self.subTest(spelling=spelling):
+                client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+                exit_exception = self._update_expecting_exit(client, 12, spelling)
+
+                self.assertEqual(exit_exception.exit_code, 1)
+                self.assertEqual(client.calls, [])
+                self.assertPrinted("domain_names is empty")
+
+    def test_a_non_empty_domain_names_is_written(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._update(client, 12, "domain_names=a.example.com,b.example.com")
+
+        self.assertEqual(
+            client.updates,
+            [(12, {"domain_names": ["a.example.com", "b.example.com"]})])
+
+    def test_another_field_may_still_be_emptied(self):
+        # Only domain_names leaves a host unreachable; clearing advanced_config
+        # is an ordinary edit and must not be caught by the same guard.
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._update(client, 12, "advanced_config=")
+
+        self.assertEqual(client.updates, [(12, {"advanced_config": ""})])
+
+
+# =============================================================================
+# host bulk-add-domain / bulk-replace-domain: a blank domain argument
+# =============================================================================
+
+class _ExplodingClient:
+    """A client that fails on first contact.
+
+    Lets a test say "the guard ran before the inventory was read" rather than
+    only "before the write": any command that reaches select_hosts against this
+    raises instead of quietly returning a plausible result.
+    """
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the client was used before the guard: {name}")
+
+
+class TestBlankDomainArguments(_MergeCommandTestCase):
+    """`bulk-replace-domain "$OLD" "$NEW"` with the variable unset.
+
+    "" is a substring of every name and str.replace("", new) inserts between
+    every character, so an empty --old rewrote app.example.com into
+    example.netaexample.netpexample.netp… on every selected host, wrote it,
+    reported Successful: 1 and exited 0. An empty --new is the mirror image
+    ("ex.example.com" -> "ex."), and bulk-add-domain's f"{prefix}.{base}" turns
+    an empty base into "ex." the same way.
+    """
+
+    def _bulk_add(self, new_domain, client=None, **overrides):
+        options = dict(new_domain=new_domain, host_ids="12", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client",
+                               lambda: client or _ExplodingClient()):
+            npm_api.host_bulk_add_domain(**options)
+
+    def _bulk_replace(self, old_domain, new_domain, client=None, **overrides):
+        options = dict(old_domain=old_domain, new_domain=new_domain,
+                       host_ids="12", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client",
+                               lambda: client or _ExplodingClient()):
+            npm_api.host_bulk_replace_domain(**options)
+
+    _BLANK = ("", " ", "\t", "   ")
+
+    def test_bulk_add_refuses_a_blank_base_before_reading_anything(self):
+        for value in self._BLANK:
+            with self.subTest(value=value):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._bulk_add(value)
+                self.assertEqual(caught.exception.exit_code, 1)
+                self.assertPrinted("The new base domain is blank")
+
+    def test_bulk_replace_refuses_a_blank_old_domain(self):
+        for value in self._BLANK:
+            with self.subTest(value=value):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._bulk_replace(value, "example.net")
+                self.assertEqual(caught.exception.exit_code, 1)
+                self.assertPrinted("The old base domain is blank")
+
+    def test_bulk_replace_refuses_a_blank_new_domain(self):
+        # Checked as well as --old, not instead of it: a script can lose either
+        # variable, and only one of the two is guarded by the other's message.
+        for value in self._BLANK:
+            with self.subTest(value=value):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._bulk_replace("example.com", value)
+                self.assertEqual(caught.exception.exit_code, 1)
+                self.assertPrinted("The new base domain is blank")
+
+    def test_the_refusal_does_not_depend_on_the_selector(self):
+        # --pattern '*' is the widest selection the tool offers and the one an
+        # unset OLD would most plausibly appear beside.
+        with self.assertRaises(npm_api.typer.Exit):
+            self._bulk_replace("", "example.net", host_ids=None, pattern="*")
+
+    def test_a_real_pair_of_domains_still_runs(self):
+        # The guard must not have made the command unusable: the ordinary
+        # rewrite still reaches the API.
+        client = self._client(_merge_host(12, ["ex.example.com"]), [])
+
+        self._bulk_replace("example.com", "example.net", client=client)
+
+        self.assertEqual(client.updates, [(12, {"domain_names": ["ex.example.net"]})])
+
+    def test_a_real_base_still_adds(self):
+        client = self._client(_merge_host(12, ["ex.example.com"]), [])
+
+        self._bulk_add("example.net", client=client)
+
+        self.assertEqual(
+            client.updates,
+            [(12, {"domain_names": ["ex.example.com", "ex.example.net"]})])
 
 
 # =============================================================================
