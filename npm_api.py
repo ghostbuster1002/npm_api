@@ -22,7 +22,7 @@ import zipfile
 from fnmatch import fnmatch
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -1270,6 +1270,13 @@ class NPMClient:
             (backup_path / subdir).mkdir(parents=True, exist_ok=True)
 
         full_config = {}
+        # A section is only assigned once its fetch has returned, so a section
+        # that failed is simply missing from the document — indistinguishable,
+        # once the file is on disk, from a section that genuinely held nothing.
+        # restore deletes what a backup says nothing about, so the file has to
+        # carry the difference itself. Keyed by section name, not by the spaced
+        # label result.failures uses, because that is what restore looks up.
+        incomplete_sections: Dict[str, str] = {}
         result = BackupResult(path=str(backup_path))
 
         # Backup users
@@ -1294,6 +1301,7 @@ class NPMClient:
             console.print("[green]✅ Backed up settings[/green]")
         except Exception as e:
             result.failures.append(f"settings: {e}")
+            incomplete_sections["settings"] = str(e)
             console.print(f"[yellow]⚠️ Failed to backup settings: {e}[/yellow]")
         
         # Backup access lists
@@ -1310,6 +1318,7 @@ class NPMClient:
             console.print(f"[green]✅ Backed up {len(access_lists)} access lists[/green]")
         except Exception as e:
             result.failures.append(f"access lists: {e}")
+            incomplete_sections["access_lists"] = str(e)
             console.print(f"[yellow]⚠️ Failed to backup access lists: {e}[/yellow]")
         
         # Backup proxy hosts
@@ -1336,6 +1345,7 @@ class NPMClient:
             console.print(f"[green]✅ Backed up {len(hosts)} proxy hosts[/green]")
         except Exception as e:
             result.failures.append(f"proxy hosts: {e}")
+            incomplete_sections["proxy_hosts"] = str(e)
             console.print(f"[yellow]⚠️ Failed to backup proxy hosts: {e}[/yellow]")
         
         # Backup certificates
@@ -1397,8 +1407,14 @@ class NPMClient:
                     self._print_key_failures(result.key_failures, backup_path / ".ssl")
         except Exception as e:
             result.failures.append(f"certificates: {e}")
+            incomplete_sections["certificates"] = str(e)
             console.print(f"[yellow]⚠️ Failed to backup certificates: {e}[/yellow]")
-        
+
+        # Only on a partial run: a clean backup must not grow a key that every
+        # reader would then have to know to ignore.
+        if incomplete_sections:
+            full_config["incomplete_sections"] = incomplete_sections
+
         # Save full config
         full_config_path = backup_path / f"full_config_{timestamp}.json"
         full_config_path.write_text(json.dumps(full_config, indent=2))
@@ -1682,6 +1698,12 @@ def backup(
 BACKUP_SECTIONS = ("proxy_hosts", "access_lists", "certificates", "settings", "users")
 RESTORED_SECTIONS = ("access_lists", "proxy_hosts", "settings")
 
+# Every section restore walks, and so every section it has to satisfy itself
+# about before it deletes anything. `certificates` is here despite never being
+# written back: matching reads every row of it, and a bad row there crashes the
+# run just as readily.
+VALIDATED_SECTIONS = RESTORED_SECTIONS + ("certificates",)
+
 
 def load_backup(source: str) -> Dict:
     """Read a full_config backup, given either the file or its directory.
@@ -1729,6 +1751,77 @@ def load_backup(source: str) -> Dict:
                        f"({', '.join(BACKUP_SECTIONS)})")
 
     return {"path": path, "data": data}
+
+
+def backup_section(data: Dict, key: str) -> Tuple[Optional[List], Optional[str]]:
+    """The section's rows, or None with a reason the backup cannot speak for it.
+
+    An absent section means the backup does not know what was there, which
+    is not the same as knowing there was nothing. Restoring "nothing" over a
+    live section deletes it, so absence must never be flattened to an empty
+    list. An explicit [] is a positive statement and is honoured.
+    """
+    recorded = data.get("incomplete_sections")
+    # Written by full_backup when the fetch for a section failed. Anything else
+    # under that key came from a hand-edit and is ignored rather than trusted.
+    if isinstance(recorded, dict) and key in recorded:
+        return None, f"the backup records it as incomplete ({recorded[key]})"
+
+    if key not in data:
+        return None, "the backup has no such section"
+
+    rows = data[key]
+    if rows is None:
+        return None, "the backup holds it as null"
+    if not isinstance(rows, list):
+        return None, (f"the backup holds it as a {type(rows).__name__}, "
+                      f"not a list of records")
+
+    return rows, None
+
+
+def validate_backup_rows(data: Dict) -> None:
+    """Refuse a backup whose rows are not the records the rebuild loop assumes.
+
+    Ordering is the whole point. restore_acl_payload and host_config_payload
+    both run in the rebuild loop, which is reached only after every host and
+    access list on the target has been deleted, so an AttributeError raised
+    there leaves a live instance emptied and not refilled. Walking the file
+    first costs one pass over data already in memory.
+    """
+    for key in VALIDATED_SECTIONS:
+        rows = data.get(key)
+        # Absent or null is backup_section's business: those sections are
+        # skipped rather than restored, so their shape decides nothing.
+        if rows is None:
+            continue
+        if not isinstance(rows, list):
+            raise NPMError(f"Backup section '{key}' is a {type(rows).__name__}, "
+                           f"not a list of records — nothing was changed")
+
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise NPMError(f"Backup section '{key}' entry {index} is a "
+                               f"{type(row).__name__}, not a record — nothing "
+                               f"was changed")
+            if key != "access_lists":
+                continue
+            for nested_key in ("items", "clients"):
+                nested = row.get(nested_key)
+                if nested is None:
+                    continue
+                if not isinstance(nested, list):
+                    raise NPMError(
+                        f"Backup section 'access_lists' entry {index} holds "
+                        f"'{nested_key}' as a {type(nested).__name__}, not a "
+                        f"list — nothing was changed")
+                for nested_index, nested_row in enumerate(nested):
+                    if not isinstance(nested_row, dict):
+                        raise NPMError(
+                            f"Backup section 'access_lists' entry {index}, "
+                            f"'{nested_key}' entry {nested_index} is a "
+                            f"{type(nested_row).__name__}, not a record — "
+                            f"nothing was changed")
 
 
 def cert_match_key(cert: Dict) -> Optional[frozenset]:
@@ -1872,11 +1965,40 @@ def restore(
     backup = load_backup(source)
     data = backup["data"]
 
-    backup_acls = data.get("access_lists") or []
-    backup_hosts = data.get("proxy_hosts") or []
-    backup_certs = data.get("certificates") or []
-    backup_settings = data.get("settings") or []
+    # Before the target is even read, let alone emptied.
+    validate_backup_rows(data)
 
+    # Only the sections the backup can actually speak for. A section that is
+    # missing from it is left out entirely rather than read as [], because the
+    # delete loops below take [] as an instruction to wipe.
+    sections: Dict[str, List] = {}
+    for key in VALIDATED_SECTIONS:
+        rows, reason = backup_section(data, key)
+        if reason is not None:
+            console.print(f"[yellow]⚠️  Skipping {key.replace('_', ' ')}: "
+                          f"{reason}.[/yellow]")
+            # What skipping costs is not the same for every section, and for
+            # certificates it is emphatically not "nothing happens": matching
+            # is the only thing that maps the backup's certificate IDs onto
+            # this NPM's, so without it every host comes back HTTP-only.
+            if key == "certificates":
+                console.print("[yellow]   Every restored host will come back "
+                              "without TLS — there is nothing to match its "
+                              "certificate against.[/yellow]")
+            else:
+                console.print("[yellow]   Nothing in that section will be "
+                              "deleted or created here.[/yellow]")
+            continue
+        sections[key] = rows
+
+    backup_acls = sections.get("access_lists") or []
+    backup_hosts = sections.get("proxy_hosts") or []
+    backup_certs = sections.get("certificates") or []
+    backup_settings = sections.get("settings") or []
+
+    # A skipped section reads as empty here, so this also catches the backup
+    # that can speak for nothing at all — which would otherwise run to
+    # completion having done nothing and exited 0.
     if not any((backup_acls, backup_hosts, backup_settings)):
         console.print(f"[yellow]{backup['path']} holds nothing this command "
                       f"restores ({', '.join(RESTORED_SECTIONS)})[/yellow]")
@@ -1922,14 +2044,23 @@ def restore(
         table.add_column("In backup", style="green", justify="right")
         table.add_column("Here now", style="yellow", justify="right")
         table.add_column("Action", style="magenta")
-        table.add_row("Access lists", str(len(backup_acls)), str(len(target_acls)),
-                      "replaced")
-        table.add_row("Proxy hosts", str(len(backup_hosts)), str(len(target_hosts)),
-                      "replaced")
-        table.add_row("Settings", str(len(backup_settings)), str(len(target_settings)),
-                      "written where already defined")
-        table.add_row("Certificates", str(len(backup_certs)), str(len(target_certs)),
-                      "left alone; matched only")
+        for label, key, rows, here, action in (
+                ("Access lists", "access_lists", backup_acls, target_acls,
+                 "replaced"),
+                ("Proxy hosts", "proxy_hosts", backup_hosts, target_hosts,
+                 "replaced"),
+                ("Settings", "settings", backup_settings, target_settings,
+                 "written where already defined"),
+                ("Certificates", "certificates", backup_certs, target_certs,
+                 "left alone; matched only")):
+            # A skipped section counts zero rows, and "0 … replaced" reads as
+            # "the backup had none, so all of yours go" — the opposite of what
+            # is about to happen.
+            if key in sections:
+                table.add_row(label, str(len(rows)), str(len(here)), action)
+            else:
+                table.add_row(label, "—", str(len(here)),
+                              "[yellow]skipped — left as it is[/yellow]")
         table.add_row("Users", str(len(data.get("users") or [])), "—", "not restored")
         console.print(table)
 
@@ -1960,12 +2091,23 @@ def restore(
             console.print(f"[dim]Setting '{setting_id}' is not defined on this NPM "
                           f"— skipped[/dim]")
 
+    # Only what the backup can speak for is replaced. A section it says nothing
+    # about is left standing, so it must not appear in the delete loops below
+    # and must not be counted in the warning above them.
+    doomed_hosts = target_hosts if "proxy_hosts" in sections else []
+    doomed_acls = target_acls if "access_lists" in sections else []
+
     if target_hosts or target_acls:
         console.print(f"\n[red]⚠️  This NPM is not empty. "
                       f"{len(target_hosts)} proxy host(s) and {len(target_acls)} access "
                       f"list(s) will be DELETED and replaced by the backup.[/red]")
         console.print("[red]   Nothing is reconciled or merged. Certificates and users "
                       "here are left alone.[/red]")
+        if len(doomed_hosts) != len(target_hosts) or len(doomed_acls) != len(target_acls):
+            console.print(f"[yellow]   Except for the skipped section(s) above: "
+                          f"only {len(doomed_hosts)} proxy host(s) and "
+                          f"{len(doomed_acls)} access list(s) are actually "
+                          f"deleted.[/yellow]")
         console.print("[yellow]   If you have not already, cancel and run "
                       "`npm-api backup` first.[/yellow]")
 
@@ -1989,7 +2131,7 @@ def restore(
     with console.status("[bold green]Restoring...") as status:
         # Hosts before access lists: NPM will not drop an access list a host
         # still references.
-        for host in target_hosts:
+        for host in doomed_hosts:
             host_id = host.get("id")
             status.update(f"[bold green]Removing host {host_id}...")
             try:
@@ -2001,7 +2143,7 @@ def restore(
                               f"{format_http_error(exc)}[/red]")
                 error_count += 1
 
-        for acl in target_acls:
+        for acl in doomed_acls:
             acl_id = acl.get("id")
             status.update(f"[bold green]Removing access list {acl_id}...")
             try:

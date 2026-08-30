@@ -1129,6 +1129,40 @@ class TestFullBackup(_WorkdirTestCase):
         self.assertTrue(list((self.workdir / ".access_lists").glob("access_lists_*.json")),
                         msg="the access lists section was not written")
 
+    def test_a_failing_section_is_named_inside_the_file(self):
+        # The document is written either way, so from the inside a section
+        # whose fetch failed looks exactly like one that held nothing. restore
+        # deletes what a backup says nothing about, so the file has to say it.
+        class _BrokenHostsClient(_BackupClient):
+            def list_hosts(self):
+                raise requests.HTTPError("500 Server Error")
+
+        _BrokenHostsClient().full_backup(str(self.workdir), include_keys=False)
+
+        written = json.loads((self.workdir / "full_config_latest.json").read_text())
+        self.assertNotIn("proxy_hosts", written)
+        self.assertIn("proxy_hosts", written["incomplete_sections"])
+        self.assertIn("500 Server Error", written["incomplete_sections"]["proxy_hosts"])
+
+    def test_the_recorded_key_is_the_section_name_not_the_printed_label(self):
+        # result.failures says "access lists" because a human reads it. restore
+        # looks the section up by key and would never find the spaced spelling.
+        class _BrokenAclClient(_BackupClient):
+            def list_access_lists(self):
+                raise requests.HTTPError("500 Server Error")
+
+        _BrokenAclClient().full_backup(str(self.workdir), include_keys=False)
+
+        written = json.loads((self.workdir / "full_config_latest.json").read_text())
+        self.assertEqual(list(written["incomplete_sections"]), ["access_lists"])
+
+    def test_a_clean_backup_grows_no_incomplete_sections_key(self):
+        # Every reader would otherwise have to know to ignore an empty one.
+        _BackupClient().full_backup(str(self.workdir), include_keys=False)
+
+        written = json.loads((self.workdir / "full_config_latest.json").read_text())
+        self.assertNotIn("incomplete_sections", written)
+
     def test_result_path_points_at_the_output_directory(self):
         result = _BackupClient().full_backup(str(self.workdir), include_keys=False)
         self.assertEqual(Path(result.path), self.workdir)
@@ -3110,6 +3144,166 @@ class TestLoadBackup(_WorkdirTestCase):
 
 
 # =============================================================================
+# backup_section
+# =============================================================================
+
+class TestBackupSection(unittest.TestCase):
+    """Whether a backup can speak for a section at all.
+
+    The distinction the whole restore hangs on: "there were none" is an
+    instruction to delete, "we never found out" is not, and both used to read
+    as the same empty list.
+    """
+
+    def test_a_populated_section_comes_back_with_no_reason(self):
+        rows, reason = npm_api.backup_section(
+            {"proxy_hosts": [{"id": 1}]}, "proxy_hosts")
+
+        self.assertEqual(rows, [{"id": 1}])
+        self.assertIsNone(reason)
+
+    def test_an_explicitly_empty_section_is_honoured(self):
+        # [] is a positive statement about the source instance, not an absence,
+        # and restoring it over a live section is the correct thing to do.
+        rows, reason = npm_api.backup_section({"proxy_hosts": []}, "proxy_hosts")
+
+        self.assertEqual(rows, [])
+        self.assertIsNone(reason)
+
+    def test_an_absent_section_is_refused_rather_than_read_as_empty(self):
+        rows, reason = npm_api.backup_section({"access_lists": []}, "proxy_hosts")
+
+        self.assertIsNone(rows)
+        self.assertIn("no such section", reason)
+
+    def test_a_null_section_is_refused(self):
+        rows, reason = npm_api.backup_section({"proxy_hosts": None}, "proxy_hosts")
+
+        self.assertIsNone(rows)
+        self.assertIn("null", reason)
+
+    def test_a_section_of_the_wrong_type_names_the_type(self):
+        for value, expected in (({"12": {}}, "dict"), ("app.lan", "str"), (3, "int")):
+            with self.subTest(value=value):
+                rows, reason = npm_api.backup_section(
+                    {"proxy_hosts": value}, "proxy_hosts")
+
+                self.assertIsNone(rows)
+                self.assertIn(expected, reason)
+
+    def test_a_section_recorded_as_incomplete_is_refused_even_when_present(self):
+        # A partial fetch that got far enough to assign something is still a
+        # section the backup cannot speak for.
+        rows, reason = npm_api.backup_section(
+            {"proxy_hosts": [{"id": 1}],
+             "incomplete_sections": {"proxy_hosts": "500 Server Error"}},
+            "proxy_hosts")
+
+        self.assertIsNone(rows)
+        self.assertIn("500 Server Error", reason)
+
+    def test_the_recorded_reason_only_covers_its_own_section(self):
+        data = {"proxy_hosts": [{"id": 1}], "access_lists": [],
+                "incomplete_sections": {"settings": "403 Forbidden"}}
+
+        self.assertIsNone(npm_api.backup_section(data, "proxy_hosts")[1])
+        self.assertIsNone(npm_api.backup_section(data, "access_lists")[1])
+        self.assertIsNotNone(npm_api.backup_section(data, "settings")[1])
+
+    def test_an_incomplete_sections_key_of_the_wrong_type_is_ignored(self):
+        # Only full_backup writes that key; anything else under it came from a
+        # hand-edit, and reading it as a marker would refuse a good section.
+        for recorded in ("proxy_hosts", ["proxy_hosts"], 7):
+            with self.subTest(recorded=recorded):
+                rows, reason = npm_api.backup_section(
+                    {"proxy_hosts": [{"id": 1}], "incomplete_sections": recorded},
+                    "proxy_hosts")
+
+                self.assertEqual(rows, [{"id": 1}])
+                self.assertIsNone(reason)
+
+
+# =============================================================================
+# validate_backup_rows
+# =============================================================================
+
+class TestValidateBackupRows(unittest.TestCase):
+    """The gate that has to close before the first delete.
+
+    Everything it catches used to surface as an AttributeError from the rebuild
+    loop, which runs only once the target has been emptied.
+    """
+
+    def test_a_well_formed_backup_passes(self):
+        npm_api.validate_backup_rows({
+            "proxy_hosts": [_merge_host(1, ["app.example.com"])],
+            "access_lists": [_backup_acl(4, "internal")],
+            "certificates": [_backup_cert(7, ["app.example.com"])],
+            "settings": [_backup_setting("default-site")],
+        })
+
+    def test_absent_and_null_sections_are_left_to_backup_section(self):
+        # They are skipped rather than restored, so their shape decides
+        # nothing and refusing over them would reject a usable backup.
+        npm_api.validate_backup_rows({"proxy_hosts": None, "access_lists": []})
+
+    def test_a_section_that_is_not_a_list_is_refused(self):
+        for key in npm_api.VALIDATED_SECTIONS:
+            with self.subTest(key=key):
+                with self.assertRaises(npm_api.NPMError) as caught:
+                    npm_api.validate_backup_rows({key: {"12": {}}})
+
+                self.assertIn(key, str(caught.exception))
+                self.assertIn("dict", str(caught.exception))
+
+    def test_a_row_that_is_not_a_record_names_the_section_and_the_index(self):
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.validate_backup_rows(
+                {"proxy_hosts": [_merge_host(1, ["a.lan"]), None]})
+
+        self.assertIn("proxy_hosts", str(caught.exception))
+        self.assertIn("1", str(caught.exception))
+
+    def test_every_section_has_its_rows_checked(self):
+        for key in npm_api.VALIDATED_SECTIONS:
+            with self.subTest(key=key):
+                with self.assertRaises(npm_api.NPMError):
+                    npm_api.validate_backup_rows({key: [None]})
+
+    def test_an_access_list_whose_items_are_not_a_list_is_refused(self):
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.validate_backup_rows({
+                "access_lists": [_backup_acl(4, "internal",
+                                             items={"ops": {"password": "s3cret"}})]})
+
+        self.assertIn("items", str(caught.exception))
+
+    def test_a_null_item_row_is_refused(self):
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.validate_backup_rows(
+                {"access_lists": [_backup_acl(4, "internal", items=[None])]})
+
+        self.assertIn("items", str(caught.exception))
+        self.assertIn("0", str(caught.exception))
+
+    def test_a_null_client_row_is_refused(self):
+        with self.assertRaises(npm_api.NPMError) as caught:
+            npm_api.validate_backup_rows(
+                {"access_lists": [_backup_acl(4, "internal", clients=[None])]})
+
+        self.assertIn("clients", str(caught.exception))
+
+    def test_absent_items_and_clients_are_not_invented(self):
+        # restore_acl_payload reads both as empty, which is a real access list
+        # NPM will accept — an older backup that omitted them is still usable.
+        npm_api.validate_backup_rows({"access_lists": [{"id": 4, "name": "internal"}]})
+
+    def test_null_items_and_clients_are_accepted(self):
+        npm_api.validate_backup_rows(
+            {"access_lists": [{"id": 4, "name": "x", "items": None, "clients": None}]})
+
+
+# =============================================================================
 # cert_match_key
 # =============================================================================
 
@@ -4051,6 +4245,183 @@ class TestRestoreCleanRun(_RestoreCommandTestCase):
 
         self.assertPrinted("come back with something dropped")
         self.assertPrinted("app.example.com")
+
+
+class TestRestoreSkipsSectionsTheBackupCannotSpeakFor(_RestoreCommandTestCase):
+    """A section the backup says nothing about is left standing.
+
+    full_backup only assigns a section once its fetch has returned, so a
+    section whose fetch failed is missing from the file entirely. Read as [],
+    it became an instruction to delete every one of them and put none back —
+    silently, and with no symptom until someone looked.
+    """
+
+    def test_an_absent_proxy_hosts_section_deletes_no_hosts(self):
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")])
+        client = self._client(hosts=[{"id": 61}, {"id": 62}], acls=[{"id": 71}])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.deleted_host_ids, [])
+        self.assertEqual(client.deleted_acl_ids, [71])
+
+    def test_an_absent_access_lists_section_deletes_no_access_lists(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.deleted_host_ids, [61])
+        self.assertEqual(client.deleted_acl_ids, [])
+
+    def test_skipping_certificates_warns_that_hosts_come_back_without_tls(self):
+        # Certificates are never deleted or created by restore, so the generic
+        # "nothing in that section will be deleted or created" line is true
+        # here and useless. Matching is the only thing that maps the backup's
+        # certificate IDs onto this NPM's, so skipping it is precisely what
+        # strips TLS from every host that comes back.
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"], certificate_id=3)],
+            access_lists=[], settings=[],
+            incomplete_sections={"certificates": "HTTP 500"})
+        client = self._client(hosts=[])
+
+        self._restore(client, source)
+
+        self.assertPrinted("without TLS")
+        self.assertNotPrinted("deleted or created here")
+
+    def test_an_explicitly_empty_section_still_wipes(self):
+        # The other half of the pair. [] says the source instance had none, and
+        # replacing the target's with none is then exactly right.
+        source = self._backup_file(proxy_hosts=[],
+                                   access_lists=[_backup_acl(4, "internal")])
+        client = self._client(hosts=[{"id": 61}])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.deleted_host_ids, [61])
+
+    def test_the_skipped_section_is_named_out_loud(self):
+        source = self._backup_file(access_lists=[_backup_acl(4, "internal")])
+
+        self._restore(self._client(hosts=[{"id": 61}]), source)
+
+        self.assertPrinted("Skipping proxy hosts")
+        self.assertPrinted("no such section")
+
+    def test_a_section_recorded_as_incomplete_is_skipped_though_present(self):
+        # The marker full_backup writes when a fetch failed part way. Whatever
+        # landed in the section is not the whole of it, so it cannot be used to
+        # decide what to delete.
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"])],
+            access_lists=[_backup_acl(4, "internal")],
+            incomplete_sections={"proxy_hosts": "500 Server Error"})
+        client = self._client(hosts=[{"id": 61}])
+
+        self._restore(client, source)
+
+        self.assertEqual(client.deleted_host_ids, [])
+        self.assertEqual(client.created_hosts, [])
+        self.assertPrinted("500 Server Error")
+
+    def test_a_backup_that_can_speak_for_nothing_exits_1(self):
+        # Every restorable section skipped. Without this the command would run
+        # to the end having done nothing at all and exit 0.
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"])],
+            incomplete_sections={"proxy_hosts": "500 Server Error"})
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+        exit_exc = self._restore_expecting_exit(client, source)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertEqual(client.calls, [])
+
+    def test_the_warning_says_how_many_are_really_deleted(self):
+        source = self._backup_file(proxy_hosts=[_merge_host(1, ["app.example.com"])])
+        client = self._client(hosts=[{"id": 61}], acls=[{"id": 71}, {"id": 72}])
+
+        with mock.patch.object(npm_api.typer, "confirm", return_value=False):
+            self._restore_expecting_exit(client, source, yes=False)
+
+        self.assertPrinted("only 1 proxy host(s) and 0 access list(s)")
+
+
+class TestRestoreValidatesBeforeItDeletes(_RestoreCommandTestCase):
+    """A malformed row must stop the run while the target is still intact.
+
+    restore_acl_payload and host_config_payload both run in the rebuild loop,
+    which is reached only after every host and access list on the target has
+    been deleted. An AttributeError there leaves a live NPM emptied.
+    """
+
+    def _target(self):
+        return self._client(hosts=[{"id": 61}], acls=[{"id": 71}])
+
+    def test_a_null_row_stops_the_run_with_nothing_deleted(self):
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"]), None])
+        client = self._target()
+
+        with self.assertRaises(npm_api.NPMError):
+            self._restore(client, source)
+
+        self.assertEqual(client.calls, [])
+
+    def test_a_malformed_nested_row_stops_the_run_with_nothing_deleted(self):
+        source = self._backup_file(
+            access_lists=[_backup_acl(4, "internal", items=[None])])
+        client = self._target()
+
+        with self.assertRaises(npm_api.NPMError):
+            self._restore(client, source)
+
+        self.assertEqual(client.calls, [])
+
+    def test_a_section_of_the_wrong_type_stops_the_run(self):
+        source = self._backup_file(
+            proxy_hosts={"12": _merge_host(12, ["app.example.com"])})
+        client = self._target()
+
+        with self.assertRaises(npm_api.NPMError):
+            self._restore(client, source)
+
+        self.assertEqual(client.calls, [])
+
+    def test_a_bad_certificate_row_is_caught_though_certificates_are_never_written(self):
+        # Matching walks every row of the section, so a null there crashes the
+        # run just as readily as one in a section that is restored.
+        source = self._backup_file(
+            proxy_hosts=[_merge_host(1, ["app.example.com"])],
+            certificates=[None])
+        client = self._target()
+
+        with self.assertRaises(npm_api.NPMError):
+            self._restore(client, source)
+
+        self.assertEqual(client.calls, [])
+
+    def test_the_refusal_names_the_section_and_the_row(self):
+        source = self._backup_file(settings=[_backup_setting("default-site"), None])
+
+        with self.assertRaises(npm_api.NPMError) as caught:
+            self._restore(self._target(), source)
+
+        self.assertIn("settings", str(caught.exception))
+        self.assertIn("1", str(caught.exception))
+
+    def test_validation_happens_before_the_target_is_read(self):
+        # Reading the target is harmless, but the message would then arrive
+        # after a screen of preview about a restore that cannot happen.
+        source = self._backup_file(proxy_hosts=[None])
+        client = self._target()
+
+        with self.assertRaises(npm_api.NPMError):
+            self._restore(client, source, preview=True)
+
+        self.assertNotPrinted("Restore Preview")
 
 
 # =============================================================================
