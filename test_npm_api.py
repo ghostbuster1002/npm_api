@@ -2759,7 +2759,7 @@ class TestDescribeHostDifferences(unittest.TestCase):
         # different single-location lists therefore read as the same.
         target, source = self._pair(
             locations=([{"path": "/api", "forward_host": "10.0.0.5"}],
-                       [{"path": "/admin", "forward_host": "10.9.9.9"}]))
+                       [{"path": "/admin", "forward_host": "192.0.2.10"}]))
         self.assertEqual(npm_api.describe_host_differences(target, source), [])
 
     def test_a_differing_number_of_locations_is_reported(self):
@@ -3029,7 +3029,7 @@ class TestHostMergeSafety(_MergeCommandTestCase):
         # repointed. That is a refusal rather than a warning because nothing in
         # the request says the user meant it.
         for field, value in (("forward_scheme", "https"),
-                             ("forward_host", "10.9.9.9"),
+                             ("forward_host", "192.0.2.10"),
                              ("forward_port", 9090)):
             with self.subTest(field=field):
                 client = self._client(_merge_host(12, ["app.example.com"]),
@@ -5323,47 +5323,47 @@ class TestWarnOnMixedBases(_ConsoleTestCase):
 
     def test_case_folding_does_not_hide_a_genuine_second_base(self):
         bases = npm_api.warn_on_mixed_bases(
-            ["App.Example.com", "nas.HOME.lan"], "Host 12")
+            ["App.Example.com", "nas.EXAMPLE.org"], "Host 12")
 
-        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertEqual(bases, ["example.com", "example.org"])
         self.assertPrinted("2 unrelated base domains")
 
     def test_two_bases_are_both_returned_and_named(self):
         bases = npm_api.warn_on_mixed_bases(
-            ["app.example.com", "nas.home.lan"], "Host 12")
+            ["app.example.com", "nas.example.org"], "Host 12")
 
-        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertEqual(bases, ["example.com", "example.org"])
         self.assertPrinted("2 unrelated base domains")
-        self.assertPrinted("example.com, home.lan")
+        self.assertPrinted("example.com, example.org")
 
     def test_the_warning_names_its_subject(self):
         # Called from merge and from clone, which are talking about different
         # things — the surviving host in one case, a host that does not exist
         # yet in the other.
-        npm_api.warn_on_mixed_bases(["app.example.com", "nas.home.lan"], "The new host")
+        npm_api.warn_on_mixed_bases(["app.example.com", "nas.example.org"], "The new host")
         self.assertPrinted("The new host will answer to")
 
     def test_the_warning_explains_the_single_certificate_constraint(self):
         # The count alone is not actionable. What makes it act-on-able is that
         # a host answering to a name its one certificate omits is precisely the
         # fault `host split` exists to undo.
-        npm_api.warn_on_mixed_bases(["app.example.com", "nas.home.lan"], "Host 12")
+        npm_api.warn_on_mixed_bases(["app.example.com", "nas.example.org"], "Host 12")
 
         self.assertPrinted("one nginx server block with one certificate")
         self.assertPrinted("host split")
 
     def test_the_bases_come_back_sorted(self):
         bases = npm_api.warn_on_mixed_bases(
-            ["nas.home.lan", "app.example.com", "shop.internal.lan"], "Host 12")
+            ["nas.example.org", "app.example.com", "shop.internal.lan"], "Host 12")
 
-        self.assertEqual(bases, ["example.com", "home.lan", "internal.lan"])
+        self.assertEqual(bases, ["example.com", "example.org", "internal.lan"])
 
     def test_every_base_is_named_not_just_the_first_two(self):
         npm_api.warn_on_mixed_bases(
-            ["nas.home.lan", "app.example.com", "shop.internal.lan"], "Host 12")
+            ["nas.example.org", "app.example.com", "shop.internal.lan"], "Host 12")
 
         self.assertPrinted("3 unrelated base domains")
-        self.assertPrinted("example.com, home.lan, internal.lan")
+        self.assertPrinted("example.com, example.org, internal.lan")
 
     def test_repeated_bases_collapse_to_one(self):
         bases = npm_api.warn_on_mixed_bases(
@@ -5383,9 +5383,9 @@ class TestWarnOnMixedBases(_ConsoleTestCase):
 
     def test_an_unusable_domain_beside_two_real_bases_is_not_named(self):
         bases = npm_api.warn_on_mixed_bases(
-            ["localhost", "app.example.com", "nas.home.lan"], "Host 12")
+            ["localhost", "app.example.com", "nas.example.org"], "Host 12")
 
-        self.assertEqual(bases, ["example.com", "home.lan"])
+        self.assertEqual(bases, ["example.com", "example.org"])
         self.assertPrinted("2 unrelated base domains")
         self.assertNotPrinted("localhost")
 
@@ -5413,7 +5413,7 @@ class _MixedBaseTestCase(_MergeCommandTestCase):
 
     # Covers both bases used below, so the only warning a mixed-base test can
     # produce is the one under test rather than a coverage complaint.
-    _CERT = {"id": 4, "domain_names": ["*.example.com", "*.home.lan"],
+    _CERT = {"id": 4, "domain_names": ["*.example.com", "*.example.org"],
              "expires_on": _expires_in(timedelta(days=90))}
 
     _WARNING = "unrelated base domains"
@@ -5427,7 +5427,7 @@ class _MixedBaseTestCase(_MergeCommandTestCase):
 
 
 class TestHostMergeMixedBases(_MixedBaseTestCase):
-    """Merge is where this was found: a host of *.home.lan names folded into one
+    """Merge is where this was found: a host of *.example.org names folded into one
     of *.example.com names, under a single uploaded certificate whose metadata
     was unusable enough that the coverage check could only shrug."""
 
@@ -5436,18 +5436,18 @@ class TestHostMergeMixedBases(_MixedBaseTestCase):
                 [_merge_host(13, source_domains)])
 
     def test_a_union_spanning_two_bases_warns_and_names_both(self):
-        target, sources = self._hosts(["nas.home.lan"])
+        target, sources = self._hosts(["nas.example.org"])
         client = self._client(target, sources, certificate=self._CERT)
 
         self._merge(client, host_ids="13")
 
         self.assertPrinted(self._WARNING)
-        self.assertPrinted("example.com, home.lan")
+        self.assertPrinted("example.com, example.org")
 
     def test_the_warning_is_about_the_whole_union_not_one_host(self):
         # Neither host on its own spans two bases; only the result does, which
         # is why the check runs on the merged list rather than per source.
-        target, sources = self._hosts(["nas.home.lan", "printer.home.lan"])
+        target, sources = self._hosts(["nas.example.org", "printer.example.org"])
         client = self._client(target, sources, certificate=self._CERT)
 
         self._merge(client, host_ids="13")
@@ -5465,7 +5465,7 @@ class TestHostMergeMixedBases(_MixedBaseTestCase):
     def test_the_warning_does_not_block_the_merge(self):
         # Advisory, not a refusal: a multi-SAN certificate covering both bases
         # is a legitimate setup, and only the operator can tell.
-        target, sources = self._hosts(["nas.home.lan"])
+        target, sources = self._hosts(["nas.example.org"])
         client = self._client(target, sources, certificate=self._CERT)
 
         self._merge(client, host_ids="13")
@@ -5477,7 +5477,7 @@ class TestHostMergeMixedBases(_MixedBaseTestCase):
     def test_cert_none_never_raises_the_question(self):
         # No certificate is being assigned, so there is no single certificate
         # for the names to have to fit inside and nothing to warn about.
-        target, sources = self._hosts(["nas.home.lan"])
+        target, sources = self._hosts(["nas.example.org"])
         client = self._client(target, sources)
 
         self._merge(client, host_ids="13", cert="none")
@@ -5495,10 +5495,10 @@ class TestHostCloneMixedBases(_MixedBaseTestCase):
     def test_new_domains_spanning_two_bases_warn(self):
         client = self._client(self._source(), [], certificate=self._CERT)
 
-        self._clone(client, ["shop.example.com", "nas.home.lan"])
+        self._clone(client, ["shop.example.com", "nas.example.org"])
 
         self.assertPrinted(self._WARNING)
-        self.assertPrinted("example.com, home.lan")
+        self.assertPrinted("example.com, example.org")
         self.assertPrinted("The new host")
 
     def test_new_domains_on_one_base_do_not_warn(self):
@@ -5511,7 +5511,7 @@ class TestHostCloneMixedBases(_MixedBaseTestCase):
     def test_the_warning_is_about_the_new_domains_not_the_sources(self):
         # The clone gets its own server block, so what the host it was copied
         # from answers to has no bearing on whether the new one is coherent.
-        client = self._client(_merge_host(12, ["nas.home.lan"], certificate_id=4),
+        client = self._client(_merge_host(12, ["nas.example.org"], certificate_id=4),
                               [], certificate=self._CERT)
 
         self._clone(client, ["shop.example.com", "api.example.com"])
@@ -5521,7 +5521,7 @@ class TestHostCloneMixedBases(_MixedBaseTestCase):
     def test_the_warning_does_not_block_the_clone(self):
         client = self._client(self._source(), [], certificate=self._CERT)
 
-        self._clone(client, ["shop.example.com", "nas.home.lan"])
+        self._clone(client, ["shop.example.com", "nas.example.org"])
 
         self.assertPrinted(self._WARNING)
         self.assertEqual(client.recreated_ids, [12])
@@ -5530,7 +5530,7 @@ class TestHostCloneMixedBases(_MixedBaseTestCase):
     def test_cert_none_never_raises_the_question(self):
         client = self._client(self._source(), [])
 
-        self._clone(client, ["shop.example.com", "nas.home.lan"], cert="none")
+        self._clone(client, ["shop.example.com", "nas.example.org"], cert="none")
 
         self.assertNotPrinted(self._WARNING)
         self.assertEqual(client.recreated_ids, [12])
@@ -6123,7 +6123,7 @@ class TestCertificateStatusLabelling(_ConsoleTestCase):
                                     "expires_on": _expires_in(timedelta(days=90))})
 
         npm_api.validate_certificate_assignment(
-            client, 4, [{"id": 12, "domain_names": ["nas.home.lan"]}])
+            client, 4, [{"id": 12, "domain_names": ["nas.example.org"]}])
 
         # The markup is kept rather than rendered here, so the assertion pins
         # the two as adjacent: the word has to qualify the label, not sit
@@ -7303,7 +7303,7 @@ class TestConfigPrecedence(_ConfigTestCase):
 
     def test_each_environment_variable_beats_the_file(self):
         cases = (
-            ("NPM_API_HOST", "nginx_ip", "10.9.9.9"),
+            ("NPM_API_HOST", "nginx_ip", "192.0.2.10"),
             ("NPM_API_PORT", "nginx_port", "9191"),
             ("NPM_API_USER", "api_user", "env@example.com"),
             ("NPM_API_PASS", "api_pass", "envpass"),
