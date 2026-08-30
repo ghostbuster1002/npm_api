@@ -81,5 +81,10 @@ htmlcov/
 # Ignored so a stray `git add -A` cannot publish a pile of red tests.
 test_qa_*.py
 
+# Patch bundles carried between machines by hand. The sandbox that writes
+# them cannot reach GitHub, so commits travel as `git format-patch` output
+# and land here to be applied; they are a transport, never content.
+mbox/
+
 # Logs
 *.log

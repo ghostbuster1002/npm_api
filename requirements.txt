@@ -1,3 +1,16 @@
+# What npm_api.py needs to run. Nothing here is needed to *build* the binary
+# — that lives in requirements-build.txt, which includes this file.
+#
+# typer, not typer[all]: since typer 0.12 the `typer` package bundles rich and
+# shellingham, and the `all` extra no longer exists. Asking for it now prints
+# "WARNING: typer x.y.z does not provide the extra 'all'" and installs the
+# same thing anyway.
+#
+# Floors, not ceilings. A capped major would have hidden the rich 15 upgrade
+# that broke the build on 2026-08-30 rather than surfacing it, and the fault
+# there was a test reading ANSI escape codes, not the library. CI runs the
+# suite against whatever pip resolves today, so a dependency moving under us
+# fails a workflow instead of failing an operator.
 requests>=2.28.0
-typer[all]>=0.9.0
+typer>=0.12.0
 rich>=13.0.0

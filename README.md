@@ -1,6 +1,7 @@
 # NPM-API
 
-[![Build and Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml)
+[![Tests](https://github.com/ghostbuster1002/npm_api/actions/workflows/test.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/test.yml)
+[![Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/release.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -24,17 +25,34 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 
 Download the latest release for your platform from [Releases](https://github.com/ghostbuster1002/npm_api/releases):
 
-```bash
-# Linux
-wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-amd64
-chmod +x npm-api-linux-amd64
-sudo mv npm-api-linux-amd64 /usr/local/bin/npm-api
+Assets are named for the platform they were built on. `uname -m` tells you
+which one you want — `x86_64` for an ordinary PC or server, `aarch64` for a
+Raspberry Pi or other 64-bit ARM board.
 
-# macOS
-wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-amd64
-chmod +x npm-api-macos-amd64
-sudo mv npm-api-macos-amd64 /usr/local/bin/npm-api
+```bash
+# Linux, 64-bit Intel/AMD
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-x86_64
+chmod +x npm-api-linux-x86_64
+sudo mv npm-api-linux-x86_64 /usr/local/bin/npm-api
+
+# Linux, 64-bit ARM (Raspberry Pi 4/5 on a 64-bit OS)
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-aarch64
+chmod +x npm-api-linux-aarch64
+sudo mv npm-api-linux-aarch64 /usr/local/bin/npm-api
+
+# macOS, Apple silicon
+curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-arm64
+chmod +x npm-api-macos-arm64
+sudo mv npm-api-macos-arm64 /usr/local/bin/npm-api
+
+# macOS, Intel
+curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-x86_64
+chmod +x npm-api-macos-x86_64
+sudo mv npm-api-macos-x86_64 /usr/local/bin/npm-api
 ```
+
+A binary is built for the architecture of the runner that produced it and will
+not run on another. There is no universal build.
 
 ### Build from Source
 

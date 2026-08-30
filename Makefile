@@ -46,10 +46,15 @@ venv:
 	python3 -m venv venv
 	@echo "Done! Activate with: source venv/bin/activate"
 
+# requirements-build.txt pulls in requirements.txt, so this one line installs
+# the runtime deps and PyInstaller together. The list used to be spelled out
+# here as well as in build.sh, build.yml and requirements.txt — four copies,
+# of which only requirements.txt carried versions, and none of which agreed
+# after typer dropped its `all` extra.
 deps: venv
 	@echo "Installing dependencies..."
 	./venv/bin/pip install --upgrade pip
-	./venv/bin/pip install requests "typer[all]" rich pyinstaller
+	./venv/bin/pip install -r requirements-build.txt
 	@echo "Done!"
 
 # deps first: the tests import npm_api, which needs requests/typer/rich, and

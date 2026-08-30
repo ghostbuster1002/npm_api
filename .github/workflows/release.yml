@@ -1,0 +1,142 @@
+# Builds a standalone binary per platform and attaches them to a GitHub
+# release. Replaces the build.yml that sat in the repo root and so never ran.
+#
+# How a release happens:
+#   git tag -a v1.2.3 -m "..."   &&   git push origin v1.2.3
+# The tag push triggers this. The `build` job compiles one binary per target
+# and uploads each as a workflow artifact; the `release` job then collects
+# every artifact and creates the GitHub release with all of them attached.
+#
+# Two jobs rather than one because a five-way matrix creating the same
+# release five times in parallel is a race. Build in parallel, publish once.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Lets you build binaries from any branch without tagging, to check the
+  # build works. Artifacts are produced; no release is created.
+  workflow_dispatch:
+
+# Default to read-only and grant contents:write in the one job that publishes.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            asset: npm-api-linux-x86_64
+            binary: npm-api
+            strip: "--strip"
+          # Free for public repositories since early 2025. This is the one
+          # that matters for a Raspberry Pi.
+          - os: ubuntu-24.04-arm
+            asset: npm-api-linux-aarch64
+            binary: npm-api
+            strip: "--strip"
+          # macos-13 is the last Intel image; macos-latest is Apple silicon.
+          # The old workflow called macos-latest "amd64", which stopped being
+          # true when GitHub moved the label to ARM in 2024.
+          - os: macos-13
+            asset: npm-api-macos-x86_64
+            binary: npm-api
+            strip: ""
+          - os: macos-latest
+            asset: npm-api-macos-arm64
+            binary: npm-api
+            strip: ""
+          - os: windows-latest
+            asset: npm-api-windows-x86_64.exe
+            binary: npm-api.exe
+            strip: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      # A tag can point at any commit, including one that never went through
+      # the Tests workflow. Do not ship a binary from an untested tree.
+      # Spelled out rather than `make test` because make is absent on the
+      # Windows runner; keep the pattern in step with the Makefile's.
+      - name: Run the test suite
+        run: python -m unittest discover -b -p "test_npm_api.py"
+
+      # --strip only on Linux. On Windows it needs binutils that are not
+      # there, and on Apple silicon stripping a signed binary invalidates the
+      # signature and the result refuses to launch. The old workflow passed
+      # it everywhere.
+      - name: Build the binary
+        run: >
+          pyinstaller --onefile --name npm-api --clean --noconfirm --console
+          ${{ matrix.strip }}
+          --exclude-module tkinter --exclude-module matplotlib
+          --exclude-module numpy --exclude-module scipy
+          --exclude-module PIL --exclude-module cv2
+          npm_api.py
+
+      # PyInstaller reports success for a binary that cannot resolve its own
+      # imports at runtime; typer and rich both load things dynamically, which
+      # is exactly the case a frozen build gets wrong. Run it once.
+      - name: Smoke-test the binary
+        shell: bash
+        run: ./dist/${{ matrix.binary }} --help
+
+      - name: Name it for its platform
+        shell: bash
+        run: mv "dist/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # Only publish for a tag. A workflow_dispatch run stops after build, so
+    # you can prove the binaries compile without cutting a release.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create a release and attach files. GITHUB_TOKEN is
+      # injected automatically; no secret needs configuring.
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          # Flatten every artifact into dist/ rather than one directory each.
+          merge-multiple: true
+
+      - name: Show what will be published
+        run: ls -lh dist
+
+      # gh is preinstalled on GitHub runners, so this needs no third-party
+      # action — one less thing to pin and to trust. GH_REPO is set because
+      # nothing is checked out here, so gh has no git remote to infer from.
+      - name: Create the release and attach every binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag

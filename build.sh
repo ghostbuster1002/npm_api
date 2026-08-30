@@ -31,10 +31,12 @@ fi
 echo "📦 Activating virtual environment..."
 source "$SCRIPT_DIR/venv/bin/activate"
 
-# Install dependencies
+# Install dependencies. Read from requirements-build.txt, which includes
+# requirements.txt, rather than repeating the list here: this script and the
+# Makefile drifted apart once already.
 echo "📦 Installing dependencies..."
 pip install --upgrade pip --quiet
-pip install requests "typer[all]" rich pyinstaller --quiet
+pip install -r "$SCRIPT_DIR/requirements-build.txt" --quiet
 
 # Check if the Python script exists
 if [ ! -f "$SCRIPT_DIR/$PYTHON_FILE" ]; then
@@ -42,9 +44,17 @@ if [ ! -f "$SCRIPT_DIR/$PYTHON_FILE" ]; then
     exit 1
 fi
 
+cd "$SCRIPT_DIR"
+
+# Run the tests before building. `make build` has always done this; this
+# script did not, so the no-make path could ship a binary nothing had run.
+# Scoped to test_npm_api.py for the same reason the Makefile is: a QA sweep
+# leaves deliberately-red scratch suites beside the code.
+echo "🧪 Running tests..."
+python3 -m unittest discover -b -p 'test_npm_api.py'
+
 # Build the binary
 echo "🔨 Building binary..."
-cd "$SCRIPT_DIR"
 
 pyinstaller \
     --onefile \
