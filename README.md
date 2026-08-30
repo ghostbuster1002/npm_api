@@ -54,6 +54,12 @@ sudo mv npm-api-macos-x86_64 /usr/local/bin/npm-api
 A binary is built for the architecture of the runner that produced it and will
 not run on another. There is no universal build.
 
+**Linux is the supported target.** The macOS and Windows binaries are built on
+a best-effort basis: nobody here runs them, so they are unverified beyond
+starting once on the build machine. If one is missing from a release it is
+because that build failed; build from source instead. A binary carries its own
+Python, so nothing needs installing to run one.
+
 ### Build from Source
 
 ```bash
@@ -62,6 +68,10 @@ cd npm_api
 make build
 sudo make install
 ```
+
+Release binaries are built with **Python 3.11**. The test suite is run against
+3.10, 3.11, 3.12 and 3.13 on every push, so those are the versions the tool is
+actually known to work on rather than merely claimed to.
 
 `make build` installs dependencies, runs the test suite, then builds. To run the
 tests on their own:

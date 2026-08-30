@@ -29,16 +29,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux is the supported target. This one must succeed: a failure
+          # here stops the release rather than publishing without it.
           - os: ubuntu-24.04
             asset: npm-api-linux-x86_64
             binary: npm-api
             strip: "--strip"
-          # Free for public repositories since early 2025. This is the one
-          # that matters for a Raspberry Pi.
+            optional: false
+          # The Raspberry Pi target, and the second one that matters here.
+          # Optional only because ubuntu-24.04-arm is a runner label that has
+          # never been exercised in this repository — GitHub made ARM runners
+          # free for public repos in early 2025, but an unknown label fails
+          # the whole job, and that must not block the x86_64 release.
+          # Once one release proves it works, set this to false: a missing
+          # Pi binary should be a failure, not a shrug.
           - os: ubuntu-24.04-arm
             asset: npm-api-linux-aarch64
             binary: npm-api
             strip: "--strip"
+            optional: true
+          # Everything below is best effort. Nobody here runs macOS or
+          # Windows, so these are unverified in practice and must never be
+          # able to hold up a Linux release -- see continue-on-error below.
+          #
           # macos-13 is the last Intel image; macos-latest is Apple silicon.
           # The old workflow called macos-latest "amd64", which stopped being
           # true when GitHub moved the label to ARM in 2024.
@@ -46,16 +59,26 @@ jobs:
             asset: npm-api-macos-x86_64
             binary: npm-api
             strip: ""
+            optional: true
           - os: macos-latest
             asset: npm-api-macos-arm64
             binary: npm-api
             strip: ""
+            optional: true
           - os: windows-latest
             asset: npm-api-windows-x86_64.exe
             binary: npm-api.exe
             strip: ""
+            optional: true
 
     runs-on: ${{ matrix.os }}
+
+    # `needs: build` waits for every matrix job, and a failed one would block
+    # the release job even with fail-fast off. Marking the optional targets
+    # continue-on-error lets them fail without taking the Linux binaries down
+    # with them. A broken build still publishes nothing for that platform:
+    # the --help smoke test below fails the step, so no artifact is uploaded.
+    continue-on-error: ${{ matrix.optional }}
 
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +150,24 @@ jobs:
 
       - name: Show what will be published
         run: ls -lh dist
+
+      # continue-on-error means an optional target can fail and leave no
+      # artifact behind. Say so out loud: a release that quietly ships four
+      # binaries instead of five looks complete from the release page, and
+      # the person who wanted the missing one only finds out on download.
+      - name: Report any platform that produced nothing
+        run: |
+          missing=""
+          for asset in npm-api-linux-x86_64 npm-api-linux-aarch64 \
+                       npm-api-macos-x86_64 npm-api-macos-arm64 \
+                       npm-api-windows-x86_64.exe; do
+            [ -f "dist/$asset" ] || missing="$missing $asset"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::No binary was produced for:$missing"
+          else
+            echo "Every platform produced a binary."
+          fi
 
       # gh is preinstalled on GitHub runners, so this needs no third-party
       # action — one less thing to pin and to trust. GH_REPO is set because

@@ -55,8 +55,12 @@ except ImportError as e:
     print("\n" + "=" * 60, file=sys.stderr)
     sys.exit(1)
 
-# Version
-VERSION = "3.0.7-py"
+# Version. Tracks the git tag and the GitHub release, so a bug report quoting
+# `npm-api info` names a build that can be checked out. Was "3.0.7-py",
+# carried over from the bash script this was ported from; no Python release
+# ever bore a 3.x number, and the release history is the lineage that is
+# actually public. Bump this in the same commit that tags a release.
+VERSION = "2.0.0"
 
 # Initialize Rich consoles and Typer app.
 #

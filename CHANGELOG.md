@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [2.0.0] - 2026-08-31
+
+A major version because the breaking changes below alter the behaviour of
+commands that already existed, not because of the size of the release. Anyone
+scripting against 1.0.0 should read the four items in the next section before
+upgrading.
+
 ### ⚠️ Breaking Changes
 
 Three changes require action before upgrading. Each is repeated in the
