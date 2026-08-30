@@ -74,5 +74,12 @@ htmlcov/
 .tox/
 .nox/
 
+# Scratch suites from a QA sweep: one deliberately failing test per finding
+# that has not been fixed yet, kept beside the code while it is worked
+# through. They are working notes, not coverage — anything worth keeping is
+# rewritten into test_npm_api.py, which is the suite that must always pass.
+# Ignored so a stray `git add -A` cannot publish a pile of red tests.
+test_qa_*.py
+
 # Logs
 *.log
