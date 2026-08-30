@@ -2699,6 +2699,46 @@ def require_nonempty_domain_names(field: str, value: Any) -> None:
         raise typer.Exit(1)
 
 
+def host_changed_since(client: NPMClient, host: Dict) -> Optional[str]:
+    """A description of how the host differs from this copy, or None.
+
+    Every bulk command reads its hosts, prints a preview, waits for a human,
+    and only then writes. That wait is the one interval in the program measured
+    in minutes rather than milliseconds, and the writes are full-field
+    overwrites — so a domain added in the NPM UI while the prompt is on screen
+    is written straight back out again unless somebody looks. This is that look,
+    called immediately before each destructive write.
+
+    Both domain_names and modified_on are compared, not just the timestamp:
+    NPM's modified_on has second resolution, so two edits inside one second are
+    indistinguishable, and domain_names is the field these commands overwrite.
+    Domains are compared order-insensitively, since NPM returns them in
+    whatever order it stored them and a reorder changes nothing about what the
+    host serves — but sorted rather than as sets, so a name appearing twice
+    still reads as a change.
+
+    Re-reads through the client rather than trusting the caller's dict: the
+    real get_host parses fresh JSON on every call, so the caller holds an
+    independent copy and only a genuine round trip can see what NPM holds now.
+    """
+    host_id = host.get("id")
+    try:
+        current = client.get_host(host_id)
+    except requests.HTTPError:
+        return "it no longer exists"
+
+    before = [str(d) for d in host.get("domain_names") or []]
+    after = [str(d) for d in current.get("domain_names") or []]
+    if sorted(before) != sorted(after):
+        return (f"its domains are now {', '.join(after) or '(none)'}, not "
+                f"{', '.join(before) or '(none)'}")
+
+    was, now = host.get("modified_on"), current.get("modified_on")
+    if was != now:
+        return f"it was modified at {now}, not {was}"
+    return None
+
+
 def apply_domain_changes(client: NPMClient, changes: List[Dict],
                          describe) -> None:
     """Write each change's resulting_domains back, then summarise.
@@ -2712,6 +2752,18 @@ def apply_domain_changes(client: NPMClient, changes: List[Dict],
     with console.status("[bold green]Applying changes...") as status:
         for change in changes:
             host_id = change["host_id"]
+
+            # The change was computed from a read taken before the
+            # confirmation prompt, and resulting_domains is written as a
+            # full replacement, so anything added to the host meanwhile
+            # would be silently dropped. Skip rather than overwrite.
+            changed = host_changed_since(client, change["host"])
+            if changed:
+                console.print(f"  [yellow]⚠️  Host {host_id}: skipped — {changed} "
+                              f"since this change was worked out[/yellow]")
+                error_count += 1
+                continue
+
             try:
                 status.update(f"[bold green]Updating host {host_id}...")
                 client.update_host(host_id, {"domain_names": change["resulting_domains"]})
@@ -2991,7 +3043,11 @@ def host_split(
             continue
 
         plans.append({"source": source, "id": host_id, "all": domains,
-                      "moving": moving, "staying": staying})
+                      "moving": moving, "staying": staying,
+                      # The source as it was when the plan was worked out, for
+                      # host_changed_since to compare a fresh read against
+                      # after the confirmation prompt.
+                      "before": dict(source, domain_names=domains)})
 
     if not plans:
         console.print("[yellow]Nothing to split[/yellow]")
@@ -3071,6 +3127,17 @@ def host_split(
         for plan in plans:
             host_id = plan["id"]
             status.update(f"[bold green]Splitting host {host_id}...")
+
+            # staying and moving were computed before the confirmation prompt,
+            # and the trim writes domain_names as a full replacement, so a name
+            # added meanwhile is on neither list: it would be wiped off the
+            # source and never land on the new host.
+            changed = host_changed_since(client, plan["before"])
+            if changed:
+                console.print(f"  [yellow]⚠️  Host {host_id}: skipped — {changed} "
+                              f"since this split was planned[/yellow]")
+                error_count += 1
+                continue
 
             # Free the domains before creating the new host so the two never
             # overlap: NPM rejects duplicates, and nginx would otherwise end up
@@ -3337,6 +3404,20 @@ def host_merge(
 
     confirm_bulk(yes, f"Merge {len(sources)} host(s) into host {into} and delete them?")
 
+    # Once, here, and never inside the loop below: the loop writes to the
+    # target on every iteration, so its modified_on legitimately moves as a
+    # result of our own writes. Every source's domains land on this one host,
+    # so a target that moved under us fails the whole merge rather than one
+    # source of it — the merged list was built from the stale copy.
+    changed = host_changed_since(client, target)
+    if changed:
+        console.print(f"[red]❌ Host {into} changed while the confirmation prompt was "
+                      f"up — {changed}[/red]")
+        console.print(f"[red]   Refusing to merge: the domain list was worked out "
+                      f"before that change and writing it would undo it. Re-run to "
+                      f"see the current state.[/red]")
+        raise typer.Exit(1)
+
     try:
         snapshot = write_state_snapshot(client.config, f"pre_merge_{into}",
                                         {"target": target, "sources": sources})
@@ -3363,6 +3444,16 @@ def host_merge(
             source_id = source.get("id")
             incoming = [str(d) for d in source.get("domain_names", [])]
             status.update(f"[bold green]Merging host {source_id}...")
+
+            # A source is deleted outright, so a domain added to it while the
+            # prompt was up would go with it — and it is not in `incoming`
+            # either, so the target never claims it.
+            changed = host_changed_since(client, source)
+            if changed:
+                console.print(f"  [yellow]⚠️  Host {source_id}: skipped — {changed} "
+                              f"since this merge was planned[/yellow]")
+                error_count += 1
+                continue
 
             # Delete before extending the target, not after: NPM will not let
             # two hosts hold the same domain, so the name has to be free before
@@ -3874,6 +3965,10 @@ def host_bulk_add_domain(
         if new_domains_to_add:
             changes.append({
                 "host_id": host_id,
+                # Snapshotted, not referenced: host_changed_since compares this
+                # against a fresh read after the confirmation prompt, so it has
+                # to be the host as it was when the change was worked out.
+                "host": dict(host, domain_names=list(current_domains)),
                 "current_domains": current_domains,
                 "new_domains": new_domains_to_add,
                 "resulting_domains": current_domains + new_domains_to_add
@@ -3948,6 +4043,7 @@ def host_bulk_remove_domain(
         if domains_to_remove and remaining_domains:  # Must have at least one domain remaining
             changes.append({
                 "host_id": host_id,
+                "host": dict(host, domain_names=list(current_domains)),
                 "current_domains": current_domains,
                 "domains_to_remove": domains_to_remove,
                 "resulting_domains": remaining_domains
@@ -4048,6 +4144,7 @@ def host_bulk_replace_domain(
 
         changes.append({
             "host_id": host_id,
+            "host": dict(host, domain_names=list(current_domains)),
             "current_domains": current_domains,
             "replacements": replaced,
             "resulting_domains": deduped
@@ -4158,6 +4255,16 @@ def host_bulk_update(
     with console.status("[bold green]Applying changes...") as status:
         for host in hosts_to_process:
             host_id = host.get("id")
+
+            # The preview the operator approved described this host as it was
+            # read before the prompt; writing `field` onto a host that has
+            # since moved is a change they never saw.
+            changed = host_changed_since(client, host)
+            if changed:
+                console.print(f"  [yellow]⚠️  Host {host_id}: skipped — {changed} "
+                              f"since the preview was taken[/yellow]")
+                error_count += 1
+                continue
 
             try:
                 status.update(f"[bold green]Updating host {host_id}...")

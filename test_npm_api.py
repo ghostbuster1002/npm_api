@@ -1368,13 +1368,28 @@ class _UpdateRecordingClient(_StubClient):
     write was attempted and NPM rejected it" from "the host was skipped".
     """
 
-    def __init__(self, fail_ids=(), error=None):
+    def __init__(self, fail_ids=(), error=None, changed_ids=()):
         self.calls = []
+        self.reads = []
         self._fail_ids = set(fail_ids)
+        # Hosts whose re-read comes back carrying a domain nobody planned for,
+        # standing in for an edit made in the NPM UI while the confirmation
+        # prompt was on screen.
+        self._changed_ids = set(changed_ids)
         self._error = error or requests.HTTPError(
             "400 Client Error",
             response=_FakeResponse(400, json_body={"error": {"message": "Domain already in use"}}),
         )
+
+    def get_host(self, host_id):
+        # apply_domain_changes re-reads every host through this before writing
+        # it. Unchanged by default, so the tests about the write loop itself
+        # are unaffected by the guard sitting in front of it.
+        self.reads.append(host_id)
+        domains = ["app.example.com"]
+        if host_id in self._changed_ids:
+            domains = domains + ["added-during-prompt.example.com"]
+        return {"id": host_id, "domain_names": domains}
 
     def update_host(self, host_id, updates):
         self.calls.append((host_id, updates))
@@ -1688,12 +1703,152 @@ class TestPrintBulkSummary(_ConsoleTestCase):
 
 
 # =============================================================================
+# host_changed_since
+# =============================================================================
+
+class _RereadClient(_StubClient):
+    """Serves whatever the test says the host looks like now.
+
+    A callable rather than a dict so a test can make the second read differ
+    from the first, and so "the host is gone" is expressed the way NPM
+    expresses it — a 404 out of get_host, not a None.
+    """
+
+    def __init__(self, current=None, error=None):
+        self.current = current
+        self.error = error
+        self.reads = []
+
+    def get_host(self, host_id):
+        self.reads.append(host_id)
+        if self.error is not None:
+            raise self.error
+        return self.current
+
+
+class TestHostChangedSince(_ConsoleTestCase):
+    """The re-read that stands between a stale plan and a destructive write.
+
+    Every bulk command reads its hosts, previews, waits for a human, then
+    writes what it worked out before the wait. This helper is the only thing
+    that notices the world moved during that wait.
+    """
+
+    def _host(self, domains, **overrides):
+        return dict({"id": 12, "domain_names": list(domains),
+                     "modified_on": "2026-08-30T10:00:00.000Z"}, **overrides)
+
+    def test_an_unchanged_host_reports_no_change(self):
+        before = self._host(["app.example.com"])
+        client = _RereadClient(self._host(["app.example.com"]))
+
+        self.assertIsNone(npm_api.host_changed_since(client, before))
+
+    def test_the_host_is_re_read_through_the_client(self):
+        # The whole point: the caller's dict cannot be trusted to have moved,
+        # because the real get_host parses fresh JSON on every call and hands
+        # back an object nobody else holds a reference to.
+        client = _RereadClient(self._host(["app.example.com"]))
+
+        npm_api.host_changed_since(client, self._host(["app.example.com"]))
+
+        self.assertEqual(client.reads, [12])
+
+    def test_an_added_domain_is_reported(self):
+        before = self._host(["app.example.com"])
+        client = _RereadClient(self._host(["app.example.com", "new.example.com"]))
+
+        changed = npm_api.host_changed_since(client, before)
+
+        self.assertIsNotNone(changed)
+        self.assertIn("new.example.com", changed)
+
+    def test_a_removed_domain_is_reported(self):
+        before = self._host(["app.example.com", "api.example.com"])
+        client = _RereadClient(self._host(["app.example.com"]))
+
+        changed = npm_api.host_changed_since(client, before)
+
+        self.assertIsNotNone(changed)
+        self.assertIn("api.example.com", changed)
+
+    def test_a_reordered_domain_list_is_not_a_change(self):
+        # NPM returns the list in whatever order it stored it, and a reorder
+        # changes nothing about what the host serves. Refusing a write over one
+        # would make the guard fire on runs where nothing happened.
+        before = self._host(["app.example.com", "api.example.com"])
+        client = _RereadClient(self._host(["api.example.com", "app.example.com"]))
+
+        self.assertIsNone(npm_api.host_changed_since(client, before))
+
+    def test_a_changed_modified_on_is_a_change_even_with_the_same_domains(self):
+        # The domains are the field these commands overwrite, but they are not
+        # the only field an operator can have touched between the preview and
+        # the write.
+        before = self._host(["app.example.com"])
+        client = _RereadClient(
+            self._host(["app.example.com"], modified_on="2026-08-30T10:04:00.000Z"))
+
+        changed = npm_api.host_changed_since(client, before)
+
+        self.assertIsNotNone(changed)
+        self.assertIn("2026-08-30T10:04:00.000Z", changed)
+
+    def test_a_changed_domain_list_is_caught_within_one_second(self):
+        # Both fields are compared precisely because either alone is blind.
+        # NPM's modified_on has second resolution, so two edits inside one
+        # second carry the same timestamp; domain_names is what catches them.
+        before = self._host(["app.example.com"])
+        client = _RereadClient(self._host(["evil.example.com"]))
+
+        self.assertIsNotNone(npm_api.host_changed_since(client, before))
+
+    def test_a_host_that_no_longer_exists_is_a_change(self):
+        client = _RereadClient(
+            error=requests.HTTPError("404 Not Found", response=_FakeResponse(404)))
+
+        changed = npm_api.host_changed_since(client, self._host(["app.example.com"]))
+
+        self.assertIsNotNone(changed)
+        self.assertIn("no longer exists", changed)
+
+    def test_a_null_domain_list_on_either_side_does_not_raise(self):
+        # NPM sends domain_names as an explicit null on some records, and a
+        # get() default only applies when the key is absent.
+        for before_domains, after_domains in ((None, ["a.example.com"]),
+                                              (["a.example.com"], None),
+                                              (None, None)):
+            with self.subTest(before=before_domains, after=after_domains):
+                client = _RereadClient(self._host([], domain_names=after_domains))
+                result = npm_api.host_changed_since(
+                    client, self._host([], domain_names=before_domains))
+                if before_domains == after_domains:
+                    self.assertIsNone(result)
+                else:
+                    self.assertIsNotNone(result)
+
+    def test_exactly_one_read_is_made_per_call(self):
+        # One re-read per host is the agreed cost. A guard that listed the whole
+        # estate would turn a 57-host run into 57 full inventory fetches.
+        client = _RereadClient(self._host(["app.example.com"]))
+
+        npm_api.host_changed_since(client, self._host(["app.example.com"]))
+
+        self.assertEqual(len(client.reads), 1)
+
+
+# =============================================================================
 # apply_domain_changes
 # =============================================================================
 
 def _change(host_id, resulting, current=None, new=None):
+    # "host" is the copy of the host taken before the confirmation prompt, which
+    # apply_domain_changes hands to host_changed_since to compare a fresh read
+    # against. It carries the domain list _UpdateRecordingClient.get_host
+    # returns, so an unmodified host reads as unmodified.
     return {
         "host_id": host_id,
+        "host": {"id": host_id, "domain_names": ["app.example.com"]},
         "current_domains": current or ["app.example.com"],
         "new_domains": new or [],
         "resulting_domains": resulting,
@@ -1820,6 +1975,85 @@ class TestApplyDomainChanges(_ConsoleTestCase):
 
         self.assertEqual(client.written_ids, [12, 13],
                          msg="the loop should stop at a connection failure")
+
+    # --- the host moved while the confirmation prompt was up ----------------
+
+    def test_a_host_that_changed_since_the_preview_is_not_written(self):
+        # resulting_domains was worked out before the prompt and is written as
+        # a full replacement, so writing it over a host that has since gained a
+        # domain would erase that domain with no error and no log line naming
+        # it. Skipped instead.
+        client = _UpdateRecordingClient(changed_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client, [_change(12, ["a.example.com"]), _change(13, ["b.example.com"])],
+                self._describe)
+
+        self.assertEqual(client.written_ids, [12],
+                         msg="host 13 changed under the plan and must not be written")
+
+    def test_a_changed_host_is_named_along_with_what_changed(self):
+        client = _UpdateRecordingClient(changed_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client, [_change(13, ["b.example.com"])], self._describe)
+
+        self.assertPrinted("Host 13")
+        self.assertPrinted("added-during-prompt.example.com")
+
+    def test_a_changed_host_counts_as_a_failure_not_a_skip(self):
+        # It exits non-zero through the existing summary machinery: a run that
+        # silently declined to do part of what was asked must not look clean to
+        # the script that invoked it.
+        client = _UpdateRecordingClient(changed_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            npm_api.apply_domain_changes(
+                client, [_change(12, ["a.example.com"]), _change(13, ["b.example.com"])],
+                self._describe)
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_one_changed_host_does_not_abandon_the_rest(self):
+        client = _UpdateRecordingClient(changed_ids=[13])
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client,
+                [_change(12, ["a.example.com"]), _change(13, ["b.example.com"]),
+                 _change(14, ["c.example.com"])],
+                self._describe)
+
+        # 14 comes after the skip, so its presence is the real assertion.
+        self.assertEqual(client.written_ids, [12, 14])
+
+    def test_describe_is_not_called_for_a_changed_host(self):
+        client = _UpdateRecordingClient(changed_ids=[13])
+        described = []
+
+        with self.assertRaises(npm_api.typer.Exit):
+            npm_api.apply_domain_changes(
+                client, [_change(12, ["a.example.com"]), _change(13, ["b.example.com"])],
+                lambda change: described.append(change["host_id"]) or "ok")
+
+        self.assertEqual(described, [12])
+
+    def test_one_extra_read_per_host_and_no_more(self):
+        # The agreed cost of the guard. A 57-host run makes 57 extra GETs, not
+        # a re-listing of the estate per host.
+        client = _UpdateRecordingClient()
+
+        npm_api.apply_domain_changes(
+            client,
+            [_change(12, ["a.example.com"]), _change(13, ["b.example.com"]),
+             _change(14, ["c.example.com"])],
+            self._describe)
+
+        self.assertEqual(client.reads, [12, 13, 14])
 
 
 # =============================================================================
@@ -2889,6 +3123,160 @@ class TestHostMergeCleanRun(_MergeCommandTestCase):
         self.assertPrinted("Merge Preview")
         self.assertPrinted("Deleting host(s) 13")
         self.assertPrinted("no way to undo")
+
+
+# =============================================================================
+# host merge: the world moving while the confirmation prompt is up
+# =============================================================================
+
+class TestHostMergeConcurrentChange(_MergeCommandTestCase):
+    """Merge reads its hosts, previews, waits for a human, then writes.
+
+    The read and the write are separated by however long the operator takes to
+    answer, which is the one interval in the program measured in minutes rather
+    than milliseconds. The merged domain list is built from the target read
+    before that wait and written back as a full replacement, so a domain added
+    in the NPM UI meanwhile would be silently overwritten.
+
+    The target is checked once, after the confirmation and before the loop, and
+    a change there fails the whole merge rather than one source of it: every
+    source's domains land on that one host, so the list to be written is stale
+    in its entirety. The operator re-runs, sees a preview reflecting the change,
+    and approves what will actually happen.
+    """
+
+    def _stale_target(self, client):
+        """Replace host 12 with a copy carrying an extra domain.
+
+        REPLACES the dict in the stub's host list rather than mutating it. The
+        real get_host parses fresh JSON on every call, so a caller holding an
+        earlier result holds an independent copy; mutating the shared dict in
+        place would hand host_merge the new value through a reference the real
+        client never gives it, and the test would pass without the code being
+        right.
+        """
+        def add_a_domain_while_the_prompt_is_up(*args, **kwargs):
+            client.hosts[0] = _merge_host(
+                12, ["app.example.com", "added-during-prompt.example.com"])
+        return add_a_domain_while_the_prompt_is_up
+
+    def _merge_with_a_changing_target(self, client, **overrides):
+        with mock.patch.object(npm_api, "confirm_bulk",
+                               self._stale_target(client)):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                self._merge(client, **overrides)
+        return caught.exception
+
+    def _target_and_source(self):
+        return (_merge_host(12, ["app.example.com"]),
+                [_merge_host(13, ["old.example.com"])])
+
+    def test_a_target_changed_during_the_prompt_aborts_the_merge(self):
+        target, sources = self._target_and_source()
+        client = self._client(target, sources)
+
+        exit_exc = self._merge_with_a_changing_target(client, host_ids="13")
+
+        self.assertEqual(exit_exc.exit_code, 1)
+
+    def test_nothing_is_written_when_the_target_changed(self):
+        # The assertion that matters: no delete, no extend, no snapshot. Merge
+        # is the only command here that deletes a host the user did not name for
+        # deletion, so a stale run has to stop before the first destructive
+        # write, not partway through.
+        target, sources = self._target_and_source()
+        client = self._client(target, sources)
+
+        self._merge_with_a_changing_target(client, host_ids="13")
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(client.deleted_ids, [])
+        self.assertEqual(client.updates, [])
+
+    def test_the_abort_happens_before_the_snapshot_is_written(self):
+        # Nothing was touched, so there is nothing to recover, and a snapshot
+        # file implying otherwise is worse than none.
+        target, sources = self._target_and_source()
+        client = self._client(target, sources)
+
+        self._merge_with_a_changing_target(client, host_ids="13")
+
+        self.assertEqual(list(self.workdir.glob("pre_merge_12_*.json")), [])
+
+    def test_the_message_names_the_host_and_what_changed(self):
+        target, sources = self._target_and_source()
+        client = self._client(target, sources)
+
+        self._merge_with_a_changing_target(client, host_ids="13")
+
+        self.assertPrinted("Host 12 changed while the confirmation prompt was up")
+        self.assertPrinted("added-during-prompt.example.com")
+        self.assertPrinted("Refusing to merge")
+
+    def test_an_unchanged_target_merges_as_before(self):
+        # The guard has to be invisible on the ordinary path, which is every
+        # run but the rare one this class is about.
+        target, sources = self._target_and_source()
+        client = self._client(target, sources)
+
+        self._merge(client, host_ids="13")
+
+        self.assertEqual(client.kinds, ["delete", "update"])
+        self.assertPrinted("Host 12 now serves: app.example.com, old.example.com")
+
+    def test_the_target_is_checked_once_rather_than_once_per_source(self):
+        # Merge writes to the target on every iteration, so its modified_on
+        # legitimately moves as a result of our own writes. Checking inside the
+        # loop would make the second source fail on the first source's success.
+        target = _merge_host(12, ["app.example.com"])
+        sources = [_merge_host(13, ["a.example.com"]),
+                   _merge_host(14, ["b.example.com"]),
+                   _merge_host(15, ["c.example.com"])]
+        client = self._client(target, sources)
+
+        self._merge(client, host_ids="13,14,15")
+
+        self.assertPrinted("Successful: 3")
+        self.assertNotPrinted("Failed:")
+
+    def test_a_source_deleted_from_under_the_run_is_skipped_not_deleted(self):
+        # A source is deleted outright, so a domain added to it while the prompt
+        # was up would go with it — and it is not in the merged list either,
+        # since that was built before the change.
+        target = _merge_host(12, ["app.example.com"])
+        sources = [_merge_host(13, ["a.example.com"]),
+                   _merge_host(14, ["b.example.com"])]
+        client = self._client(target, sources)
+
+        def change_source_14(*args, **kwargs):
+            client.hosts[2] = _merge_host(14, ["b.example.com", "late.example.com"])
+
+        with mock.patch.object(npm_api, "confirm_bulk", change_source_14):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                self._merge(client, host_ids="13,14")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertEqual(client.deleted_ids, [13],
+                         msg="host 14 changed under the plan and must not be deleted")
+        self.assertPrinted("Host 14")
+        self.assertPrinted("late.example.com")
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_a_source_that_vanished_is_reported_as_gone(self):
+        target = _merge_host(12, ["app.example.com"])
+        sources = [_merge_host(13, ["a.example.com"])]
+        client = self._client(target, sources)
+
+        def delete_source_13(*args, **kwargs):
+            client.hosts = [h for h in client.hosts if h.get("id") != 13]
+
+        with mock.patch.object(npm_api, "confirm_bulk", delete_source_13):
+            with self.assertRaises(npm_api.typer.Exit):
+                self._merge(client, host_ids="13")
+
+        self.assertEqual(client.deleted_ids, [])
+        self.assertPrinted("no longer exists")
 
 
 # =============================================================================
@@ -5686,6 +6074,148 @@ class TestHostSplitDanglingSourceCertificate(_SplitCommandTestCase):
 
 
 # =============================================================================
+# host split: the world moving while the confirmation prompt is up
+# =============================================================================
+
+class TestHostSplitConcurrentChange(_SplitCommandTestCase):
+    """select_hosts() runs once, at the very top of host_split, before the
+    preview and before confirm_bulk(). Every plan's "staying" and "moving"
+    lists are computed from that one read and never revisited, and confirm_bulk's
+    prompt is the only synchronous pause in the whole command.
+
+    Worse here than in merge: the trim's payload is {"domain_names": staying} —
+    a full-field overwrite, per host_config_payload's `payload.update(overrides)`
+    — so a domain added during the prompt would be written out of the source
+    completely, and it was never part of "moving" either, so it would not land
+    on the new host. It would end up served by nothing, with no error and no log
+    line naming it. The source is checked before its trim and skipped instead.
+
+    Note that the change is made here by MUTATING the host dict in place, which
+    is what a second run of this same tool against the stub does. select_hosts
+    hands back the stub's live objects, so the plan must compare against a
+    snapshot taken at plan time rather than against plan["source"] — that dict
+    moves along with the host and would show no difference at all.
+    """
+
+    def _source(self, domains=("app.example.com", "api.internal.lan")):
+        return _merge_host(12, list(domains))
+
+    def _split_with_a_changing_source(self, client, **overrides):
+        def confirm_and_mutate(*args, **kwargs):
+            # A concurrent session adds a domain to host 12 while the operator
+            # is looking at the confirmation prompt, before answering "y".
+            client.hosts[0]["domain_names"].append("new.example.com")
+            return True
+
+        with mock.patch.object(npm_api.typer, "confirm",
+                               side_effect=confirm_and_mutate):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                self._split(client, "*.internal.lan", host_ids="12", yes=False,
+                            **overrides)
+        return caught.exception
+
+    def test_a_source_changed_during_the_prompt_is_not_split(self):
+        client = self._client(self._source(), [])
+
+        self._split_with_a_changing_source(client)
+
+        # Sanity: the addition really did land on the host split is operating
+        # on — the plan is stale, not a broken mutation.
+        self.assertIn("new.example.com", client.hosts[0]["domain_names"])
+        self.assertEqual(client.updates, [],
+                         msg="the source must not be trimmed from a stale plan")
+        self.assertEqual(client.created_overrides, [],
+                         msg="no new host, since nothing was freed off the source")
+
+    def test_the_added_domain_is_still_on_the_host_afterwards(self):
+        # The point of the guard, stated as the property it protects: the domain
+        # added during the prompt is served by exactly the host it was added to,
+        # rather than by nothing at all.
+        client = self._client(self._source(), [])
+
+        self._split_with_a_changing_source(client)
+
+        self.assertEqual(client.calls, [])
+        self.assertIn("new.example.com", client.hosts[0]["domain_names"])
+        self.assertIn("api.internal.lan", client.hosts[0]["domain_names"])
+
+    def test_the_message_names_the_host_and_what_changed(self):
+        client = self._client(self._source(), [])
+
+        self._split_with_a_changing_source(client)
+
+        self.assertPrinted("Host 12")
+        self.assertPrinted("new.example.com")
+        self.assertPrinted("since this split was planned")
+
+    def test_a_changed_source_counts_as_a_failure(self):
+        client = self._client(self._source(), [])
+
+        exit_exc = self._split_with_a_changing_source(client)
+
+        self.assertEqual(exit_exc.exit_code, 1)
+        self.assertPrinted("Failed: 1")
+
+    def test_one_changed_source_does_not_abandon_the_others(self):
+        # Unlike merge's shared target, each source is independent, so a stale
+        # one is skipped rather than failing the batch.
+        client = self._client(self._source(),
+                              [_merge_host(13, ["shop.example.com", "db.internal.lan"])])
+
+        def confirm_and_mutate(*args, **kwargs):
+            client.hosts[0]["domain_names"].append("new.example.com")
+            return True
+
+        with mock.patch.object(npm_api.typer, "confirm",
+                               side_effect=confirm_and_mutate):
+            with self.assertRaises(npm_api.typer.Exit):
+                self._split(client, "*.internal.lan", host_ids="12,13", yes=False)
+
+        self.assertEqual([host_id for host_id, _ in client.updates], [13])
+        self.assertEqual(client.created_overrides,
+                         [{"domain_names": ["db.internal.lan"], "certificate_id": None}])
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_an_unchanged_source_splits_as_before(self):
+        client = self._client(self._source(), [])
+
+        self._split(client, "*.internal.lan", host_ids="12")
+
+        self.assertEqual(client.updates, [(12, {"domain_names": ["app.example.com"]})])
+        self.assertEqual(client.created_overrides,
+                         [{"domain_names": ["api.internal.lan"], "certificate_id": None}])
+        self.assertPrinted("Successful: 1")
+
+    def test_a_source_that_vanished_is_reported_as_gone(self):
+        client = self._client(self._source(), [])
+
+        def delete_the_source(*args, **kwargs):
+            client.hosts = []
+            return True
+
+        with mock.patch.object(npm_api.typer, "confirm",
+                               side_effect=delete_the_source):
+            with self.assertRaises(npm_api.typer.Exit):
+                self._split(client, "*.internal.lan", host_ids="12", yes=False)
+
+        self.assertEqual(client.updates, [])
+        self.assertPrinted("no longer exists")
+
+    def test_the_snapshot_still_records_the_pre_split_state(self):
+        # The snapshot is written before the loop, so it exists even for a run
+        # every host of which turns out to be stale. Harmless, and the
+        # alternative — deciding staleness before recording anything — would
+        # move the read back to where the race is.
+        client = self._client(self._source(), [])
+
+        self._split_with_a_changing_source(client)
+
+        written = list(self.workdir.glob("pre_split_*.json"))
+        self.assertEqual(len(written), 1, written)
+
+
+# =============================================================================
 # Config.load
 # =============================================================================
 
@@ -6670,6 +7200,52 @@ class TestHostBulkUpdate(_MergeCommandTestCase):
 
         self.assertEqual(client.updates, [(12, {"domain_names": ["only.example.com"]})])
 
+    # --- the host moved while the confirmation prompt was up ----------------
+
+    def test_a_host_changed_since_the_preview_is_skipped(self):
+        # bulk-update names one field, so update_host's own read supplies
+        # domain_names and no domain is lost — but the preview the operator
+        # approved described this host as it was read before the prompt, and
+        # writing the field onto a host that has since moved applies a change
+        # they never saw.
+        client = self._client_with_two_hosts()
+
+        def change_host_13(*args, **kwargs):
+            client.hosts[1] = _merge_host(13, ["api.example.com", "late.example.com"])
+
+        with mock.patch.object(npm_api, "confirm_bulk", change_host_13):
+            exit_exception = self._bulk_update_expecting_exit(
+                client, "forward_port", "9090", host_ids="12,13")
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.updates, [(12, {"forward_port": 9090})])
+        self.assertPrinted("Host 13")
+        self.assertPrinted("late.example.com")
+        self.assertPrinted("Successful: 1")
+        self.assertPrinted("Failed: 1")
+
+    def test_an_unchanged_selection_is_written_as_before(self):
+        client = self._client_with_two_hosts()
+
+        self._bulk_update(client, "forward_port", "9090", host_ids="12,13")
+
+        self.assertEqual(client.updates,
+                         [(12, {"forward_port": 9090}), (13, {"forward_port": 9090})])
+        self.assertNotPrinted("Failed:")
+
+    def test_a_host_deleted_since_the_preview_is_reported_as_gone(self):
+        client = self._client_with_two_hosts()
+
+        def delete_host_13(*args, **kwargs):
+            client.hosts = [h for h in client.hosts if h.get("id") != 13]
+
+        with mock.patch.object(npm_api, "confirm_bulk", delete_host_13):
+            self._bulk_update_expecting_exit(
+                client, "forward_port", "9090", host_ids="12,13")
+
+        self.assertEqual(client.updates, [(12, {"forward_port": 9090})])
+        self.assertPrinted("no longer exists")
+
 
 # =============================================================================
 # host update
@@ -6826,6 +7402,137 @@ class TestBlankDomainArguments(_MergeCommandTestCase):
         self.assertEqual(
             client.updates,
             [(12, {"domain_names": ["ex.example.com", "ex.example.net"]})])
+
+
+# =============================================================================
+# the bulk domain commands: the world moving while the prompt is up
+# =============================================================================
+
+class TestBulkDomainCommandsConcurrentChange(_MergeCommandTestCase):
+    """End to end for the three commands that route through apply_domain_changes.
+
+    All three hand it a resulting_domains worked out before the confirmation
+    prompt, and it is written as a full replacement — so before the guard, a
+    domain added to the host while the prompt was up was erased on every one of
+    them. Verified against each command rather than against the shared loop
+    alone, because the loop can only check what the command chose to record: a
+    command that forgot to carry its pre-prompt copy of the host would be
+    guarded by a comparison against the host's own current state, which can
+    never differ.
+    """
+
+    def _bulk_add(self, client, new_domain, **overrides):
+        options = dict(new_domain=new_domain, host_ids="12", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_add_domain(**options)
+
+    def _bulk_remove(self, client, domain_pattern, **overrides):
+        options = dict(domain_pattern=domain_pattern, host_ids="12", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_remove_domain(**options)
+
+    def _bulk_replace(self, client, old_domain, new_domain, **overrides):
+        options = dict(old_domain=old_domain, new_domain=new_domain,
+                       host_ids="12", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_replace_domain(**options)
+
+    def _changing_host(self, client, domains):
+        """Replace host 12 with a copy carrying an extra domain.
+
+        REPLACES the dict in the stub's host list rather than mutating it, for
+        the same reason the merge tests do: the real get_host parses fresh JSON
+        on every call, so a caller holding an earlier result holds an
+        independent copy. Mutating the shared dict in place would hand the
+        command the new value through a reference the real client never gives
+        it, and the test would pass without the code being right.
+        """
+        def add_a_domain_while_the_prompt_is_up(*args, **kwargs):
+            client.hosts[0] = _merge_host(
+                12, list(domains) + ["added-during-prompt.example.com"])
+        return add_a_domain_while_the_prompt_is_up
+
+    def _run_expecting_exit(self, client, domains, run):
+        with mock.patch.object(npm_api, "confirm_bulk",
+                               self._changing_host(client, domains)):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                run()
+        return caught.exception
+
+    def test_bulk_add_domain_does_not_overwrite_a_domain_added_meanwhile(self):
+        domains = ["ex.example.com"]
+        client = self._client(_merge_host(12, domains), [])
+
+        exit_exception = self._run_expecting_exit(
+            client, domains, lambda: self._bulk_add(client, "example.net"))
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.updates, [])
+        self.assertPrinted("added-during-prompt.example.com")
+        self.assertPrinted("Failed: 1")
+
+    def test_bulk_remove_domain_does_not_overwrite_a_domain_added_meanwhile(self):
+        domains = ["ex.example.com", "ex.example.net"]
+        client = self._client(_merge_host(12, domains), [])
+
+        exit_exception = self._run_expecting_exit(
+            client, domains, lambda: self._bulk_remove(client, "example.net"))
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.updates, [])
+        self.assertPrinted("added-during-prompt.example.com")
+
+    def test_bulk_replace_domain_does_not_overwrite_a_domain_added_meanwhile(self):
+        domains = ["ex.example.com"]
+        client = self._client(_merge_host(12, domains), [])
+
+        exit_exception = self._run_expecting_exit(
+            client, domains,
+            lambda: self._bulk_replace(client, "example.com", "example.net"))
+
+        self.assertEqual(exit_exception.exit_code, 1)
+        self.assertEqual(client.updates, [])
+        self.assertPrinted("added-during-prompt.example.com")
+
+    def test_an_unchanged_host_is_written_by_every_one_of_them(self):
+        # The guard has to be invisible on the ordinary path.
+        cases = (
+            ("bulk-add-domain", ["ex.example.com"],
+             lambda c: self._bulk_add(c, "example.net"),
+             ["ex.example.com", "ex.example.net"]),
+            ("bulk-remove-domain", ["ex.example.com", "ex.example.net"],
+             lambda c: self._bulk_remove(c, "example.net"),
+             ["ex.example.com"]),
+            ("bulk-replace-domain", ["ex.example.com"],
+             lambda c: self._bulk_replace(c, "example.com", "example.net"),
+             ["ex.example.net"]),
+        )
+        for label, domains, run, expected in cases:
+            with self.subTest(command=label):
+                client = self._client(_merge_host(12, domains), [])
+
+                run(client)
+
+                self.assertEqual(client.updates, [(12, {"domain_names": expected})])
+
+    def test_a_host_deleted_during_the_prompt_is_reported_as_gone(self):
+        client = self._client(_merge_host(12, ["ex.example.com"]), [])
+
+        def delete_the_host(*args, **kwargs):
+            client.hosts = []
+
+        with mock.patch.object(npm_api, "confirm_bulk", delete_the_host):
+            with self.assertRaises(npm_api.typer.Exit):
+                self._bulk_add(client, "example.net")
+
+        self.assertEqual(client.updates, [])
+        self.assertPrinted("no longer exists")
 
 
 # =============================================================================
