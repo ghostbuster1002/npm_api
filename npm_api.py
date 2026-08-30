@@ -18,6 +18,7 @@ import os
 import sys
 import re
 import shutil
+import unicodedata
 import zipfile
 from fnmatch import fnmatch
 from datetime import datetime, timedelta
@@ -30,6 +31,7 @@ try:
     import requests
     import typer
     from rich.console import Console
+    from rich.markup import escape
     from rich.table import Table
     from rich.panel import Panel
     from rich.syntax import Syntax
@@ -1544,6 +1546,50 @@ def print_json(payload: Any):
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def display_domain(domain: str) -> str:
+    """Render one domain for a human, with anything invisible spelled out.
+
+    Display only — never feed the result back to NPM or into a backup, or the
+    literal "\\u200b" becomes part of the stored name.
+
+    A zero-width space inside app.exam<U+200B>ple.com makes it a different
+    string from app.example.com while looking identical on screen, and Rich
+    passes it straight through. The realistic cost is not an attack but a
+    debugging dead end: a name pasted out of a ticket carries a stray
+    invisible character, `host list` shows what looks like the right name, and
+    the certificate quietly fails to match it. Spelling the character out is
+    what turns that into a five-second diagnosis.
+
+    Escaped by Unicode category rather than by a list of known offenders:
+    every C* (control, format, surrogate, private use, unassigned — zero-width
+    spaces and every bidi override live in Cf) and every separator that is not
+    a plain ASCII space.
+
+    The result is then markup-escaped. Rich reads square brackets in any string
+    handed to console.print or Table.add_row, so an un-escaped "a[b]c" already
+    renders as "ac" today and a name containing "[/]" raises MarkupError out of
+    a command that has not written anything yet.
+    """
+    rendered = []
+    for char in str(domain):
+        category = unicodedata.category(char)
+        if category.startswith("C") or (category.startswith("Z") and char != " "):
+            rendered.append(f"\\u{ord(char):04x}")
+        else:
+            rendered.append(char)
+    return escape("".join(rendered))
+
+
+def display_domains(domains, empty: str = "") -> str:
+    """Comma-join a list of domains for display, each one escaped.
+
+    The companion to display_domain, and the reason the many bare
+    `', '.join(domain_names)` sites were consolidated: one of them missing the
+    escaping is exactly the case where the operator is already confused.
+    """
+    return ", ".join(display_domain(d) for d in (domains or [])) or empty
+
+
 # =============================================================================
 # CLI Commands - Main
 # =============================================================================
@@ -2274,7 +2320,7 @@ def host_list(
     
     for host in hosts:
         host_id = str(host.get("id", "?"))
-        domain = ", ".join(host.get("domain_names", ["?"]))
+        domain = display_domains(host.get("domain_names", ["?"]))
         enabled = host.get("enabled", False)
         status = "[green]enabled[/green]" if enabled else "[red]disabled[/red]"
         cert_id = host.get("certificate_id")
@@ -2306,7 +2352,7 @@ def host_show(
 
     out_console.print(f"\n[yellow]📋 Host Details:[/yellow]")
     out_console.print(f"  [cyan]ID:[/cyan] {host.get('id')}")
-    out_console.print(f"  [cyan]Domains:[/cyan] {', '.join(host.get('domain_names', []))}")
+    out_console.print(f"  [cyan]Domains:[/cyan] {display_domains(host.get('domain_names', []))}")
     out_console.print(f"  [cyan]Forward Host:[/cyan] {host.get('forward_host')}")
     out_console.print(f"  [cyan]Forward Port:[/cyan] {host.get('forward_port')}")
     out_console.print(f"  [cyan]Forward Scheme:[/cyan] {host.get('forward_scheme')}")
@@ -2354,7 +2400,8 @@ def host_search(
         return
 
     for host in hosts:
-        out_console.print(f"  [yellow]{host.get('id'):4}[/yellow] [green]{', '.join(host.get('domain_names', []))}[/green]")
+        out_console.print(f"  [yellow]{host.get('id'):4}[/yellow] "
+                          f"[green]{display_domains(host.get('domain_names', []))}[/green]")
 
 
 @host_app.command("create")
@@ -2416,7 +2463,7 @@ def host_delete(
         console.print(f"[red]❌ Host ID {host_id} not found[/red]")
         raise typer.Exit(1)
     
-    domain = ", ".join(host.get("domain_names", ["unknown"]))
+    domain = display_domains(host.get("domain_names", ["unknown"]))
     
     if not yes:
         console.print(f"\n[yellow]⚠️ About to delete:[/yellow]")
@@ -2490,6 +2537,33 @@ def host_update(
         raise typer.Exit(1)
 
 
+def _require_selection(selected: List[Dict], option: str, given: str) -> List[Dict]:
+    """Hand back a non-empty selection, or refuse with a non-zero exit.
+
+    Every caller of select_hosts treats an empty list as a quiet no-op, prints
+    "No hosts selected for processing" and returns 0. That made three
+    different mistakes indistinguishable from a clean run in a cron log:
+    `--ids ,` (a shell join over an empty array), `--ids 99` for a host that
+    has been deleted, and a `--pattern` whose base domain was misspelled. A
+    selector that was given and found nothing is an error.
+
+    Distinct from the refusal at the bottom of select_hosts, which is the
+    different fault of giving no selector at all — that one tells the operator
+    which options exist, this one tells them which of their arguments came up
+    empty.
+    """
+    if selected:
+        return selected
+
+    # escaped: --pattern is handed to us verbatim, and '[/]' is both a
+    # plausible typo and a Rich closing tag that would raise MarkupError here.
+    console.print(f"[red]❌ {option} {escape(repr(given))} matched no hosts[/red]")
+    console.print(f"[red]   Nothing was changed. A selector that selects nothing is "
+                  f"reported as a failure rather than a silent success, so a scripted "
+                  f"run cannot read it as a clean pass.[/red]")
+    raise typer.Exit(1)
+
+
 def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[str],
                  interactive: bool, *, detail_field: Optional[str] = None) -> List[Dict]:
     """Resolve --ids / --pattern / --interactive into a list of hosts.
@@ -2497,6 +2571,11 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
     Refuses to act when no filter is given. bulk-add-domain and
     bulk-remove-domain previously fell through to every host, so a bare
     `bulk-remove-domain com` would have rewritten the entire estate.
+
+    Also refuses when a filter *was* given and matched nothing — see
+    _require_selection. The one empty list still returned is the estate that
+    has no hosts at all, which is not the operator getting their selector
+    wrong.
     """
     all_hosts = client.list_hosts()
     if not all_hosts:
@@ -2516,22 +2595,23 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
         if missing:
             console.print(f"[yellow]⚠️  No such host(s): "
                           f"{', '.join(str(m) for m in sorted(missing))}[/yellow]")
-        return selected
+        return _require_selection(selected, "--ids", host_ids)
 
     if pattern:
         # Accepts a glob or a plain substring, so '*.example.com' and 'example.com'
         # both work and the option means the same thing across every command
         needle = pattern.lower()
-        return [
+        matched = [
             h for h in all_hosts
             if any(fnmatch(d.lower(), needle) or needle in d.lower()
                    for d in h.get("domain_names", []))
         ]
+        return _require_selection(matched, "--pattern", pattern)
 
     if interactive:
         console.print("\n[cyan]Select hosts:[/cyan]\n")
         for idx, host in enumerate(all_hosts):
-            domains = ", ".join(host.get("domain_names", []))
+            domains = display_domains(host.get("domain_names", []))
             extra = (f" ({detail_field}={host.get(detail_field, 'N/A')})"
                      if detail_field else "")
             console.print(f"  [{idx + 1}] [yellow]ID {host.get('id')}[/yellow]: "
@@ -2547,7 +2627,8 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
         except ValueError:
             console.print("[red]❌ Invalid selection[/red]")
             raise typer.Exit(1)
-        return [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
+        chosen = [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
+        return _require_selection(chosen, "--interactive", selection.strip())
 
     console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
     raise typer.Exit(1)
@@ -2638,6 +2719,53 @@ def warn_on_mixed_bases(domains: List[str], subject: str) -> List[str]:
                   f"certificate omits is the dual-domain fault `host split` "
                   f"undoes.[/yellow]")
     return bases
+
+
+# Set once the internationalised-domain warning has been printed. The condition
+# is a property of the names in play rather than of one command, so a bulk run
+# over thirty hosts would otherwise repeat the same paragraph thirty times and
+# bury the per-host output it is meant to annotate.
+_idn_warning_shown = False
+
+
+def warn_on_idn_domains(domains: List[str], subject: str) -> List[str]:
+    """Warn once per run when an internationalised domain name is in play.
+
+    Returns the domains that triggered it. A name may contain non-ASCII
+    characters, münchen.example.com; DNS carries only ASCII, so the same name
+    also has a punycode spelling, xn--mnchen-3ya.example.com. They are one
+    name. This tool compares domains as plain strings — dedupe_domains, the
+    conflict checks, every selector — so it reads the two spellings as
+    unrelated, and the "two hosts must not hold the same domain" guard misses
+    a pair holding one form each.
+
+    Warned rather than normalised, deliberately. Python's built-in idna codec
+    implements IDNA 2003 and raises UnicodeError on input NPM stores happily —
+    an underscore in a label, a label past 63 characters — so wiring it into
+    the comparison paths would trade a rare wrong answer for a common crash on
+    names that work today. A third-party idna library would handle it, and is
+    not worth a dependency for a case this rare.
+    """
+    global _idn_warning_shown
+
+    # Checked per label: the punycode form of a subdomain is
+    # app.xn--mnchen-3ya.com, whose first label is perfectly ASCII.
+    flagged = [d for d in domains
+               if not str(d).isascii()
+               or any(label.startswith("xn--")
+                      for label in str(d).lower().split("."))]
+    if not flagged or _idn_warning_shown:
+        return flagged
+
+    _idn_warning_shown = True
+    console.print(f"\n[yellow]⚠️  {subject} involves internationalised domain name(s): "
+                  f"{display_domains(flagged)}[/yellow]")
+    console.print(f"[yellow]   A name written in non-ASCII characters and the same name "
+                  f"written in punycode (xn--…) are one name to DNS, but this tool "
+                  f"compares domains as plain text and will not notice the same name "
+                  f"spelled both ways. Check by hand that no two hosts hold one "
+                  f"spelling each.[/yellow]")
+    return flagged
 
 
 def dedupe_domains(domains: List[str]) -> List[str]:
@@ -2927,12 +3055,12 @@ def host_clone(
     if preview:
         console.print(f"\n[cyan]📋 Clone Preview[/cyan]")
         console.print(f"[cyan]   Source: [yellow]host {host_id}[/yellow] "
-                      f"({', '.join(source.get('domain_names', []))})[/cyan]\n")
+                      f"({display_domains(source.get('domain_names', []))})[/cyan]\n")
 
         table = Table(show_header=True, header_style="bold cyan")
         table.add_column("Setting", style="white")
         table.add_column("New host", style="green")
-        table.add_row("Domain(s)", ", ".join(domains))
+        table.add_row("Domain(s)", display_domains(domains))
         table.add_row("Forwards to", f"{target.get('forward_scheme')}://"
                                      f"{target.get('forward_host')}:{target.get('forward_port')}")
         table.add_row("Certificate", cert_note)
@@ -2951,6 +3079,12 @@ def host_clone(
 
     if cert_id:
         warn_on_mixed_bases(domains, "The new host")
+
+    # Outside the cert_id guard above, unlike the mixed-base warning: that one
+    # is about a certificate having to cover every name, this one is about the
+    # conflict check just above having compared these names as plain text, and
+    # an HTTP-only host can collide with another host just as easily.
+    warn_on_idn_domains(domains, "The new host")
 
     confirm_bulk(yes, "Create this host?")
 
@@ -3010,7 +3144,7 @@ def host_split(
     for source in hosts:
         host_id = source.get("id")
         domains = [str(d) for d in source.get("domain_names", [])]
-        label = ", ".join(domains) or "(no domains)"
+        label = display_domains(domains, "(no domains)")
 
         if len(domains) < 2:
             console.print(f"[yellow]⚠️  Host {host_id} ({label}): needs at least two "
@@ -3067,8 +3201,8 @@ def host_split(
         for plan in plans:
             table.add_row(
                 str(plan["id"]),
-                ", ".join(plan["staying"]),
-                ", ".join(plan["moving"]),
+                display_domains(plan["staying"]),
+                display_domains(plan["moving"]),
                 str(plan["source"].get("certificate_id") or "none"),
             )
 
@@ -3174,7 +3308,7 @@ def host_split(
                 continue
 
             console.print(f"  [green]✅ Host {host_id} → new host "
-                          f"{new_host.get('id')} ({', '.join(plan['moving'])})[/green]")
+                          f"{new_host.get('id')} ({display_domains(plan['moving'])})[/green]")
             success_count += 1
 
     print_bulk_summary(success_count, error_count, skipped)
@@ -3255,7 +3389,7 @@ def _restore_merge_source(client: NPMClient, source: Dict, snapshot: Path) -> No
     except (requests.HTTPError, NPMError) as exc:
         console.print(f"     [red]‼ ROLLBACK FAILED: {format_http_error(exc)}[/red]")
         console.print(f"     [red]‼ Host {source_id} is gone and its domains "
-                      f"({', '.join(str(d) for d in source.get('domain_names', []))}) "
+                      f"({display_domains(source.get('domain_names', []))}) "
                       f"are not being served. Its full configuration is in "
                       f"{snapshot}[/red]")
         return
@@ -3354,7 +3488,7 @@ def host_merge(
     if preview:
         console.print(f"\n[cyan]📋 Merge Preview[/cyan]")
         console.print(f"[cyan]   Keeping [yellow]host {into}[/yellow] "
-                      f"({', '.join(target.get('domain_names', []))}) → "
+                      f"({display_domains(target.get('domain_names', []))}) → "
                       f"{_forward_label(target)}[/cyan]\n")
 
         table = Table(show_header=True, header_style="bold cyan")
@@ -3366,7 +3500,7 @@ def host_merge(
         for source in sources:
             table.add_row(
                 str(source.get("id")),
-                ", ".join(source.get("domain_names", [])) or "(none)",
+                display_domains(source.get("domain_names", []), "(none)"),
                 _forward_label(source),
                 ", ".join(describe_host_differences(target, source)) or "—",
             )
@@ -3374,7 +3508,7 @@ def host_merge(
 
         console.print(f"\n[cyan]   Resulting domains on host {into} "
                       f"([yellow]{len(merged_domains)}[/yellow]): "
-                      f"{', '.join(merged_domains)}[/cyan]")
+                      f"{display_domains(merged_domains)}[/cyan]")
         console.print(f"[cyan]   Certificate: [yellow]{cert_note}[/yellow][/cyan]")
         console.print(f"\n[red]   Deleting host(s) "
                       f"{', '.join(str(s.get('id')) for s in sources)} — NPM offers no "
@@ -3394,6 +3528,10 @@ def host_merge(
 
     if cert_id:
         warn_on_mixed_bases(merged_domains, f"Host {into}")
+
+    # The merged list is exactly what dedupe_domains just folded by lowercased
+    # string, so two spellings of one name survive it as two entries.
+    warn_on_idn_domains(merged_domains, f"Host {into}")
 
     if cert_id is None:
         losing_tls = [str(s.get("id")) for s in sources if s.get("certificate_id")]
@@ -3483,11 +3621,11 @@ def host_merge(
 
             applied = candidate
             console.print(f"  [green]✅ Host {source_id} merged into {into} "
-                          f"({', '.join(incoming)})[/green]")
+                          f"({display_domains(incoming)})[/green]")
             success_count += 1
 
     if success_count:
-        console.print(f"\n[green]Host {into} now serves: {', '.join(applied)}[/green]")
+        console.print(f"\n[green]Host {into} now serves: {display_domains(applied)}[/green]")
         if cert_id:
             console.print(f"[dim]All of them via certificate {cert_id} alone; any domain "
                           f"it does not cover will fail TLS.[/dim]")
@@ -3991,18 +4129,23 @@ def host_bulk_add_domain(
         for change in changes:
             table.add_row(
                 str(change["host_id"]),
-                "\n".join(change["current_domains"]),
-                "\n".join(change["new_domains"])
+                "\n".join(display_domain(d) for d in change["current_domains"]),
+                "\n".join(display_domain(d) for d in change["new_domains"])
             )
         
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
         console.print(f"[cyan]Total domains to add: [yellow]{sum(len(c['new_domains']) for c in changes)}[/yellow][/cyan]\n")
 
+    # Every name the run touches, not just the new ones: the collision this
+    # warns about is between a name being written and one already stored.
+    warn_on_idn_domains([d for c in changes for d in c["resulting_domains"]],
+                        "This bulk-add-domain run")
+
     confirm_bulk(yes)
     apply_domain_changes(
         client, changes,
-        lambda c: f"Added {', '.join(c['new_domains'])}"
+        lambda c: f"Added {display_domains(c['new_domains'])}"
     )
 
 
@@ -4069,19 +4212,24 @@ def host_bulk_remove_domain(
         for change in changes:
             table.add_row(
                 str(change["host_id"]),
-                "\n".join(change["current_domains"]),
-                "\n".join(change["domains_to_remove"]),
-                "\n".join(change["resulting_domains"])
+                "\n".join(display_domain(d) for d in change["current_domains"]),
+                "\n".join(display_domain(d) for d in change["domains_to_remove"]),
+                "\n".join(display_domain(d) for d in change["resulting_domains"])
             )
         
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
         console.print(f"[cyan]Total domains to remove: [red]{sum(len(c['domains_to_remove']) for c in changes)}[/red][/cyan]\n")
 
+    # The removal itself is a plain substring test against these names, so a
+    # pattern typed in one spelling silently spares the other.
+    warn_on_idn_domains([d for c in changes for d in c["current_domains"]],
+                        "This bulk-remove-domain run")
+
     confirm_bulk(yes)
     apply_domain_changes(
         client, changes,
-        lambda c: f"Removed {', '.join(c['domains_to_remove'])}"
+        lambda c: f"Removed {display_domains(c['domains_to_remove'])}"
     )
 
 
@@ -4166,7 +4314,8 @@ def host_bulk_replace_domain(
         
         for change in changes:
             for old, new in change["replacements"]:
-                table.add_row(str(change["host_id"]), old, new)
+                table.add_row(str(change["host_id"]),
+                              display_domain(old), display_domain(new))
         
         console.print(table)
         console.print(f"\n[cyan]Total hosts to update: [yellow]{len(changes)}[/yellow][/cyan]")
@@ -4177,10 +4326,14 @@ def host_bulk_replace_domain(
                       f"carry a name the rewrite produces; the duplicate will be "
                       f"dropped rather than stored twice[/yellow]\n")
 
+    warn_on_idn_domains([d for c in changes for d in c["resulting_domains"]],
+                        "This bulk-replace-domain run")
+
     confirm_bulk(yes)
     apply_domain_changes(
         client, changes,
-        lambda c: ", ".join(f"{old}→{new}" for old, new in c["replacements"])
+        lambda c: ", ".join(f"{display_domain(old)}→{display_domain(new)}"
+                            for old, new in c["replacements"])
     )
 
 
@@ -4231,7 +4384,7 @@ def host_bulk_update(
         for host in hosts_to_process:
             table.add_row(
                 str(host.get("id")),
-                ", ".join(host.get("domain_names", [])),
+                display_domains(host.get("domain_names", [])),
                 str(host.get(field, "N/A")),
                 str(typed_value)
             )

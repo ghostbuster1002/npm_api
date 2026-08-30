@@ -1361,6 +1361,36 @@ class _HostsClient(_StubClient):
         return self.hosts
 
 
+class _BulkDomainClient(_StubClient):
+    """Enough of a client to run a bulk domain command end to end.
+
+    get_host answers out of the same inventory list_hosts served, so
+    host_changed_since sees nothing moving underneath the confirmation prompt
+    and the tests below are about the command rather than about that guard.
+    """
+
+    def __init__(self, hosts):
+        self.hosts = hosts
+        self.calls = []
+
+    def list_hosts(self):
+        return self.hosts
+
+    def get_host(self, host_id):
+        for host in self.hosts:
+            if host.get("id") == host_id:
+                return host
+        raise AssertionError(f"the test asked for an absent host: {host_id}")
+
+    def update_host(self, host_id, updates):
+        self.calls.append((host_id, updates))
+        return {"id": host_id, **updates}
+
+    @property
+    def written_domains(self):
+        return [updates.get("domain_names") for _, updates in self.calls]
+
+
 class _UpdateRecordingClient(_StubClient):
     """Records every update_host call and fails for chosen host IDs.
 
@@ -1513,9 +1543,18 @@ class TestSelectHosts(_ConsoleTestCase):
         self.assertEqual(self._ids_of(selected), [12])
         self.assertPrinted("No such host(s): 98, 99")
 
-    def test_ids_matching_nothing_return_empty_and_warn(self):
-        self.assertEqual(self._select(ids="98,99"), [])
+    def test_ids_matching_nothing_warn_then_refuse(self):
+        # Was "return empty and warn". Returning empty made a --ids list of
+        # hosts that have all been deleted exit 0 through the caller's "No
+        # hosts selected" branch, which in a cron log is indistinguishable
+        # from a batch that ran clean. The per-ID warning is still printed —
+        # it names *which* IDs — and the refusal follows it.
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._select(ids="98,99")
+
+        self.assertEqual(caught.exception.exit_code, 1)
         self.assertPrinted("No such host(s)")
+        self.assertPrinted("matched no hosts")
 
     # --- --pattern ---------------------------------------------------------
 
@@ -1539,10 +1578,17 @@ class TestSelectHosts(_ConsoleTestCase):
         # brings the whole host into the selection.
         self.assertEqual(self._ids_of(self._select(pattern="www.example.com")), [13])
 
-    def test_pattern_matching_nothing_selects_nothing(self):
-        # The other half of the fall-through guard: no match means no hosts, not
-        # all hosts.
-        self.assertEqual(self._select(pattern="*.example.net"), [])
+    def test_pattern_matching_nothing_refuses_rather_than_selecting_nothing(self):
+        # The other half of the fall-through guard still holds — no match means
+        # no hosts, emphatically not all hosts — but "no hosts" is now a
+        # non-zero exit rather than a quiet empty list, since a misspelt base
+        # domain in a scheduled --pattern otherwise reports success.
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._select(pattern="*.example.net")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("--pattern")
+        self.assertPrinted("matched no hosts")
 
     def test_ids_take_precedence_over_pattern(self):
         # Both options given is ambiguous; --ids is the more specific of the two
@@ -1587,9 +1633,15 @@ class TestSelectHosts(_ConsoleTestCase):
 
     def test_interactive_zero_and_negative_indices_are_ignored(self):
         # "0" is the off-by-one a 1-based menu invites. It must not resolve to
-        # all_hosts[-1] and rewrite the last host in the list.
-        selected, _ = self._interactive("0,-1")
-        self.assertEqual(selected, [])
+        # all_hosts[-1] and rewrite the last host in the list. Dropping both
+        # leaves nothing selected, which is now the refusal rather than an
+        # empty list — the operator answered the prompt and got nothing, and
+        # should be told so rather than shown a clean exit.
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._interactive("0,-1")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("matched no hosts")
 
     def test_interactive_non_numeric_selection_exits_1(self):
         for given in ("one", "1;2", ""):
@@ -1614,6 +1666,186 @@ class TestSelectHosts(_ConsoleTestCase):
         with mock.patch.object(npm_api.typer, "prompt", return_value="all"):
             npm_api.select_hosts(_HostsClient(), None, None, True, detail_field="certificate_id")
         self.assertPrinted("certificate_id=N/A")
+
+
+# =============================================================================
+# select_hosts: a selector that matched nothing
+# =============================================================================
+
+class TestSelectorMatchedNothing(_ConsoleTestCase):
+    """A selector was given and found no hosts. That is a failure.
+
+    Every caller treats an empty return as a quiet no-op and exits 0, so three
+    separate mistakes used to read as a clean run in a cron log: `--ids ,`
+    (a shell join over an empty array), `--ids 99` for a host somebody deleted
+    last week, and a `--pattern` with a typo in the base domain. Only `--ids ""`
+    was caught, and then only by accident — it is falsy, so it fell through to
+    the "no selector at all" refusal.
+    """
+
+    def _select(self, ids=None, pattern=None, interactive=False, hosts=None):
+        return npm_api.select_hosts(_HostsClient(hosts), ids, pattern, interactive)
+
+    def _expect_refusal(self, **kwargs):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._select(**kwargs)
+        self.assertEqual(caught.exception.exit_code, 1)
+        return caught.exception
+
+    # --- the three spellings of "found nothing" ----------------------------
+
+    def test_ids_naming_only_absent_hosts_is_an_error(self):
+        self._expect_refusal(ids="98,99")
+        self.assertPrinted("matched no hosts")
+
+    def test_a_pattern_matching_nothing_is_an_error(self):
+        self._expect_refusal(pattern="*.example.net")
+        self.assertPrinted("matched no hosts")
+
+    def test_an_interactive_answer_selecting_nothing_is_an_error(self):
+        with mock.patch.object(npm_api.typer, "prompt", return_value="0"):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                npm_api.select_hosts(_HostsClient(), None, None, True)
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("matched no hosts")
+
+    def test_an_ids_list_that_parses_to_nothing_is_an_error(self):
+        # The case that started this: `--ids ","` is `--ids ""` with one more
+        # character, and the two must not disagree about whether the run
+        # succeeded. Both now exit 1 — by different routes, since "" is falsy
+        # and reaches the no-selector refusal instead.
+        for given in (",", ",,", " , ", " "):
+            with self.subTest(given=given):
+                self._expect_refusal(ids=given)
+
+    # --- kept distinct from "no selector at all" ---------------------------
+
+    def test_no_selector_at_all_keeps_its_own_message(self):
+        # Two different faults with two different fixes: this one means the
+        # operator has to add an option, the other means the option they added
+        # is wrong. Confusing them would send them looking in the wrong place.
+        with self.assertRaises(npm_api.typer.Exit):
+            self._select()
+
+        self.assertPrinted("Please specify --ids, --pattern, or --interactive")
+        self.assertNotPrinted("matched no hosts")
+
+    def test_an_empty_selection_does_not_offer_the_list_of_options(self):
+        with self.assertRaises(npm_api.typer.Exit):
+            self._select(pattern="*.example.net")
+
+        self.assertNotPrinted("Please specify")
+
+    # --- what it tells the operator ----------------------------------------
+
+    def test_the_message_names_the_selector_that_came_up_empty(self):
+        with self.assertRaises(npm_api.typer.Exit):
+            self._select(pattern="*.example.net")
+
+        self.assertPrinted("--pattern")
+        self.assertPrinted("*.example.net")
+
+    def test_the_ids_message_names_ids_not_pattern(self):
+        with self.assertRaises(npm_api.typer.Exit):
+            self._select(ids="99")
+
+        self.assertPrinted("--ids")
+        self.assertNotPrinted("--pattern")
+
+    def test_the_unknown_id_warning_still_names_which_ids(self):
+        # The refusal says the selector matched nothing; the warning above it
+        # says which IDs were missing. Losing the second to gain the first
+        # would be a downgrade.
+        with self.assertRaises(npm_api.typer.Exit):
+            self._select(ids="98,99")
+
+        self.assertPrinted("No such host(s): 98, 99")
+
+    def test_a_pattern_that_is_rich_markup_does_not_crash_the_refusal(self):
+        # --pattern is echoed back verbatim, and "[/]" is both a plausible
+        # fnmatch typo and a Rich closing tag with nothing to close, which
+        # raises MarkupError out of the error path itself.
+        for pattern in ("[/]", "[red]", "[a", "]"):
+            with self.subTest(pattern=pattern):
+                with self.assertRaises(npm_api.typer.Exit) as caught:
+                    self._select(pattern=pattern)
+                self.assertEqual(caught.exception.exit_code, 1)
+
+    # --- what is still not an error ----------------------------------------
+
+    def test_an_estate_with_no_hosts_at_all_is_still_not_an_error(self):
+        # Not the operator getting a selector wrong, and there is nothing here
+        # for a bulk command to damage either way.
+        self.assertEqual(self._select(ids="12", hosts=[]), [])
+        self.assertPrinted("No proxy hosts found")
+
+    def test_a_partial_match_is_not_an_error(self):
+        # One of the two IDs exists, so the run has something to do. The other
+        # is still reported.
+        self.assertEqual([h["id"] for h in self._select(ids="12,99")], [12])
+        self.assertPrinted("No such host(s): 99")
+
+    def test_interactive_all_is_never_empty(self):
+        with mock.patch.object(npm_api.typer, "prompt", return_value="all"):
+            selected = npm_api.select_hosts(_HostsClient(), None, None, True)
+        self.assertEqual(len(selected), 3)
+
+
+class TestEmptySelectionReachesEveryBulkCommand(_ConsoleTestCase):
+    """The refusal lives in select_hosts, so every caller inherits it.
+
+    Asserted per command rather than trusted, because each one wraps the call
+    in its own `if not hosts: return` and any of them could have grown a way
+    to swallow the exit.
+    """
+
+    def _expect_exit_1(self, call):
+        with mock.patch.object(npm_api, "get_client", lambda: _HostsClient()):
+            with self.assertRaises(npm_api.typer.Exit) as caught:
+                call()
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("matched no hosts")
+
+    def test_bulk_add_domain_exits_1(self):
+        self._expect_exit_1(lambda: npm_api.host_bulk_add_domain(
+            new_domain="example.net", host_ids="99", pattern=None,
+            preview=False, yes=True, interactive=False))
+
+    def test_bulk_remove_domain_exits_1(self):
+        self._expect_exit_1(lambda: npm_api.host_bulk_remove_domain(
+            domain_pattern="example.com", host_ids="99", pattern=None,
+            preview=False, yes=True, interactive=False))
+
+    def test_bulk_replace_domain_exits_1(self):
+        self._expect_exit_1(lambda: npm_api.host_bulk_replace_domain(
+            old_domain="example.com", new_domain="example.net", host_ids="99",
+            pattern=None, preview=False, yes=True, interactive=False))
+
+    def test_bulk_update_exits_1(self):
+        self._expect_exit_1(lambda: npm_api.host_bulk_update(
+            field="forward_host", value="10.0.0.9", host_ids="99", pattern=None,
+            preview=False, yes=True, interactive=False))
+
+    def test_split_exits_1(self):
+        self._expect_exit_1(lambda: npm_api.host_split(
+            match="*.internal.lan", cert="none", host_ids="99", pattern=None,
+            preview=False, yes=True, interactive=False))
+
+    def test_no_bulk_command_writes_anything_first(self):
+        # The selector is resolved at the top of each command, so an empty
+        # selection cannot reach a write. _HostsClient raises on any method
+        # other than list_hosts.
+        for label, call in (
+            ("bulk-add-domain", lambda: npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="99", pattern=None,
+                preview=True, yes=True, interactive=False)),
+            ("bulk-update", lambda: npm_api.host_bulk_update(
+                field="forward_host", value="10.0.0.9", host_ids="99",
+                pattern=None, preview=True, yes=True, interactive=False)),
+        ):
+            with self.subTest(command=label):
+                self._expect_exit_1(call)
 
 
 # =============================================================================
@@ -2728,13 +2960,18 @@ class TestHostMergeSafety(_MergeCommandTestCase):
         self.assertEqual(client.calls, [])
         self.assertPrinted("Nothing left to merge into host 12")
 
-    def test_no_matching_hosts_writes_nothing(self):
+    def test_no_matching_hosts_writes_nothing_and_exits_1(self):
+        # The pair to test_only_the_target_matching_leaves_nothing_to_do above,
+        # which must stay a clean exit: there the pattern *did* match, and
+        # merge dropped the target from its own source list. Here it matched
+        # nothing at all, which is the operator's selector being wrong.
         client = self._client(_merge_host(12, ["app.example.com"]), [])
 
-        self._merge(client, pattern="nothing.example.net")
+        exit_exc = self._merge_expecting_exit(client, pattern="nothing.example.net")
 
+        self.assertEqual(exit_exc.exit_code, 1)
         self.assertEqual(client.calls, [])
-        self.assertPrinted("No hosts selected")
+        self.assertPrinted("matched no hosts")
 
     def test_a_missing_into_host_exits_1_before_touching_anything(self):
         client = self._client(_merge_host(12, ["app.example.com"]),
@@ -5260,6 +5497,577 @@ class TestHostCloneMixedBases(_MixedBaseTestCase):
 
 
 # =============================================================================
+# warn_on_idn_domains
+# =============================================================================
+
+class _IdnTestCase(_ConsoleTestCase):
+    """Resets the once-per-run latch around every test.
+
+    warn_on_idn_domains sets a module global the first time it fires, so
+    without this the second test in the file would silently assert against a
+    warning the first one had already consumed.
+    """
+
+    # münchen.example.com and the punycode spelling of the same name.
+    UNICODE = "münchen.example.com"
+    PUNYCODE = "xn--mnchen-3ya.example.com"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, npm_api, "_idn_warning_shown", False)
+        npm_api._idn_warning_shown = False
+
+
+class TestWarnOnIdnDomains(_IdnTestCase):
+    """Advisory only, and deliberately not a normalisation.
+
+    Python's built-in idna codec is IDNA 2003 and raises UnicodeError on names
+    NPM stores happily — an underscore in a label, a label past 63 characters —
+    so encoding on the comparison paths would trade a rare wrong answer for a
+    common crash. The warning says plainly that the tool cannot see the
+    equivalence, and leaves the check to the operator.
+    """
+
+    def test_an_ascii_only_list_says_nothing(self):
+        self.assertEqual(
+            npm_api.warn_on_idn_domains(["app.example.com", "api.example.com"], "Host 12"),
+            [])
+        self.assertEqual(self.console.text, "")
+
+    def test_a_non_ascii_domain_warns(self):
+        flagged = npm_api.warn_on_idn_domains([self.UNICODE], "Host 12")
+
+        self.assertEqual(flagged, [self.UNICODE])
+        self.assertPrinted("internationalised domain name")
+
+    def test_a_punycode_domain_warns(self):
+        flagged = npm_api.warn_on_idn_domains([self.PUNYCODE], "Host 12")
+
+        self.assertEqual(flagged, [self.PUNYCODE])
+        self.assertPrinted("internationalised domain name")
+
+    def test_a_punycode_label_below_the_first_still_warns(self):
+        # app.xn--mnchen-3ya.com has a perfectly ASCII first label, and is
+        # exactly the shape the warning exists for.
+        self.assertEqual(
+            npm_api.warn_on_idn_domains(["app.xn--mnchen-3ya.com"], "Host 12"),
+            ["app.xn--mnchen-3ya.com"])
+        self.assertPrinted("internationalised domain name")
+
+    def test_a_name_merely_containing_xn_is_not_flagged(self):
+        # "xnavier.example.com" and "learn--fast.example.com" are ASCII names
+        # that happen to contain the letters; the test is on the label prefix.
+        self.assertEqual(
+            npm_api.warn_on_idn_domains(
+                ["xnavier.example.com", "learn--fast.example.com"], "Host 12"),
+            [])
+        self.assertEqual(self.console.text, "")
+
+    def test_the_warning_names_its_subject(self):
+        npm_api.warn_on_idn_domains([self.UNICODE], "The new host")
+        self.assertPrinted("The new host")
+
+    def test_the_warning_says_the_comparison_is_plain_text(self):
+        # The count alone is not actionable. What makes it act-on-able is
+        # naming the limitation: this tool will not notice the two spellings
+        # are one name, so the operator has to.
+        npm_api.warn_on_idn_domains([self.UNICODE], "Host 12")
+
+        self.assertPrinted("compares domains as plain text")
+        self.assertPrinted("spelled both ways")
+
+    def test_the_warning_names_the_domains_that_triggered_it(self):
+        npm_api.warn_on_idn_domains(
+            ["app.example.com", self.PUNYCODE], "Host 12")
+
+        self.assertPrinted(self.PUNYCODE)
+
+    def test_only_the_triggering_domains_are_named(self):
+        npm_api.warn_on_idn_domains(
+            ["app.example.com", self.PUNYCODE], "Host 12")
+
+        # The positive half first: assertNotPrinted alone would pass just as
+        # happily against a warning that never fired at all.
+        self.assertPrinted(self.PUNYCODE)
+        self.assertNotPrinted("app.example.com")
+
+    def test_both_spellings_of_one_name_are_returned_as_two(self):
+        # The whole point: this tool sees two unrelated names here, and says so
+        # rather than folding them.
+        self.assertEqual(
+            npm_api.warn_on_idn_domains([self.UNICODE, self.PUNYCODE], "Host 12"),
+            [self.UNICODE, self.PUNYCODE])
+
+    def test_it_warns_once_per_run(self):
+        npm_api.warn_on_idn_domains([self.UNICODE], "Host 12")
+        first = self.console.text
+
+        npm_api.warn_on_idn_domains([self.PUNYCODE], "Host 13")
+
+        # Pinned non-empty: comparing "what was printed" before and after is
+        # satisfied by printing nothing both times, which is the one outcome
+        # this test must not accept.
+        self.assertIn("internationalised domain name", first)
+        self.assertEqual(self.console.text, first)
+
+    def test_the_second_call_still_reports_what_it_found(self):
+        # Silent, but not a lie: a caller that branches on the return value
+        # must not start seeing "no IDNs here" once the latch is set.
+        npm_api.warn_on_idn_domains([self.UNICODE], "Host 12")
+
+        self.assertEqual(
+            npm_api.warn_on_idn_domains([self.PUNYCODE], "Host 13"),
+            [self.PUNYCODE])
+
+    def test_an_ascii_first_call_does_not_spend_the_one_warning(self):
+        npm_api.warn_on_idn_domains(["app.example.com"], "Host 12")
+        npm_api.warn_on_idn_domains([self.UNICODE], "Host 13")
+
+        self.assertPrinted("internationalised domain name")
+
+    def test_an_empty_list_returns_empty_and_says_nothing(self):
+        self.assertEqual(npm_api.warn_on_idn_domains([], "Host 12"), [])
+        self.assertEqual(self.console.text, "")
+
+    def test_the_domains_are_rendered_through_the_display_helper(self):
+        # A name can be both non-ASCII and invisible; the warning about the
+        # first must not itself hide the second.
+        npm_api.warn_on_idn_domains(["münchen\u200b.example.com"], "Host 12")
+
+        self.assertPrinted("\\u200b")
+
+
+class TestIdnWarningCallSites(_MixedBaseTestCase):
+    """Wired into the same commands as warn_on_mixed_bases, plus the bulk
+    domain commands that rewrite names."""
+
+    _IDN = "xn--mnchen-3ya.example.com"
+    _NOTICE = "internationalised domain name"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, npm_api, "_idn_warning_shown", False)
+        npm_api._idn_warning_shown = False
+
+    def test_clone_warns_on_an_internationalised_new_domain(self):
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=4),
+                              [], certificate=self._CERT)
+
+        self._clone(client, [self._IDN])
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_clone_warns_even_with_no_certificate(self):
+        # Unlike the mixed-base warning, this one is not about a certificate
+        # having to cover every name — it is about the conflict check having
+        # compared them as text, which an HTTP-only host needs just as much.
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._clone(client, [self._IDN], cert="none")
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_clone_stays_quiet_on_ascii_names(self):
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._clone(client, ["shop.example.com"], cert="none")
+
+        self.assertNotPrinted(self._NOTICE)
+
+    def test_merge_warns_when_the_union_contains_one(self):
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=4),
+                              [_merge_host(13, [self._IDN])], certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_merge_stays_quiet_on_an_ascii_union(self):
+        client = self._client(_merge_host(12, ["app.example.com"], certificate_id=4),
+                              [_merge_host(13, ["old.example.com"])],
+                              certificate=self._CERT)
+
+        self._merge(client, host_ids="13")
+
+        self.assertNotPrinted(self._NOTICE)
+
+    def test_the_warning_does_not_block_the_clone(self):
+        # Advisory. Refusing would make the tool unusable against an estate
+        # that legitimately carries one.
+        client = self._client(_merge_host(12, ["app.example.com"]), [])
+
+        self._clone(client, [self._IDN], cert="none")
+
+        self.assertPrinted(self._NOTICE)
+        self.assertEqual(client.recreated_ids, [12])
+
+
+class TestIdnWarningInBulkDomainCommands(_ConsoleTestCase):
+    """The three bulk commands that rewrite the stored names."""
+
+    _NOTICE = "internationalised domain name"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, npm_api, "_idn_warning_shown", False)
+        npm_api._idn_warning_shown = False
+
+    def _run(self, call, hosts):
+        client = _BulkDomainClient(hosts)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            call()
+        return client
+
+    def test_bulk_add_domain_warns_when_a_selected_host_carries_one(self):
+        self._run(
+            lambda: npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="12", pattern=None,
+                preview=False, yes=True, interactive=False),
+            [{"id": 12, "domain_names": ["app.xn--mnchen-3ya.com"]}])
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_bulk_add_domain_warns_when_the_new_base_is_one(self):
+        self._run(
+            lambda: npm_api.host_bulk_add_domain(
+                new_domain="xn--mnchen-3ya.com", host_ids="12", pattern=None,
+                preview=False, yes=True, interactive=False),
+            [{"id": 12, "domain_names": ["app.example.com"]}])
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_bulk_remove_domain_warns(self):
+        self._run(
+            lambda: npm_api.host_bulk_remove_domain(
+                domain_pattern="example.net", host_ids="12", pattern=None,
+                preview=False, yes=True, interactive=False),
+            [{"id": 12, "domain_names": ["app.xn--mnchen-3ya.com",
+                                         "app.example.net"]}])
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_bulk_replace_domain_warns_on_the_name_it_writes(self):
+        self._run(
+            lambda: npm_api.host_bulk_replace_domain(
+                old_domain="example.com", new_domain="xn--mnchen-3ya.com",
+                host_ids="12", pattern=None, preview=False, yes=True,
+                interactive=False),
+            [{"id": 12, "domain_names": ["app.example.com"]}])
+
+        self.assertPrinted(self._NOTICE)
+
+    def test_an_all_ascii_bulk_run_stays_quiet(self):
+        self._run(
+            lambda: npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="12", pattern=None,
+                preview=False, yes=True, interactive=False),
+            [{"id": 12, "domain_names": ["app.example.com"]}])
+
+        self.assertNotPrinted(self._NOTICE)
+
+
+# =============================================================================
+# display_domain / display_domains
+# =============================================================================
+
+# A zero-width space. Invisible on every terminal, and Rich passes it straight
+# through, so app.exam<ZWSP>ple.com and app.example.com look identical while
+# being different strings — and only one of them matches the certificate.
+#
+# Written as an escape rather than pasted in literally, here and everywhere
+# below: a test file about invisible characters is the last place that should
+# contain any. Python turns "\u200b" into the real character at compile time,
+# so what reaches the code under test is the genuine article.
+_ZWSP = "\u200b"
+_HIDDEN_DOMAIN = f"app.exam{_ZWSP}ple.com"
+
+
+class TestDisplayDomain(unittest.TestCase):
+    """Display only. The stored value is never touched — see
+    TestHiddenCharactersAreShownButNotSent below for the half of that
+    contract which matters."""
+
+    def test_an_ordinary_domain_is_unchanged(self):
+        # The overwhelmingly common case has to stay byte-identical, or every
+        # existing assertion about output becomes a lie.
+        for domain in ("app.example.com", "example.com", "*.example.com",
+                       "xn--mnchen-3ya.example.com", "host_1.example.com"):
+            with self.subTest(domain=domain):
+                self.assertEqual(npm_api.display_domain(domain), domain)
+
+    def test_a_zero_width_space_is_spelled_out(self):
+        self.assertEqual(npm_api.display_domain(_HIDDEN_DOMAIN),
+                         "app.exam\\u200bple.com")
+
+    def test_a_plain_ascii_space_is_left_alone(self):
+        # Category Zs, like the exotic separators, but the one separator a
+        # human can already see. Escaping it would make every "(no domains)"
+        # and every joined list unreadable.
+        self.assertEqual(npm_api.display_domain("app example.com"),
+                         "app example.com")
+
+    def test_bidirectional_overrides_are_spelled_out(self):
+        # U+202E flips the rendering of everything after it, so a name can be
+        # made to display as a completely different one.
+        for char, expected in (("\u202e", "\\u202e"), ("\u202d", "\\u202d"),
+                               ("\u2066", "\\u2066"), ("\u200f", "\\u200f")):
+            with self.subTest(char=expected):
+                self.assertEqual(npm_api.display_domain(f"a{char}b"),
+                                 f"a{expected}b")
+
+    def test_control_characters_are_spelled_out(self):
+        for char, expected in (("\n", "\\u000a"), ("\r", "\\u000d"),
+                               ("\t", "\\u0009"), ("\x00", "\\u0000")):
+            with self.subTest(char=expected):
+                self.assertEqual(npm_api.display_domain(f"a{char}b"),
+                                 f"a{expected}b")
+
+    def test_exotic_separators_are_spelled_out(self):
+        for char, expected in (("\u00a0", "\\u00a0"), ("\u2028", "\\u2028"),
+                               ("\u2029", "\\u2029"), ("\u3000", "\\u3000")):
+            with self.subTest(char=expected):
+                self.assertEqual(npm_api.display_domain(f"a{char}b"),
+                                 f"a{expected}b")
+
+    def test_a_soft_hyphen_is_spelled_out(self):
+        # Cf, like the zero-width space, and just as invisible.
+        self.assertEqual(npm_api.display_domain("a\u00adb"), "a\\u00adb")
+
+    def test_visible_non_ascii_is_left_alone(self):
+        # münchen.example.com is a real name a human can read. Escaping it
+        # would bury the IDN warning's own output in backslashes and make a
+        # legitimate estate unreadable; the letters are not the hazard.
+        self.assertEqual(npm_api.display_domain("münchen.example.com"),
+                         "münchen.example.com")
+
+    def test_square_brackets_cannot_be_read_as_rich_markup(self):
+        # Not hypothetical: an unescaped "a[b]c" already renders as "ac", and
+        # "[/]" raises MarkupError. The escape is a backslash Rich consumes,
+        # so what reaches the terminal is the bracket.
+        self.assertEqual(npm_api.display_domain("a[b]c"), "a\\[b]c")
+
+    def test_a_non_string_does_not_raise(self):
+        # domain_names comes from NPM's JSON and is not guaranteed to hold
+        # strings; a display helper is the wrong place to discover that.
+        self.assertEqual(npm_api.display_domain(12), "12")
+
+
+class TestDisplayDomains(unittest.TestCase):
+    """The comma-joining companion, which the display sites call."""
+
+    def test_a_list_is_comma_joined(self):
+        self.assertEqual(
+            npm_api.display_domains(["app.example.com", "api.example.com"]),
+            "app.example.com, api.example.com")
+
+    def test_every_element_is_escaped_not_just_the_first(self):
+        self.assertEqual(
+            npm_api.display_domains(["app.example.com", _HIDDEN_DOMAIN]),
+            "app.example.com, app.exam\\u200bple.com")
+
+    def test_an_empty_list_is_empty_by_default(self):
+        self.assertEqual(npm_api.display_domains([]), "")
+
+    def test_none_is_treated_as_empty(self):
+        self.assertEqual(npm_api.display_domains(None), "")
+
+    def test_the_empty_placeholder_is_used_when_given(self):
+        # The call sites that previously read `", ".join(...) or "(none)"`.
+        self.assertEqual(npm_api.display_domains([], "(no domains)"),
+                         "(no domains)")
+
+    def test_the_placeholder_is_not_used_for_a_non_empty_list(self):
+        self.assertEqual(npm_api.display_domains(["app.example.com"], "(none)"),
+                         "app.example.com")
+
+
+class _RenderedOutputTestCase(_ConsoleTestCase):
+    """Renders out_console for real rather than recording its markup.
+
+    _RecordingConsole deliberately keeps the markup string instead of
+    rendering it, which is the right trade everywhere else — but the whole
+    question here is what survives Rich, so an assertion against unrendered
+    markup would pass whether or not Rich then swallowed the text.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.stdout = io.StringIO()
+        # Wide enough that the table cannot wrap a domain mid-name and turn a
+        # content assertion into a layout assertion.
+        rendered = npm_api.Console(file=self.stdout, width=200,
+                                   force_terminal=False, no_color=True)
+        patcher = mock.patch.object(npm_api, "out_console", rendered)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def rendered(self):
+        return self.stdout.getvalue()
+
+    def run_command(self, client, call):
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            call()
+        return self.rendered
+
+
+class TestHiddenCharactersAreShownButNotSent(_RenderedOutputTestCase):
+    """The point of the whole change, stated as one property.
+
+    A domain pasted out of a ticket carries a stray zero-width space. `host
+    list` has to show it, or the operator spends an afternoon on why a
+    certificate that plainly covers app.example.com does not match. NPM has to
+    receive the name exactly as stored, or the display helper has quietly
+    become a data migration.
+    """
+
+    def _host(self):
+        return {"id": 12, "domain_names": [_HIDDEN_DOMAIN],
+                "enabled": True, "forward_host": "10.0.0.5",
+                "forward_port": 8080, "forward_scheme": "http"}
+
+    def test_host_list_shows_the_hidden_character(self):
+        text = self.run_command(_HostsClient([self._host()]),
+                                lambda: npm_api.host_list(as_json=False))
+
+        self.assertIn("\\u200b", text)
+
+    def test_host_list_does_not_pass_the_raw_character_through(self):
+        # The failure this replaces: Rich rendered the zero-width space
+        # untouched, so the terminal showed "app.example.com" and the operator
+        # had no way to see the difference.
+        text = self.run_command(_HostsClient([self._host()]),
+                                lambda: npm_api.host_list(as_json=False))
+
+        self.assertNotIn(_ZWSP, text)
+
+    def test_the_stored_name_reaches_npm_unescaped(self):
+        # Same host, same character, through a command that writes. What goes
+        # on the wire must be the byte NPM already holds.
+        client = _BulkDomainClient([self._host()])
+
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="12", pattern=None,
+                preview=True, yes=True, interactive=False)
+
+        written = client.written_domains[0]
+        self.assertIn(_HIDDEN_DOMAIN, written)
+        self.assertNotIn("app.exam\\u200bple.com", written)
+
+    def test_the_escaped_spelling_is_never_written(self):
+        # Belt and braces on the line above: no name in the payload may carry
+        # a literal backslash that the operator would then have to unpick.
+        #
+        # Asserted on the strings rather than on json.dumps(...), which
+        # escapes non-ASCII to "\\u200b" itself under its default
+        # ensure_ascii=True and would fail this whatever the code did.
+        client = _BulkDomainClient([self._host()])
+
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="12", pattern=None,
+                preview=True, yes=True, interactive=False)
+
+        for domain in client.written_domains[0]:
+            with self.subTest(domain=domain):
+                self.assertNotIn("\\", domain)
+
+    def test_json_output_is_not_escaped_either(self):
+        # `host list --json | jq` is a data path, not a display one. Escaping
+        # here would corrupt every scripted round trip.
+        client = _HostsClient([self._host()])
+        buffer = io.StringIO()
+
+        with mock.patch.object(npm_api, "get_client", lambda: client), \
+                mock.patch.object(sys, "stdout", buffer):
+            npm_api.host_list(as_json=True)
+
+        self.assertEqual(json.loads(buffer.getvalue())[0]["domain_names"],
+                         [_HIDDEN_DOMAIN])
+
+
+class TestRenderedDomainsAtTheDisplaySites(_RenderedOutputTestCase):
+    """The stdout sites. The stderr ones are covered against the recording
+    console, which keeps the markup display_domain produced."""
+
+    def _host(self, domains):
+        return {"id": 12, "domain_names": domains, "enabled": True,
+                "forward_host": "10.0.0.5", "forward_port": 8080,
+                "forward_scheme": "http"}
+
+    def test_host_show_escapes(self):
+        client = _HostsClient([self._host([_HIDDEN_DOMAIN])])
+        client.get_host = lambda host_id: client.hosts[0]
+
+        text = self.run_command(
+            client, lambda: npm_api.host_show(host_id=12, as_json=False))
+
+        self.assertIn("\\u200b", text)
+
+    def test_host_search_escapes(self):
+        client = _HostsClient([self._host([_HIDDEN_DOMAIN])])
+        client.search_hosts = lambda search: client.hosts
+
+        text = self.run_command(
+            client, lambda: npm_api.host_search(search="app", as_json=False))
+
+        self.assertIn("\\u200b", text)
+
+    def test_host_list_does_not_swallow_a_bracketed_name(self):
+        # Rich reads "[b]" as a bold tag. Before the escaping, a name
+        # containing one rendered with the tag removed — the display site
+        # inventing a domain that does not exist.
+        client = _HostsClient([self._host(["a[b]c.example.com"])])
+
+        text = self.run_command(client, lambda: npm_api.host_list(as_json=False))
+
+        self.assertIn("a[b]c.example.com", text)
+
+    def test_host_list_survives_a_name_that_is_a_closing_tag(self):
+        # "[/]" with nothing open raises MarkupError, which would take out
+        # `host list` for the whole estate over one bad name.
+        client = _HostsClient([self._host(["[/].example.com"])])
+
+        text = self.run_command(client, lambda: npm_api.host_list(as_json=False))
+
+        self.assertIn("[/].example.com", text)
+
+    def test_an_ordinary_estate_renders_exactly_as_before(self):
+        client = _HostsClient([self._host(["app.example.com", "api.example.com"])])
+
+        text = self.run_command(client, lambda: npm_api.host_list(as_json=False))
+
+        self.assertIn("app.example.com, api.example.com", text)
+        self.assertNotIn("\\", text)
+
+
+class TestDomainEchoesOnTheDiagnosticConsole(_ConsoleTestCase):
+    """The stderr sites: previews and the per-host success lines."""
+
+    def test_a_bulk_add_success_line_escapes_the_new_name(self):
+        client = _BulkDomainClient(
+            [{"id": 12, "domain_names": [f"app{_ZWSP}.example.com"]}])
+
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_add_domain(
+                new_domain="example.net", host_ids="12", pattern=None,
+                preview=True, yes=True, interactive=False)
+
+        self.assertPrinted("\\u200b")
+
+    def test_the_delete_confirmation_escapes(self):
+        client = _HostsClient([{"id": 12, "domain_names": [_HIDDEN_DOMAIN]}])
+        client.get_host = lambda host_id: client.hosts[0]
+        client.delete_host = lambda host_id: True
+
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_delete(host_id=12, yes=True)
+
+        self.assertPrinted("\\u200b")
+
+
+# =============================================================================
 # validate_certificate_assignment: labelling
 # =============================================================================
 
@@ -5729,13 +6537,18 @@ class TestHostSplitSkips(_SplitCommandTestCase):
         self.assertEqual(client.calls, [])
         self.assertPrinted("Nothing to split")
 
-    def test_no_hosts_selected_writes_nothing(self):
+    def test_no_hosts_selected_writes_nothing_and_exits_1(self):
+        # Distinct from "Nothing to split" above, which is a real host that had
+        # nothing to move — a decision the command made about a host it saw.
+        # This one is the operator naming a host that is not there, and it now
+        # fails the run rather than reporting a clean pass over zero hosts.
         client = self._client(_merge_host(12, ["app.example.com", "api.internal.lan"]), [])
 
-        self._split(client, "*.internal.lan", host_ids="99")
+        exit_exc = self._split_expecting_exit(client, "*.internal.lan", host_ids="99")
 
+        self.assertEqual(exit_exc.exit_code, 1)
         self.assertEqual(client.calls, [])
-        self.assertPrinted("No hosts selected")
+        self.assertPrinted("matched no hosts")
 
     def test_a_skip_beside_a_success_is_reported_without_failing_the_run(self):
         # The property that matters: a skipped host is a decision the command
