@@ -23,7 +23,7 @@ import zipfile
 from fnmatch import fnmatch
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Callable, Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -2565,7 +2565,10 @@ def _require_selection(selected: List[Dict], option: str, given: str) -> List[Di
 
 
 def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[str],
-                 interactive: bool, *, detail_field: Optional[str] = None) -> List[Dict]:
+                 interactive: bool, *, detail_field: Optional[str] = None,
+                 default_filter: Optional[Callable[[Dict], bool]] = None,
+                 default_label: str = "the domain argument",
+                 default_given: str = "") -> List[Dict]:
     """Resolve --ids / --pattern / --interactive into a list of hosts.
 
     Refuses to act when no filter is given. bulk-add-domain and
@@ -2576,6 +2579,14 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
     _require_selection. The one empty list still returned is the estate that
     has no hosts at all, which is not the operator getting their selector
     wrong.
+
+    `default_filter` lets a command derive its own selection when the operator
+    gave none, for the case where the command's own argument already says
+    which hosts are meant — bulk-replace-domain's old base domain names them
+    exactly, so demanding it a second time as --pattern was pure ceremony. It
+    is only safe where that argument cannot be a substring of the whole
+    estate, so the predicate must match on whole labels; passing one that does
+    not reopens the bare-`com` hole this function exists to close.
     """
     all_hosts = client.list_hosts()
     if not all_hosts:
@@ -2630,6 +2641,10 @@ def select_hosts(client: NPMClient, host_ids: Optional[str], pattern: Optional[s
         chosen = [all_hosts[i] for i in indices if 0 <= i < len(all_hosts)]
         return _require_selection(chosen, "--interactive", selection.strip())
 
+    if default_filter is not None:
+        derived = [h for h in all_hosts if default_filter(h)]
+        return _require_selection(derived, default_label, default_given)
+
     console.print("[red]❌ Please specify --ids, --pattern, or --interactive[/red]")
     raise typer.Exit(1)
 
@@ -2683,6 +2698,48 @@ def domain_base(domain: str) -> Optional[str]:
     if len(parts) < 2:
         return None
     return ".".join(parts[-2:])
+
+
+def domain_labels(domain: str) -> List[str]:
+    """A domain split into its labels, ignoring case-free surrounding noise."""
+    return [p for p in domain.strip().strip(".").split(".") if p]
+
+
+def domain_is_under(domain: str, base: str) -> bool:
+    """True when `domain` is `base` itself or a name beneath it.
+
+    Whole labels, never characters: "example.com" covers "nas.example.com"
+    and "example.com", and does not cover "myexample.com".
+    """
+    labels = [p.lower() for p in domain_labels(domain)]
+    base_labels = [p.lower() for p in domain_labels(base)]
+    if len(base_labels) < 2 or len(labels) < len(base_labels):
+        return False
+    return labels[-len(base_labels):] == base_labels
+
+
+def replace_domain_base(domain: str, old_base: str, new_base: str) -> Optional[str]:
+    """`domain` moved from `old_base` onto `new_base`, or None if unaffected.
+
+    The rule this replaced was `old in domain` followed by str.replace, which
+    matched characters rather than names. Two things fell out of that: renaming
+    "example.com" also rewrote "myexample.com" into "myexample.net", and a
+    one-label argument like "com" matched most of the estate — which is why
+    the command used to insist on a host selector, a speed bump that stopped
+    neither fault since passing '-p com' reproduced both exactly.
+
+    The subdomain keeps the spelling NPM holds for it; only the base is
+    rewritten, and it lands spelled the way the operator typed it. So
+    "Shop.Example.COM" onto "example.net" gives "Shop.example.net", not a
+    silently lowercased name the operator never asked for.
+    """
+    if not domain_is_under(domain, old_base):
+        return None
+    labels = domain_labels(domain)
+    depth = len(domain_labels(old_base))
+    prefix = labels[:-depth]
+    tail = ".".join(domain_labels(new_base))
+    return ".".join(prefix + [tail]) if prefix else tail
 
 
 def warn_on_mixed_bases(domains: List[str], subject: str) -> List[str]:
@@ -3639,6 +3696,33 @@ def host_merge(
     print_bulk_summary(success_count, error_count)
 
 
+@host_app.command("cert-assign")
+def host_cert_assign(
+    cert_id: int = typer.Argument(..., help="Certificate ID to assign"),
+    host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs"),
+    pattern: str = typer.Option(None, "--pattern", "-p",
+                                help="Only process hosts matching this domain pattern"),
+    preview: bool = typer.Option(True, "--preview/--no-preview",
+                                 help="Preview changes before applying"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
+    interactive: bool = typer.Option(False, "--interactive", "-I",
+                                     help="Interactively select hosts"),
+):
+    """
+    Assign a certificate to many proxy hosts at once.
+
+    The same command as `host ssl-enable`, under the name people reach for
+    when they are looking to bulk-update certificates rather than to toggle
+    something on. Only certificate_id is written; ssl_forced and http2_support
+    are left as they are.
+
+        host cert-assign 14 --pattern example.com
+        host cert-assign 14 --ids 3,7,12
+    """
+    host_ssl_enable(cert_id=cert_id, host_ids=host_ids, pattern=pattern,
+                    preview=preview, yes=yes, interactive=interactive)
+
+
 @host_app.command("ssl-enable")
 def host_ssl_enable(
     cert_id: int = typer.Argument(..., help="Certificate ID to assign"),
@@ -4238,7 +4322,7 @@ def host_bulk_replace_domain(
     old_domain: str = typer.Argument(..., help="Old base domain to replace (e.g., olddomain.com)"),
     new_domain: str = typer.Argument(..., help="New base domain (e.g., newdomain.com)"),
     host_ids: str = typer.Option(None, "--ids", "-i", help="Comma-separated host IDs to update"),
-    pattern: str = typer.Option(None, "--pattern", "-p", help="Only process hosts matching this domain pattern"),
+    pattern: str = typer.Option(None, "--pattern", "-p", help="Narrow to hosts matching this domain pattern"),
     preview: bool = typer.Option(True, "--preview/--no-preview", help="Preview changes before applying"),
     yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation"),
     interactive: bool = typer.Option(False, "--interactive", "-I", help="Interactively select hosts")
@@ -4247,18 +4331,34 @@ def host_bulk_replace_domain(
     Bulk replace one base domain with another in existing hosts.
 
     Example: Replace olddomain.com with newdomain.com everywhere it appears:
-        host bulk-replace-domain olddomain.com newdomain.com -p olddomain.com
+        host bulk-replace-domain olddomain.com newdomain.com
 
     This will change ex.olddomain.com to ex.newdomain.com. A host selector is
-    required; the command no longer defaults to every host carrying the old
-    domain, since a short argument like 'com' would match the whole estate.
+    optional: with none given, every host carrying the old base is rebased,
+    since that argument already names the hosts that are meant. Pass --ids,
+    --pattern or --interactive to narrow it further.
+
+    Matching is by whole label, so renaming 'old.com' leaves 'myold.com'
+    alone, and the old base must be at least two labels — 'com' is refused
+    rather than quietly matching most of the estate.
     """
     require_domain_argument(old_domain, "The old base domain")
     require_domain_argument(new_domain, "The new base domain")
 
+    if len(domain_labels(old_domain)) < 2:
+        console.print(f"[red]❌ The old base domain must be a full domain such "
+                      f"as 'example.com', not {escape(repr(old_domain))}[/red]")
+        console.print("[red]   A single label would match most of the estate "
+                      "at once[/red]")
+        raise typer.Exit(1)
+
     client = get_client()
 
-    hosts_to_process = select_hosts(client, host_ids, pattern, interactive)
+    hosts_to_process = select_hosts(
+        client, host_ids, pattern, interactive,
+        default_filter=lambda h: any(domain_is_under(d, old_domain)
+                                     for d in h.get("domain_names") or []),
+        default_label="the base domain", default_given=old_domain)
     if not hosts_to_process:
         console.print("[yellow]No hosts selected for processing[/yellow]")
         return
@@ -4273,10 +4373,13 @@ def host_bulk_replace_domain(
         new_domains = []
         replaced = []
         for domain in current_domains:
-            if old_domain.lower() in domain.lower():
-                new_domain_full = domain.lower().replace(old_domain.lower(), new_domain.lower())
-                new_domains.append(new_domain_full)
-                replaced.append((domain, new_domain_full))
+            rebased = replace_domain_base(domain, old_domain, new_domain)
+            # A rebase onto the same base, or one that lands on the spelling
+            # already stored, is not a change. Recording it anyway would send
+            # NPM a write that alters nothing and report it as work done.
+            if rebased is not None and rebased != domain:
+                new_domains.append(rebased)
+                replaced.append((domain, rebased))
             else:
                 new_domains.append(domain)
 

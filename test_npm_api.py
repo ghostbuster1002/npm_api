@@ -8181,6 +8181,265 @@ class TestHostUpdate(_MergeCommandTestCase):
 
 
 # =============================================================================
+# rebasing a domain onto another base, by label rather than by character
+# =============================================================================
+
+class TestDomainIsUnder(unittest.TestCase):
+    """Whether one name sits at or beneath a base, compared label by label."""
+
+    def test_the_base_itself_is_under_it(self):
+        self.assertTrue(npm_api.domain_is_under("example.com", "example.com"))
+
+    def test_a_subdomain_is_under_it(self):
+        self.assertTrue(npm_api.domain_is_under("ex.example.com", "example.com"))
+
+    def test_a_deep_subdomain_is_under_it(self):
+        self.assertTrue(npm_api.domain_is_under("a.b.example.com", "example.com"))
+
+    def test_a_name_merely_ending_in_those_characters_is_not(self):
+        # The whole point: 'myexample.com' shares a suffix with 'example.com'
+        # as text and shares no label with it as a name.
+        self.assertFalse(npm_api.domain_is_under("myexample.com", "example.com"))
+
+    def test_a_partial_first_label_is_not(self):
+        self.assertFalse(npm_api.domain_is_under("example.com", "e.com"))
+
+    def test_a_one_label_base_is_never_a_base(self):
+        for domain in ("example.com", "ex.example.com", "com"):
+            with self.subTest(domain=domain):
+                self.assertFalse(npm_api.domain_is_under(domain, "com"))
+
+    def test_case_and_a_trailing_dot_do_not_matter(self):
+        self.assertTrue(npm_api.domain_is_under("EX.Example.COM", "example.com."))
+
+    def test_a_shorter_name_is_not_under_a_longer_base(self):
+        self.assertFalse(npm_api.domain_is_under("example.com", "a.example.com"))
+
+
+class TestReplaceDomainBase(unittest.TestCase):
+    """Moving a name from one base onto another.
+
+    Replaced `old in domain` plus str.replace, which matched characters: it
+    rewrote 'myexample.com' while renaming 'example.com', and let a one-label
+    argument match most of an estate.
+    """
+
+    def test_a_subdomain_is_rebased(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("ex.example.com", "example.com", "example.net"),
+            "ex.example.net")
+
+    def test_the_apex_is_rebased_to_the_bare_new_base(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("example.com", "example.com", "example.net"),
+            "example.net")
+
+    def test_every_subdomain_label_survives(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("a.b.example.com", "example.com", "example.net"),
+            "a.b.example.net")
+
+    def test_a_name_merely_containing_the_base_is_untouched(self):
+        self.assertIsNone(
+            npm_api.replace_domain_base("myexample.com", "example.com", "example.net"))
+
+    def test_an_unrelated_name_is_untouched(self):
+        self.assertIsNone(
+            npm_api.replace_domain_base("other.internal.lan", "example.com", "example.net"))
+
+    def test_a_one_label_old_base_rebases_nothing(self):
+        self.assertIsNone(
+            npm_api.replace_domain_base("example.com", "com", "net"))
+
+    def test_the_subdomain_keeps_the_spelling_npm_holds(self):
+        # Only the base was asked to change. Lowercasing the rest is an
+        # unrequested write to a field the operator can see in the UI.
+        self.assertEqual(
+            npm_api.replace_domain_base("Shop.Example.COM", "example.com", "example.net"),
+            "Shop.example.net")
+
+    def test_the_new_base_lands_spelled_as_given(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("ex.example.com", "example.com", "Example.NET"),
+            "ex.Example.NET")
+
+    def test_a_trailing_dot_on_either_side_is_tolerated(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("ex.example.com.", "example.com", "example.net."),
+            "ex.example.net")
+
+    def test_rebasing_onto_the_same_base_returns_the_same_name(self):
+        self.assertEqual(
+            npm_api.replace_domain_base("ex.example.com", "example.com", "example.com"),
+            "ex.example.com")
+
+
+# =============================================================================
+# bulk-replace-domain: the old base names the hosts, so a selector is optional
+# =============================================================================
+
+class TestBulkReplaceDomainSelector(_ConsoleTestCase):
+    """The old base already says which hosts are meant.
+
+    Requiring --pattern as well was ceremony that guarded nothing: the reason
+    given for it was that a short argument like 'com' would match the estate,
+    but typing '-p com' reproduced that exactly. The argument is now required
+    to be a real base and matched by label, which closes the hole for real,
+    and the selector is free to be omitted.
+    """
+
+    def _hosts(self):
+        return [
+            _merge_host(1, ["ex.example.com"]),
+            _merge_host(2, ["shop.example.com", "www.example.com"]),
+            _merge_host(3, ["other.internal.lan"]),
+            _merge_host(4, ["myexample.com"]),
+        ]
+
+    def _replace(self, client, old, new, **overrides):
+        options = dict(old_domain=old, new_domain=new, host_ids=None,
+                       pattern=None, preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        with mock.patch.object(npm_api, "get_client", lambda: client):
+            npm_api.host_bulk_replace_domain(**options)
+
+    def test_with_no_selector_every_host_on_that_base_is_rebased(self):
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net")
+
+        self.assertEqual(sorted(host_id for host_id, _ in client.calls), [1, 2])
+
+    def test_a_host_on_another_base_is_left_alone(self):
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net")
+
+        self.assertNotIn(3, [host_id for host_id, _ in client.calls])
+
+    def test_a_name_merely_containing_the_base_is_never_rewritten(self):
+        # host 4 is 'myexample.com'. The old rule turned it into
+        # 'myexample.net' while the operator was renaming a different base.
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net")
+
+        self.assertNotIn(4, [host_id for host_id, _ in client.calls])
+
+    def test_both_names_on_one_host_are_rebased_together(self):
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net")
+
+        written = dict(client.calls)
+        self.assertEqual(written[2]["domain_names"],
+                         ["shop.example.net", "www.example.net"])
+
+    def test_an_explicit_ids_selector_still_narrows(self):
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net", host_ids="1")
+
+        self.assertEqual([host_id for host_id, _ in client.calls], [1])
+
+    def test_an_explicit_pattern_still_narrows(self):
+        client = _BulkDomainClient(self._hosts())
+
+        self._replace(client, "example.com", "example.net", pattern="shop.*")
+
+        self.assertEqual([host_id for host_id, _ in client.calls], [2])
+
+    def test_a_one_label_old_base_is_refused_before_the_client_is_touched(self):
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._replace(_ExplodingClient(), "com", "net")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertPrinted("must be a full domain")
+
+    def test_no_host_on_that_base_exits_1_rather_than_reporting_success(self):
+        client = _BulkDomainClient(self._hosts())
+
+        with self.assertRaises(npm_api.typer.Exit) as caught:
+            self._replace(client, "absent.example.org", "example.net")
+
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertEqual(client.calls, [])
+
+    def test_the_refusal_names_the_base_that_matched_nothing(self):
+        client = _BulkDomainClient(self._hosts())
+
+        with self.assertRaises(npm_api.typer.Exit):
+            self._replace(client, "absent.example.org", "example.net")
+
+        self.assertPrinted("absent.example.org")
+
+    def test_the_stored_case_of_a_subdomain_survives_the_rewrite(self):
+        client = _BulkDomainClient([_merge_host(1, ["Shop.Example.COM"])])
+
+        self._replace(client, "example.com", "example.net")
+
+        self.assertEqual(dict(client.calls)[1]["domain_names"],
+                         ["Shop.example.net"])
+
+    def test_rebasing_onto_the_same_base_writes_nothing(self):
+        client = _BulkDomainClient([_merge_host(1, ["ex.example.com"])])
+
+        self._replace(client, "example.com", "example.com")
+
+        self.assertEqual(client.calls, [])
+
+
+# =============================================================================
+# host cert-assign: the findable name for bulk certificate assignment
+# =============================================================================
+
+class TestCertAssignAlias(_ConsoleTestCase):
+    """`ssl-enable` is named after a toggle, so nobody finds it.
+
+    cert-assign is the same command under the name people reach for. It must
+    stay a delegation rather than a second copy, or the certificate validation
+    that lives in bulk-update applies to only one of the two.
+    """
+
+    def _cert_assign(self, cert_id, **overrides):
+        options = dict(cert_id=cert_id, host_ids="1", pattern=None,
+                       preview=False, yes=True, interactive=False)
+        options.update(overrides)
+        npm_api.host_cert_assign(**options)
+
+    def test_it_writes_the_certificate_through_ssl_enable(self):
+        seen = {}
+
+        def record(**kwargs):
+            seen.update(kwargs)
+
+        with mock.patch.object(npm_api, "host_ssl_enable", record):
+            self._cert_assign(14)
+
+        self.assertEqual(seen["cert_id"], 14)
+
+    def test_every_selector_is_forwarded_unchanged(self):
+        seen = {}
+
+        def record(**kwargs):
+            seen.update(kwargs)
+
+        with mock.patch.object(npm_api, "host_ssl_enable", record):
+            self._cert_assign(14, host_ids="3,7", pattern="example.com",
+                              preview=True, yes=False, interactive=True)
+
+        self.assertEqual(
+            (seen["host_ids"], seen["pattern"], seen["preview"],
+             seen["yes"], seen["interactive"]),
+            ("3,7", "example.com", True, False, True))
+
+    def test_it_is_registered_as_its_own_command(self):
+        names = {c.name for c in npm_api.host_app.registered_commands}
+        self.assertIn("cert-assign", names)
+        self.assertIn("ssl-enable", names)
+
+
+# =============================================================================
 # host bulk-add-domain / bulk-replace-domain: a blank domain argument
 # =============================================================================
 
