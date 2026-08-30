@@ -81,9 +81,9 @@ jobs:
     continue-on-error: ${{ matrix.optional }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -124,6 +124,13 @@ jobs:
         shell: bash
         run: mv "dist/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
+      # Left at v4 on purpose while checkout and setup-python move to their
+      # Node 24 majors. The artifact actions changed behaviour across majors
+      # before — v4 made artifacts immutable and altered how names resolve —
+      # and this pair is load-bearing for the download step below, which has
+      # never run. Bump them on their own, after one release has worked, so
+      # that if something breaks it is obvious what broke it. The Node 20
+      # deprecation warning they emit is not a failure.
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
