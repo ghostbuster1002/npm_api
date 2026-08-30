@@ -26,6 +26,7 @@ or run this file directly:
 
 import io
 import json
+import re
 import stat
 import sys
 import tempfile
@@ -44,6 +45,21 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import npm_api  # noqa: E402
+
+
+# Rich decides whether to emit colour from the stream it is writing to, and
+# that decision has changed between releases: on rich 13 a captured StringIO
+# gets plain text, on rich 15 the same capture came back carrying SGR codes.
+# Any assertion that looks for a bare character in rendered output is at the
+# mercy of that, because the reset sequence \x1b[0m contains a literal "0".
+# Strip the codes before asserting so the suite tests what was rendered rather
+# than which version of rich rendered it.
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """`text` with any ANSI colour/style sequences removed."""
+    return _ANSI_SGR.sub("", text)
 
 
 # =============================================================================
@@ -7721,9 +7737,13 @@ class TestInfoTable(_JsonCommandTestCase):
 
         text, exit_code = self.stdout_of(client, lambda: npm_api.info(as_json=False))
 
+        # Read the row as the operator sees it. With the styling left in, the
+        # "0" of a \x1b[0m reset counts as a digit and the row reads as a
+        # count of zero to this assertion even while rendering a "?".
+        plain = strip_ansi(text)
         self.assertEqual(exit_code, 1)
-        self.assertIn("?", text)
-        self.assertNotIn("0", text.split("Proxy Hosts")[1].splitlines()[0])
+        self.assertIn("?", plain)
+        self.assertNotIn("0", plain.split("Proxy Hosts")[1].splitlines()[0])
         self.assertPrinted("section(s) could not be read")
 
     def test_a_failure_to_authenticate_still_exits_non_zero(self):
