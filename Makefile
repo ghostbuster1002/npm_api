@@ -4,7 +4,7 @@ SCRIPT_NAME = npm-api
 PYTHON_FILE = npm_api.py
 INSTALL_DIR = /usr/local/bin
 
-.PHONY: all build install uninstall clean venv deps help
+.PHONY: all build install uninstall clean venv deps help test
 
 all: build
 
@@ -12,13 +12,25 @@ help:
 	@echo "NPM-API CLI Build System"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make build     - Build the standalone binary"
+	@echo "  make test      - Run the test suite (stdlib unittest, no pytest)"
+	@echo "  make build     - Install deps, run tests, then build the binary"
 	@echo "  make install   - Install to $(INSTALL_DIR) (requires sudo)"
 	@echo "  make uninstall - Remove from $(INSTALL_DIR) (requires sudo)"
 	@echo "  make clean     - Remove build artifacts"
 	@echo "  make venv      - Create virtual environment"
 	@echo "  make deps      - Install dependencies"
 	@echo ""
+
+# Standard-library unittest only, so the suite runs with nothing installed
+# beyond what npm_api.py itself needs. Importing npm_api pulls in requests,
+# typer and rich, which may only be present in ./venv, so prefer the venv
+# interpreter when it exists and fall back to whatever python3 is on PATH.
+# The tests need no network and no live NPM. -b buffers the progress output
+# npm_api prints as it works, so it only surfaces for a test that fails.
+test:
+	@echo "Running tests..."
+	@if [ -x ./venv/bin/python3 ]; then PY=./venv/bin/python3; else PY=python3; fi; \
+		$$PY -m unittest discover -v -b
 
 venv:
 	@echo "Creating virtual environment..."
@@ -31,7 +43,9 @@ deps: venv
 	./venv/bin/pip install requests "typer[all]" rich pyinstaller
 	@echo "Done!"
 
-build: deps
+# deps first: the tests import npm_api, which needs requests/typer/rich, and
+# the `test` target prefers ./venv/bin/python3 once the venv exists.
+build: deps test
 	@echo "Building binary..."
 	./venv/bin/pyinstaller \
 		--onefile \

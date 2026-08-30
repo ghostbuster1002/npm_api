@@ -4,6 +4,10 @@ venv/
 env/
 .env/
 
+# Environment files (the .env/ above only matches a directory)
+.env
+.env.*
+
 # Build artifacts
 build/
 dist/
@@ -32,8 +36,20 @@ npm-api.conf
 # Token and data files
 data/
 token/
+backups/
 *.txt
 !requirements.txt
+!requirements-*.txt
+
+# Certificate material. `cert download` defaults to ./certificates and writes
+# a private key there, so never let one be staged from inside a clone.
+certificates/
+*.key
+*.pem
+*.crt
+*.cer
+*.pfx
+*.p12
 
 # IDE
 .idea/
@@ -57,6 +73,13 @@ Thumbs.db
 htmlcov/
 .tox/
 .nox/
+
+# Scratch suites from a QA sweep: one deliberately failing test per finding
+# that has not been fixed yet, kept beside the code while it is worked
+# through. They are working notes, not coverage — anything worth keeping is
+# rewritten into test_npm_api.py, which is the suite that must always pass.
+# Ignored so a stray `git add -A` cannot publish a pile of red tests.
+test_qa_*.py
 
 # Logs
 *.log
