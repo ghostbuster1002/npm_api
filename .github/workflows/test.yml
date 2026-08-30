@@ -4,13 +4,24 @@
 
 name: Tests
 
-# Every push to any branch, so a branch gets a verdict before it becomes a
-# pull request, plus pull_request so that contributions from forks are
-# checked too. A same-repo PR therefore runs twice; that is the cost of
-# covering forks, and on a public repo the minutes are free.
+# pull_request covers branches; push covers main. Listing both against every
+# branch ran a same-repo pull request twice over, which is noise rather than
+# coverage — the two runs do not even test the same tree. A push run tests the
+# branch commit; a pull_request run tests the branch *merged into main*, which
+# is what will actually exist afterwards and is the one that catches a change
+# that passes alone and fails beside someone else's. So keep the merge-result
+# run and drop the duplicate.
+#
+# push on main still matters: it covers a merge or a direct commit, neither of
+# which raises a pull_request event.
+#
+# A branch with no pull request open now gets no automatic run. Use the Run
+# workflow button, which takes a branch — the workflow has to exist on the
+# default branch for the button to appear, but it will run against any branch
+# you pick.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -21,6 +32,12 @@ permissions:
 
 # A second push to the same branch makes the first run pointless. Cancel it
 # rather than queue behind it.
+#
+# Note this did nothing about the duplicate above: a push and a pull_request
+# for the same branch carry different github.ref values — refs/heads/x versus
+# refs/pull/N/merge — so they land in different groups and neither cancels the
+# other. Concurrency deduplicates repeated runs of one trigger, not two
+# triggers firing on one change.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
