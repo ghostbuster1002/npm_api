@@ -36,30 +36,27 @@ jobs:
             binary: npm-api
             strip: "--strip"
             optional: false
-          # The Raspberry Pi target, and the second one that matters here.
-          # Optional only because ubuntu-24.04-arm is a runner label that has
-          # never been exercised in this repository — GitHub made ARM runners
-          # free for public repos in early 2025, but an unknown label fails
-          # the whole job, and that must not block the x86_64 release.
-          # Once one release proves it works, set this to false: a missing
-          # Pi binary should be a failure, not a shrug.
+          # The Raspberry Pi target, and required for the same reason as
+          # x86_64. It was optional until the 2026-08-31 dispatch run proved
+          # ubuntu-24.04-arm resolves — GitHub made ARM runners free for
+          # public repos in early 2025, but an unknown label fails the whole
+          # job and that could not be allowed to block a release. Now that it
+          # is known good, a missing Pi binary is a failure, not a shrug.
           - os: ubuntu-24.04-arm
             asset: npm-api-linux-aarch64
             binary: npm-api
             strip: "--strip"
-            optional: true
-          # Everything below is best effort. Nobody here runs macOS or
-          # Windows, so these are unverified in practice and must never be
-          # able to hold up a Linux release -- see continue-on-error below.
+            optional: false
+          # Best effort, and must never hold up a Linux release — see
+          # continue-on-error below.
           #
-          # macos-13 is the last Intel image; macos-latest is Apple silicon.
-          # The old workflow called macos-latest "amd64", which stopped being
-          # true when GitHub moved the label to ARM in 2024.
-          - os: macos-13
-            asset: npm-api-macos-x86_64
-            binary: npm-api
-            strip: ""
-            optional: true
+          # macos-latest is Apple silicon; the old workflow published it as
+          # "amd64", which stopped being true when GitHub moved the label to
+          # ARM in 2024. There is no Intel build: macos-13 is the last Intel
+          # image, its runners are scarce enough to sit queued for many
+          # minutes, and GitHub is winding them down. Waiting on a platform
+          # nobody here uses is a poor trade for a release that is otherwise
+          # a couple of minutes.
           - os: macos-latest
             asset: npm-api-macos-arm64
             binary: npm-api
@@ -166,8 +163,7 @@ jobs:
         run: |
           missing=""
           for asset in npm-api-linux-x86_64 npm-api-linux-aarch64 \
-                       npm-api-macos-x86_64 npm-api-macos-arm64 \
-                       npm-api-windows-x86_64.exe; do
+                       npm-api-macos-arm64 npm-api-windows-x86_64.exe; do
             [ -f "dist/$asset" ] || missing="$missing $asset"
           done
           if [ -n "$missing" ]; then

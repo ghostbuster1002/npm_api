@@ -44,12 +44,10 @@ sudo mv npm-api-linux-aarch64 /usr/local/bin/npm-api
 curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-arm64
 chmod +x npm-api-macos-arm64
 sudo mv npm-api-macos-arm64 /usr/local/bin/npm-api
-
-# macOS, Intel
-curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-x86_64
-chmod +x npm-api-macos-x86_64
-sudo mv npm-api-macos-x86_64 /usr/local/bin/npm-api
 ```
+
+There is no Intel macOS binary. Build from source on that machine — the
+instructions below work anywhere Python 3.10+ and PyInstaller do.
 
 A binary is built for the architecture of the runner that produced it and will
 not run on another. There is no universal build.
