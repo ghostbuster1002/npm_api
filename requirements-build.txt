@@ -1,0 +1,9 @@
+# Everything needed to turn npm_api.py into a standalone binary.
+#
+# Kept apart from requirements.txt because PyInstaller is not a dependency of
+# the tool — nobody running the script needs it, and it is a large install.
+# The -r line means the build environment is the runtime environment plus the
+# builder, so the two can never drift.
+-r requirements.txt
+
+pyinstaller>=6.0.0

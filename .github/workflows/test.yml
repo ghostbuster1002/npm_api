@@ -1,0 +1,82 @@
+# GitHub only reads workflows from .github/workflows/. A file anywhere else —
+# the repo root, for instance — is inert: no run, no error, no clue. That is
+# why build.yml never once executed.
+
+name: Tests
+
+# pull_request covers branches; push covers main. Listing both against every
+# branch ran a same-repo pull request twice over, which is noise rather than
+# coverage — the two runs do not even test the same tree. A push run tests the
+# branch commit; a pull_request run tests the branch *merged into main*, which
+# is what will actually exist afterwards and is the one that catches a change
+# that passes alone and fails beside someone else's. So keep the merge-result
+# run and drop the duplicate.
+#
+# push on main still matters: it covers a merge or a direct commit, neither of
+# which raises a pull_request event.
+#
+# A branch with no pull request open now gets no automatic run. Use the Run
+# workflow button, which takes a branch — the workflow has to exist on the
+# default branch for the button to appear, but it will run against any branch
+# you pick.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: this workflow needs the code and nothing else. The release
+# workflow asks for more, and only in the job that needs it.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run pointless. Cancel it
+# rather than queue behind it.
+#
+# Note this did nothing about the duplicate above: a push and a pull_request
+# for the same branch carry different github.ref values — refs/heads/x versus
+# refs/pull/N/merge — so they land in different groups and neither cancels the
+# other. Concurrency deduplicates repeated runs of one trigger, not two
+# triggers firing on one change.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every version's result, rather than stopping at the first
+      # failure — "3.10 fails, 3.13 passes" is the useful shape of the answer.
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor the README advertises; 3.13 is the newest stable.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Runtime dependencies only. The tests import npm_api, which needs
+      # requests, typer and rich; they do not need PyInstaller, and they
+      # reach no network and no live NPM.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Through the Makefile deliberately, so CI exercises the same entry
+      # point a developer types. With no ./venv present it falls back to the
+      # interpreter setup-python selected.
+      - name: Run the test suite
+        run: make test
+
+      # Nothing above proves the CLI can start: every test imports the module
+      # directly. A missing import or a decorator typo would pass the suite
+      # and fail the first real invocation.
+      - name: Check the CLI starts
+        run: python npm_api.py --help

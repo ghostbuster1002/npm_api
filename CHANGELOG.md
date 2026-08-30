@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [2.0.0] - 2026-08-31
+
+A major version because the breaking changes below alter the behaviour of
+commands that already existed, not because of the size of the release. Anyone
+scripting against 1.0.0 should read the four items in the next section before
+upgrading.
+
 ### ⚠️ Breaking Changes
 
 Three changes require action before upgrading. Each is repeated in the
@@ -27,6 +36,22 @@ relevant section below.
    old outcome deliberately.
 
 ### Added
+
+- `host cert-assign <cert_id>` — assign a certificate to many hosts at once.
+  The same command as `host ssl-enable`, which stays, under a name that can be
+  found by someone looking to bulk-update certificates rather than to toggle
+  something on. It delegates rather than duplicating, so the certificate-exists
+  check and coverage warnings apply identically to both.
+- Continuous integration, in `.github/workflows/`. `test.yml` runs the suite on
+  Python 3.10 through 3.13 on every push; `release.yml` builds a binary per
+  platform on a `v*` tag and attaches them to the release. The previous
+  workflow sat in the repository root, where GitHub does not look for
+  workflows, and had therefore never run.
+- Linux `aarch64` release binaries, for Raspberry Pi and other 64-bit ARM.
+- `requirements-build.txt`, holding PyInstaller on top of `requirements.txt`.
+  The dependency list previously existed in four places — the Makefile,
+  `build.sh`, the workflow and `requirements.txt` — of which only the last
+  carried versions, and they had drifted.
 
 - `host split <glob> --cert <id>` — move domains matching a glob out of
   existing hosts onto brand-new hosts carrying the given certificate. Solves
@@ -141,6 +166,27 @@ relevant section below.
   every scheduled run.
 
 ### Changed
+
+- **BREAKING — `host bulk-replace-domain` matches whole labels, not
+  characters.** It compared with `old_domain in domain` and rewrote with
+  `str.replace`, so renaming `old.com` also turned `myold.com` into
+  `mynew.com`, and a one-label argument such as `com` matched most of an
+  estate. The old base must now be at least two labels and is matched label by
+  label. A rewrite that used to happen by accident will now simply not happen;
+  a run that relied on substring behaviour needs its argument spelled out in
+  full.
+- **`host bulk-replace-domain` no longer requires a host selector.** The old
+  base already names the hosts that are meant, so with no selector every host
+  under it is rebased. The selector was introduced to stop a bare `com`
+  matching everything, which it never did — `-p com` reproduced the fault
+  exactly. `--ids`, `--pattern` and `--interactive` still narrow the run.
+- `host bulk-replace-domain` keeps the spelling NPM holds for the part of the
+  name it did not change: `Shop.Example.COM` becomes `Shop.example.net` rather
+  than being silently lowercased in full.
+- `host bulk-replace-domain` treats a rebase onto the same base as no change,
+  instead of sending an update that alters nothing and reporting it as work.
+- `build.sh` runs the test suite before building, as `make build` always has.
+  The no-make path could previously ship a binary nothing had run.
 
 - **BREAKING — `host ssl-enable` signature.** Was
   `ssl-enable <host_id> <cert_id>`, a single host by positional argument. It is

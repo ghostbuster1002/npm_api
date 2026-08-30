@@ -1,6 +1,7 @@
 # NPM-API
 
-[![Build and Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/build.yml)
+[![Tests](https://github.com/ghostbuster1002/npm_api/actions/workflows/test.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/test.yml)
+[![Release](https://github.com/ghostbuster1002/npm_api/actions/workflows/release.yml/badge.svg)](https://github.com/ghostbuster1002/npm_api/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -24,17 +25,40 @@ A Python CLI tool for managing [Nginx Proxy Manager](https://nginxproxymanager.c
 
 Download the latest release for your platform from [Releases](https://github.com/ghostbuster1002/npm_api/releases):
 
-```bash
-# Linux
-wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-amd64
-chmod +x npm-api-linux-amd64
-sudo mv npm-api-linux-amd64 /usr/local/bin/npm-api
+Assets are named for the platform they were built on. `uname -m` tells you
+which one you want — `x86_64` for an ordinary PC or server, `aarch64` for a
+Raspberry Pi or other 64-bit ARM board.
 
-# macOS
-wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-amd64
-chmod +x npm-api-macos-amd64
-sudo mv npm-api-macos-amd64 /usr/local/bin/npm-api
+```bash
+# Linux, 64-bit Intel/AMD
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-x86_64
+chmod +x npm-api-linux-x86_64
+sudo mv npm-api-linux-x86_64 /usr/local/bin/npm-api
+
+# Linux, 64-bit ARM (Raspberry Pi 4/5 on a 64-bit OS)
+wget https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-linux-aarch64
+chmod +x npm-api-linux-aarch64
+sudo mv npm-api-linux-aarch64 /usr/local/bin/npm-api
+
+# macOS, Apple silicon
+curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-arm64
+chmod +x npm-api-macos-arm64
+sudo mv npm-api-macos-arm64 /usr/local/bin/npm-api
+
+# macOS, Intel
+curl -LO https://github.com/ghostbuster1002/npm_api/releases/latest/download/npm-api-macos-x86_64
+chmod +x npm-api-macos-x86_64
+sudo mv npm-api-macos-x86_64 /usr/local/bin/npm-api
 ```
+
+A binary is built for the architecture of the runner that produced it and will
+not run on another. There is no universal build.
+
+**Linux is the supported target.** The macOS and Windows binaries are built on
+a best-effort basis: nobody here runs them, so they are unverified beyond
+starting once on the build machine. If one is missing from a release it is
+because that build failed; build from source instead. A binary carries its own
+Python, so nothing needs installing to run one.
 
 ### Build from Source
 
@@ -44,6 +68,10 @@ cd npm_api
 make build
 sudo make install
 ```
+
+Release binaries are built with **Python 3.11**. The test suite is run against
+3.10, 3.11, 3.12 and 3.13 on every push, so those are the versions the tool is
+actually known to work on rather than merely claimed to.
 
 `make build` installs dependencies, runs the test suite, then builds. To run the
 tests on their own:
@@ -155,7 +183,8 @@ npm-api acl --help          Access list management
 | `host enable <id>` | Enable a host |
 | `host disable <id>` | Disable a host |
 | `host update <id> <field>=<value>` | Update a host field |
-| `host ssl-enable <cert_id>` | Assign a certificate to hosts |
+| `host cert-assign <cert_id>` | Assign a certificate to hosts |
+| `host ssl-enable <cert_id>` | The same command under its older name |
 | `host ssl-disable <id>` | Disable SSL |
 | `host bulk-add-domain <domain>` | Add domain to multiple hosts |
 | `host bulk-remove-domain <pattern>` | Remove domains from hosts |
@@ -172,11 +201,17 @@ Commands that write to more than one host take a selector, and all but
 |---------|-----------|
 | `host split` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host merge` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
-| `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host cert-assign` / `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-update` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-add-domain` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-remove-domain` | `--ids 1,2,3` · `--interactive` |
-| `host bulk-replace-domain` | `--ids 1,2,3` · `--interactive` (defaults to every host holding the old domain) |
+| `host bulk-replace-domain` | optional — `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+
+`bulk-replace-domain` is the exception because its own first argument already
+names the hosts that are meant: with no selector it rebases every host under
+the old base. The bare-`com` hazard is closed at the source instead — the old
+base must be at least two labels, and matching is by whole label, so renaming
+`old.com` leaves `myold.com` alone. Give a selector to narrow it further.
 
 On `host split`, `host ssl-enable` and `host bulk-update`, `--pattern` accepts
 either a glob or a plain substring, so `*.internal.lan` and `internal.lan` both work;
@@ -369,8 +404,11 @@ npm-api host bulk-add-domain domain3.com --interactive
 # Remove domains matching a pattern
 npm-api host bulk-remove-domain olddomain.com --ids 1,2,3
 
-# Replace one domain with another
-npm-api host bulk-replace-domain old.com new.com --pattern old.com
+# Replace one base domain with another, everywhere it appears
+npm-api host bulk-replace-domain old.com new.com
+
+# ...or on just some of those hosts
+npm-api host bulk-replace-domain old.com new.com --ids 1,2,3
 
 # Update a field across multiple hosts
 npm-api host bulk-update forward_host 192.168.1.100 --ids 1,2,3
@@ -535,8 +573,9 @@ npm-api cert list --json | jq '[.[].id]'
 npm-api host list --json | jq '[.[] | {id, domain_names, certificate_id}]'
 ```
 
-Assigning a certificate through `host bulk-update certificate_id <id>` or
-`host ssl-enable <id>` now guards against creating one: the certificate must
+Assigning a certificate through `host cert-assign <id>` (or its older names,
+`host ssl-enable <id>` and `host bulk-update certificate_id <id>` — all three
+are the same code path) now guards against creating one: the certificate must
 exist, its expiry is reported, and any host domain the certificate does not
 cover is flagged. Coverage is checked against the domain list NPM records for
 the certificate, which for uploaded certificates can be incomplete — when that
