@@ -121,14 +121,7 @@ jobs:
         shell: bash
         run: mv "dist/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
-      # Left at v4 on purpose while checkout and setup-python move to their
-      # Node 24 majors. The artifact actions changed behaviour across majors
-      # before — v4 made artifacts immutable and altered how names resolve —
-      # and this pair is load-bearing for the download step below, which has
-      # never run. Bump them on their own, after one release has worked, so
-      # that if something breaks it is obvious what broke it. The Node 20
-      # deprecation warning they emit is not a failure.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
@@ -136,17 +129,23 @@ jobs:
 
   release:
     needs: build
-    # Only publish for a tag. A workflow_dispatch run stops after build, so
-    # you can prove the binaries compile without cutting a release.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Runs on a dispatch as well as a tag, and does everything except the
+    # publish step at the bottom. Gating the whole job on a tag left
+    # download-artifact and its merge-multiple flatten as the only part of
+    # the pipeline that had never executed — which is exactly the part a
+    # first release would have discovered the hard way, with a tag already
+    # pushed. Now a dispatch run exercises build, upload, download and the
+    # completeness check, and stops short of creating anything.
     runs-on: ubuntu-latest
     permissions:
       # Required to create a release and attach files. GITHUB_TOKEN is
-      # injected automatically; no secret needs configuring.
+      # injected automatically; no secret needs configuring. Granted for
+      # dispatch runs too, since permissions are per job rather than per
+      # step; nothing on that path writes anything.
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           # Flatten every artifact into dist/ rather than one directory each.
@@ -172,10 +171,15 @@ jobs:
             echo "Every platform produced a binary."
           fi
 
+      # The only step that creates anything, and the only one gated on a tag.
+      # Everything above runs on a dispatch too, so the dry run is a real
+      # rehearsal rather than a partial one.
+      #
       # gh is preinstalled on GitHub runners, so this needs no third-party
       # action — one less thing to pin and to trust. GH_REPO is set because
       # nothing is checked out here, so gh has no git remote to infer from.
       - name: Create the release and attach every binary
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
