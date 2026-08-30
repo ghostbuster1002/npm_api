@@ -173,7 +173,8 @@ npm-api acl --help          Access list management
 | `host enable <id>` | Enable a host |
 | `host disable <id>` | Disable a host |
 | `host update <id> <field>=<value>` | Update a host field |
-| `host ssl-enable <cert_id>` | Assign a certificate to hosts |
+| `host cert-assign <cert_id>` | Assign a certificate to hosts |
+| `host ssl-enable <cert_id>` | The same command under its older name |
 | `host ssl-disable <id>` | Disable SSL |
 | `host bulk-add-domain <domain>` | Add domain to multiple hosts |
 | `host bulk-remove-domain <pattern>` | Remove domains from hosts |
@@ -190,11 +191,17 @@ Commands that write to more than one host take a selector, and all but
 |---------|-----------|
 | `host split` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host merge` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
-| `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+| `host cert-assign` / `host ssl-enable` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-update` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-add-domain` | `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
 | `host bulk-remove-domain` | `--ids 1,2,3` · `--interactive` |
-| `host bulk-replace-domain` | `--ids 1,2,3` · `--interactive` (defaults to every host holding the old domain) |
+| `host bulk-replace-domain` | optional — `--ids 1,2,3` · `--pattern <domain>` · `--interactive` |
+
+`bulk-replace-domain` is the exception because its own first argument already
+names the hosts that are meant: with no selector it rebases every host under
+the old base. The bare-`com` hazard is closed at the source instead — the old
+base must be at least two labels, and matching is by whole label, so renaming
+`old.com` leaves `myold.com` alone. Give a selector to narrow it further.
 
 On `host split`, `host ssl-enable` and `host bulk-update`, `--pattern` accepts
 either a glob or a plain substring, so `*.internal.lan` and `internal.lan` both work;
@@ -387,8 +394,11 @@ npm-api host bulk-add-domain domain3.com --interactive
 # Remove domains matching a pattern
 npm-api host bulk-remove-domain olddomain.com --ids 1,2,3
 
-# Replace one domain with another
-npm-api host bulk-replace-domain old.com new.com --pattern old.com
+# Replace one base domain with another, everywhere it appears
+npm-api host bulk-replace-domain old.com new.com
+
+# ...or on just some of those hosts
+npm-api host bulk-replace-domain old.com new.com --ids 1,2,3
 
 # Update a field across multiple hosts
 npm-api host bulk-update forward_host 192.168.1.100 --ids 1,2,3
@@ -553,8 +563,9 @@ npm-api cert list --json | jq '[.[].id]'
 npm-api host list --json | jq '[.[] | {id, domain_names, certificate_id}]'
 ```
 
-Assigning a certificate through `host bulk-update certificate_id <id>` or
-`host ssl-enable <id>` now guards against creating one: the certificate must
+Assigning a certificate through `host cert-assign <id>` (or its older names,
+`host ssl-enable <id>` and `host bulk-update certificate_id <id>` — all three
+are the same code path) now guards against creating one: the certificate must
 exist, its expiry is reported, and any host domain the certificate does not
 cover is flagged. Coverage is checked against the domain list NPM records for
 the certificate, which for uploaded certificates can be incomplete — when that
